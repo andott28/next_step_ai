@@ -1,0 +1,25 @@
+# Virtual environments and Python cache
+verification_env/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Large/generated experiment artifacts
+results/
+experiments/
+
+# Local temp and scratch files
+_tmp*
+*.tmp
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

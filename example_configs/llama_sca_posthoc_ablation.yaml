@@ -1,0 +1,25 @@
+model_name: "unsloth/Meta-Llama-3.1-8B-bnb-4bit"
+checkpoint_dir: "experiments/llama_sca_objective_v1"
+task_id: 0
+seed: 42
+
+dataset_name: "wikitext"
+dataset_config: "wikitext-2-raw-v1"
+dataset_split: "validation"
+text_column: "text"
+max_samples: 1024
+max_seq_length: 128
+batch_size: 1
+num_workers: 0
+max_eval_batches: 64
+warmup_batches: 4
+
+spmm_impls: ["dense", "cuda_spmm"]
+top_k_values: [3]
+soft_mask_values: [true, false]
+sigma_values: [1.0]
+ablate_inhibition: true
+ablate_refractory: true
+include_frozen_baseline: true
+
+output_json: "results/sca_posthoc_ablation/results.json"

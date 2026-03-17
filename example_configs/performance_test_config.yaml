@@ -1,0 +1,181 @@
+# Performance Test Configuration Example
+# Optimized for quick performance and stress testing
+
+# General Configuration
+general:
+  name: "Performance Test Benchmark Suite"
+  description: "Quick performance and stress testing for benchmarking system"
+  version: "1.0.0"
+  timestamp_format: "%Y%m%d_%H%M%S"
+
+# Benchmark Selection - Minimal for quick testing
+benchmarks:
+  # GLUE Benchmark - Minimal subset
+  glue:
+    enabled: true
+    description: "General Language Understanding Evaluation (minimal)"
+    datasets:
+      sst2:
+        enabled: true
+        description: "Stanford Sentiment Treebank 2"
+        max_samples: 20
+        subset: "validation"
+      mrpc:
+        enabled: true
+        description: "Microsoft Research Paraphrase Corpus"
+        max_samples: 20
+        subset: "validation"
+    metrics:
+      accuracy:
+        enabled: true
+        description: "Classification accuracy"
+      f1:
+        enabled: true
+        description: "F1 score"
+        average: "weighted"
+
+  # Question Answering - Minimal
+  qa:
+    enabled: true
+    description: "Question Answering (minimal)"
+    datasets:
+      squad:
+        enabled: true
+        description: "Stanford Question Answering Dataset"
+        max_samples: 20
+        subset: "validation"
+    metrics:
+      exact_match:
+        enabled: true
+        description: "Exact match score"
+      f1:
+        enabled: true
+        description: "F1 score"
+
+  # Reasoning - Minimal
+  reasoning:
+    enabled: true
+    description: "Reasoning (minimal)"
+    datasets:
+      hellaswag:
+        enabled: true
+        description: "HellaSwag - Common sense reasoning"
+        max_samples: 20
+        subset: "validation"
+      piqa:
+        enabled: true
+        description: "Physical Commonsense Questions"
+        max_samples: 20
+        subset: "validation"
+    metrics:
+      accuracy:
+        enabled: true
+        description: "Classification accuracy"
+
+  # Biological Benchmarks - Disabled for performance testing
+  biological:
+    enabled: false
+    description: "Biological-specific evaluation benchmarks"
+    categories:
+      protein_folding:
+        enabled: false
+      drug_discovery:
+        enabled: false
+      gene_analysis:
+        enabled: false
+      medical_diagnosis:
+        enabled: false
+      bioinformatics:
+        enabled: false
+
+# Model Configuration
+models:
+  gpt2_large:
+    enabled: true
+    name: "GPT-2 Large"
+    path: "gpt2-large"
+    type: "baseline"
+    parameters:
+      max_length: 256
+      temperature: 0.7
+      top_p: 0.9
+      num_return_sequences: 1
+      pad_token_id: 50256
+
+  neuroplastic_transformer:
+    enabled: true
+    name: "Neuroplastic Transformer"
+    path: "models/neuroplastic_adapter_agi/final_model"
+    type: "neuroplastic"
+    parameters:
+      max_length: 256
+      temperature: 0.7
+      top_p: 0.9
+      num_return_sequences: 1
+      pad_token_id: 50256
+      biological_mode: false
+      adaptation_strength: 0.5
+
+# Statistical Configuration - Minimal for quick testing
+statistics:
+  confidence_level: 0.90
+  number_of_runs: 1
+  cross_validation:
+    enabled: false
+    folds: 3
+  bootstrap:
+    enabled: false
+    samples: 100
+    confidence_interval: 0.90
+  significance_tests:
+    enabled: false
+    tests: ["t_test"]
+    alpha: 0.10
+
+# Output Configuration
+output:
+  results_directory: "results/performance_tests"
+  logging:
+    level: "WARNING"
+    format: "%(asctime)s - %(levelname)s - %(message)s"
+    file: "logs/performance_test.log"
+  reporting:
+    formats: ["json"]
+    include_plots: false
+    plot_formats: []
+  save_intermediate: false
+  cleanup_temp_files: true
+
+# Performance Configuration - Optimized for speed
+performance:
+  batch_size: 16
+  max_memory_gb: 4
+  timeout_seconds: 120
+  parallel_processing: true
+  num_workers: 8
+  cache_enabled: false
+  cache_directory: "cache/performance"
+
+# Biological-Specific Configuration - Disabled
+biological:
+  enabled: false
+  domain_knowledge: {}
+  evaluation_criteria: {}
+
+# Validation Configuration - Basic only
+validation:
+  enabled: true
+  sanity_checks: true
+  data_quality_checks: false
+  model_compatibility_checks: true
+  statistical_validity_checks: false
+  output_format_checks: true
+  custom_validators: []
+  fail_on_error: false
+  continue_on_warning: true
+
+# Experimental Configuration - Disabled
+experimental:
+  enabled: false
+  features: {}
+  parameters: {}
