@@ -14,6 +14,8 @@ dist/
 # Large/generated experiment artifacts
 results/
 experiments/
+tests/
+example_configs/
 
 # Local temp and scratch files
 _tmp*
@@ -23,3 +25,7 @@ _tmp*
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Written documentation
+written_documentation/
+legacy_files/
