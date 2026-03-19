@@ -58,6 +58,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--allow-cache", action="store_true", help="Allow generation cache in hybrid mode")
     p.add_argument("--enable-sparse-mlp", action="store_true", help="Enable sparse-MLP routing path")
+    p.add_argument(
+        "--sca-bottom-buffer-layers",
+        type=int,
+        default=2,
+        help="Number of bottom layers to keep dense.",
+    )
     p.add_argument("--sca-decode-guard-layers", type=int, default=12, help="Number of top decode layers to keep dense.")
     p.add_argument("--enable-sparse-attention", action="store_true", help="Enable paged sparse attention decode path")
     p.add_argument("--local-window-tokens", type=int, default=2048)
@@ -77,6 +83,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sca-top-k", type=int, default=3)
     p.add_argument("--sca-basis-rank", type=int, default=32)
     p.add_argument("--sca-basis-top-k", type=int, default=8)
+    p.add_argument(
+        "--sca-routing-mode",
+        type=str,
+        choices=["spatial_grid", "semantic_latent"],
+        default="semantic_latent",
+    )
     p.add_argument(
         "--sca-spmm-impl",
         type=str,
@@ -111,6 +123,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-enable strict decode repetition penalty; disabled by default because it destabilizes sparse decode.",
     )
+    p.add_argument(
+        "--strict-decode-upper-layer-cap-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the legacy strict decode upper-layer output-scale cap.",
+    )
     p.add_argument("--dump-attention-diagnostics-json", type=str, default="")
     return p
 
@@ -139,6 +157,7 @@ def main() -> None:
         sca_top_k=int(args.sca_top_k),
         sca_basis_rank=int(args.sca_basis_rank),
         sca_basis_top_k=int(args.sca_basis_top_k),
+        sca_routing_mode=str(args.sca_routing_mode),
         sca_spmm_impl=sca_spmm_impl,
         sca_sparse_placement=str(args.sca_sparse_placement),
         sca_stability_dense_fallback_threshold=float(fallback_threshold),
@@ -146,6 +165,7 @@ def main() -> None:
         sca_adaptive_top_k_min=int(args.sca_adaptive_top_k_min),
         sca_adaptive_top_k_max=int(args.sca_adaptive_top_k_max),
         sca_adaptive_top_k_min_score_ratio=float(args.sca_adaptive_top_k_min_score_ratio),
+        sca_bottom_buffer_layers=int(args.sca_bottom_buffer_layers),
         sca_decode_guard_layers=int(args.sca_decode_guard_layers),
         attention_hybrid_enabled=True,
         attention_hybrid_layers=layer_selection,
@@ -165,6 +185,7 @@ def main() -> None:
         attention_disable_ssd_fetch_in_decode=True,
         attention_force_single_model_runtime=True,
         strict_decode_enable_repetition_penalty=bool(args.enable_strict_repetition_penalty),
+        strict_decode_upper_layer_cap_enabled=bool(args.strict_decode_upper_layer_cap_enabled),
         strict_runtime_allow_noncuda_spmm_diagnostic=bool(args.allow_strict_noncuda_spmm),
     )
     model.set_sparse_attention_mode(strict_fully_sparse=bool(args.strict_fully_sparse))
@@ -206,13 +227,16 @@ def main() -> None:
                 "strict_runtime_allow_noncuda_spmm_diagnostic": bool(model.strict_runtime_allow_noncuda_spmm_diagnostic),
                 "sca_spmm_impl": str(model.sca_config.spmm_impl),
                 "sca_sparse_placement": str(model.sca_config.sparse_placement),
+                "sca_routing_mode": str(model.sca_config.routing_mode),
                 "sca_top_k": int(model.sca_config.top_k),
                 "sca_basis_rank": int(model.sca_config.basis_rank),
                 "sca_basis_top_k": int(model.sca_config.basis_top_k),
                 "sca_fallback_threshold": float(model.sca_config.stability_dense_fallback_threshold),
                 "sca_adaptive_top_k": bool(model.sca_config.adaptive_top_k),
                 "sca_route_top_k": int(model.sca_config.route_top_k),
+                "sca_bottom_buffer_layers": int(getattr(model, "bottom_buffer_layers", 0)),
                 "sca_decode_guard_layers": int(model.decode_guard_layers),
+                "strict_decode_upper_layer_cap_enabled": bool(model.strict_decode_upper_layer_cap_enabled),
             }
         )
     )

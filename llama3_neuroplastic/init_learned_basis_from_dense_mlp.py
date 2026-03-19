@@ -136,6 +136,59 @@ def _fit_layer_basis(
     }
 
 
+def _load_profile_overrides(path: str) -> Dict[str, Dict[int, int]]:
+    if not str(path).strip():
+        return {
+            "basis_rank_by_layer": {},
+            "basis_top_k_by_layer": {},
+            "top_k_by_layer": {},
+        }
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    overrides = payload.get("recommended_overrides", {}) if isinstance(payload, dict) else {}
+    out: Dict[str, Dict[int, int]] = {
+        "basis_rank_by_layer": {},
+        "basis_top_k_by_layer": {},
+        "top_k_by_layer": {},
+    }
+    for key in out:
+        raw = overrides.get(key, {}) if isinstance(overrides, dict) else {}
+        if isinstance(raw, dict):
+            out[key] = {int(layer_idx): int(value) for layer_idx, value in raw.items()}
+    return out
+
+
+def _collect_alignment_rows(
+    model: NeuroplasticLlama,
+    selected_layers: List[int],
+    *,
+    attention_mask: torch.Tensor,
+    layer_x: Dict[int, List[torch.Tensor]],
+    layer_y: Dict[int, List[torch.Tensor]],
+    layer_rows: Dict[int, int],
+    max_rows: int,
+) -> None:
+    valid = attention_mask.reshape(-1).to(dtype=torch.bool)
+    for layer_idx in selected_layers:
+        if layer_rows[layer_idx] >= max_rows:
+            continue
+        align = model.sca_sparse_mlps[layer_idx].get_last_alignment()
+        if align is None:
+            continue
+        mlp_input = align.get("mlp_input")
+        dense_out = align.get("dense_mlp_out")
+        if mlp_input is None or dense_out is None:
+            continue
+        x = mlp_input.reshape(-1, mlp_input.shape[-1])[valid]
+        y = dense_out.reshape(-1, dense_out.shape[-1])[valid]
+        if x.numel() == 0 or y.numel() == 0:
+            continue
+        remain = max_rows - layer_rows[layer_idx]
+        take = int(min(remain, x.shape[0]))
+        layer_x[layer_idx].append(x[:take].detach().cpu().float())
+        layer_y[layer_idx].append(y[:take].detach().cpu().float())
+        layer_rows[layer_idx] += take
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Initialize learned-basis sparse MLP from dense MLP activations.")
     p.add_argument("--model-name", type=str, required=True)
@@ -147,6 +200,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--max-rows-per-layer", type=int, default=4096)
     p.add_argument("--basis-rank", type=int, default=64)
+    p.add_argument("--sca-bottom-buffer-layers", type=int, default=2)
+    p.add_argument("--sca-decode-guard-layers", type=int, default=12)
+    p.add_argument("--dense-rollout-tokens", type=int, default=8)
+    p.add_argument("--profile-path", type=str, default="")
+    p.add_argument(
+        "--sca-routing-mode",
+        type=str,
+        choices=["spatial_grid", "semantic_latent"],
+        default="semantic_latent",
+    )
     p.add_argument("--dataset-name", type=str, default="wikitext")
     p.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1")
     p.add_argument("--dataset-split", type=str, default="train")
@@ -167,6 +230,9 @@ def main() -> None:
         sca_spmm_impl="cuda_spmm",
         sca_basis_rank=int(args.basis_rank),
         sca_basis_top_k=max(1, int(args.basis_rank) // 4),
+        sca_routing_mode=str(args.sca_routing_mode),
+        sca_bottom_buffer_layers=int(args.sca_bottom_buffer_layers),
+        sca_decode_guard_layers=int(args.sca_decode_guard_layers),
         sca_sparse_placement="learned_basis",
         sca_stability_dense_fallback_threshold=0.0,
         attention_hybrid_enabled=True,
@@ -202,6 +268,7 @@ def main() -> None:
     layer_y: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
     layer_rows: Dict[int, int] = {int(idx): 0 for idx in selected_layers}
     max_rows = int(max(args.max_rows_per_layer, 32))
+    rollout_tokens = int(max(args.dense_rollout_tokens, 1))
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(model.device, non_blocking=True)
@@ -214,29 +281,53 @@ def main() -> None:
                 return_dict=True,
                 task_id=0,
             )
-        valid = attention_mask.reshape(-1).to(dtype=torch.bool)
-        for layer_idx in selected_layers:
-            if layer_rows[layer_idx] >= max_rows:
-                continue
-            align = model.sca_sparse_mlps[layer_idx].get_last_alignment()
-            if align is None:
-                continue
-            mlp_input = align.get("mlp_input")
-            dense_out = align.get("dense_mlp_out")
-            if mlp_input is None or dense_out is None:
-                continue
-            x = mlp_input.reshape(-1, mlp_input.shape[-1])[valid]
-            y = dense_out.reshape(-1, dense_out.shape[-1])[valid]
-            if x.numel() == 0 or y.numel() == 0:
-                continue
-            remain = max_rows - layer_rows[layer_idx]
-            take = int(min(remain, x.shape[0]))
-            layer_x[layer_idx].append(x[:take].detach().cpu().float())
-            layer_y[layer_idx].append(y[:take].detach().cpu().float())
-            layer_rows[layer_idx] += take
+        _collect_alignment_rows(
+            model,
+            selected_layers,
+            attention_mask=attention_mask,
+            layer_x=layer_x,
+            layer_y=layer_y,
+            layer_rows=layer_rows,
+            max_rows=max_rows,
+        )
+        if not all(v >= max_rows for v in layer_rows.values()):
+            valid_lengths = attention_mask.sum(dim=-1).tolist()
+            for row_idx, valid_len in enumerate(valid_lengths):
+                prefix_len = int(max(1, min(64, int(valid_len) - rollout_tokens)))
+                prefix_ids = input_ids[row_idx : row_idx + 1, :prefix_len]
+                prefix_mask = attention_mask[row_idx : row_idx + 1, :prefix_len]
+                with torch.no_grad():
+                    generated = model.generate(
+                        input_ids=prefix_ids,
+                        attention_mask=prefix_mask,
+                        max_new_tokens=rollout_tokens,
+                        do_sample=False,
+                        use_cache=True,
+                        task_id=0,
+                    )
+                    generated_mask = torch.ones_like(generated, device=model.device)
+                    _ = model(
+                        input_ids=generated,
+                        attention_mask=generated_mask,
+                        use_cache=False,
+                        return_dict=True,
+                        task_id=0,
+                    )
+                _collect_alignment_rows(
+                    model,
+                    selected_layers,
+                    attention_mask=generated_mask,
+                    layer_x=layer_x,
+                    layer_y=layer_y,
+                    layer_rows=layer_rows,
+                    max_rows=max_rows,
+                )
+                if all(v >= max_rows for v in layer_rows.values()):
+                    break
         if all(v >= max_rows for v in layer_rows.values()):
             break
 
+    overrides = _load_profile_overrides(str(args.profile_path))
     layer_states: Dict[str, Dict[str, torch.Tensor]] = {}
     stats: Dict[str, Dict[str, float]] = {}
     for layer_idx in selected_layers:
@@ -272,7 +363,13 @@ def main() -> None:
         "hybrid_checkpoint_path": str(args.hybrid_checkpoint),
         "config": {
             "sparse_placement": "learned_basis",
+            "routing_mode": str(args.sca_routing_mode),
+            "bottom_buffer_layers": int(args.sca_bottom_buffer_layers),
+            "decode_guard_layers": int(args.sca_decode_guard_layers),
             "basis_rank": int(args.basis_rank),
+            "basis_rank_by_layer": overrides["basis_rank_by_layer"],
+            "basis_top_k_by_layer": overrides["basis_top_k_by_layer"],
+            "top_k_by_layer": overrides["top_k_by_layer"],
             "block_size": int(model.sca_config.block_size),
             "num_blocks": int(model.sca_config.num_blocks),
         },

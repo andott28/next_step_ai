@@ -39,6 +39,9 @@ except ImportError:
 class SparseRouteSelection:
     active_idx: torch.Tensor
     score_weights: Optional[torch.Tensor] = None
+    latent_idx: Optional[torch.Tensor] = None
+    latent_weights: Optional[torch.Tensor] = None
+    block_scores: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -85,7 +88,7 @@ class SparseLlamaMLP(nn.Module):
         self._fallback_triggered_steps: int = 0
         self.capture_route_snapshot: bool = False
         self._last_route_snapshot: Optional[Dict[str, torch.Tensor]] = None
-        self._last_learned_basis_stats: Optional[Dict[str, float]] = None
+        self._last_learned_basis_stats: Optional[Dict[str, Any]] = None
         self.sparse_basis_encoder = nn.Linear(self.hidden_size, int(config.basis_rank), bias=True)
         self.sparse_basis_decoder = nn.Parameter(torch.empty(self.num_blocks, int(config.basis_rank), self.block_size))
         self.sparse_basis_bias = nn.Parameter(torch.zeros(self.num_blocks, self.block_size))
@@ -180,11 +183,130 @@ class SparseLlamaMLP(nn.Module):
         if self._last_learned_basis_stats is None:
             return None
         out: Dict[str, torch.Tensor] = {}
-        for key in ("_coord_probs", "_row_probs"):
-            value = self._last_learned_basis_stats.get(key)
+        for key, value in self._last_learned_basis_stats.items():
             if torch.is_tensor(value):
                 out[str(key)] = value
         return out or None
+
+    def _effective_basis_rank(self) -> int:
+        if hasattr(self.config, "basis_rank_for_layer"):
+            return int(self.config.basis_rank_for_layer(self.layer_idx))
+        return int(getattr(self.config, "basis_rank", self.sparse_basis_encoder.out_features))
+
+    def _effective_basis_top_k(self) -> int:
+        if hasattr(self.config, "basis_top_k_for_layer"):
+            return int(self.config.basis_top_k_for_layer(self.layer_idx))
+        return int(getattr(self.config, "basis_top_k", 1))
+
+    def _effective_block_top_k(self) -> int:
+        if hasattr(self.config, "top_k_for_layer"):
+            return int(self.config.top_k_for_layer(self.layer_idx))
+        return int(getattr(self.config, "route_top_k", getattr(self.config, "top_k", 1)))
+
+    @staticmethod
+    def _normalize_selected_weights(active_idx: torch.Tensor, active_score: torch.Tensor) -> torch.Tensor:
+        valid_mask = active_idx >= 0
+        neg_inf = torch.full_like(active_score, float("-inf"))
+        masked = torch.where(valid_mask, active_score, neg_inf)
+        weights = torch.softmax(masked, dim=-1)
+        return torch.where(valid_mask, weights, torch.zeros_like(weights))
+
+    def _apply_adaptive_block_top_k(
+        self,
+        active_idx: torch.Tensor,
+        active_score: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not bool(getattr(self.config, "adaptive_top_k", False)):
+            return active_idx, active_score
+        if active_idx.numel() == 0:
+            return active_idx, active_score
+        valid = active_idx >= 0
+        if not torch.any(valid):
+            return active_idx, active_score
+
+        keep = valid.clone()
+        best = active_score[:, :1].clamp_min(1e-8)
+        relative = active_score / best
+        keep = keep & (relative >= float(getattr(self.config, "adaptive_top_k_min_score_ratio", 0.15)))
+
+        min_k = int(
+            min(
+                getattr(self.config, "adaptive_top_k_min", active_idx.shape[1]),
+                active_idx.shape[1],
+            )
+        )
+        if min_k > 0:
+            keep[:, :min_k] = valid[:, :min_k]
+
+        pruned_idx = active_idx.masked_fill(~keep, -1)
+        pruned_score = active_score.masked_fill(~keep, 0.0)
+        return pruned_idx, pruned_score
+
+    def _compute_latent_dense(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        rows = int(hidden_states.shape[0] * hidden_states.shape[1])
+        flat_hidden = hidden_states.reshape(rows, self.hidden_size)
+        latent_dense = F.silu(self.sparse_basis_encoder(flat_hidden.to(dtype=self.sparse_basis_encoder.weight.dtype)))
+        effective_rank = int(min(max(self._effective_basis_rank(), 1), latent_dense.shape[-1]))
+        return latent_dense[:, :effective_rank], effective_rank
+
+    def _select_latent_support(
+        self,
+        latent_dense: torch.Tensor,
+        *,
+        preset_idx: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = int(latent_dense.shape[0])
+        effective_top_k = int(min(max(self._effective_basis_top_k(), 1), latent_dense.shape[-1]))
+        latent_abs = latent_dense.abs()
+        if preset_idx is not None:
+            topk_idx = preset_idx.to(device=latent_dense.device, dtype=torch.long)
+            if topk_idx.shape[0] != rows:
+                raise RuntimeError("preset latent_idx rows must match latent rows")
+            if topk_idx.numel() > 0:
+                topk_idx = topk_idx.clamp(min=0, max=max(latent_dense.shape[-1] - 1, 0))
+            latent_mask = torch.zeros_like(latent_dense)
+            if topk_idx.numel() > 0:
+                latent_mask.scatter_(1, topk_idx, 1.0)
+        elif effective_top_k < int(latent_dense.shape[-1]):
+            topk_idx = torch.topk(latent_abs, k=effective_top_k, dim=-1).indices
+            latent_mask = torch.zeros_like(latent_dense)
+            latent_mask.scatter_(1, topk_idx, 1.0)
+        else:
+            topk_idx = torch.arange(
+                latent_dense.shape[-1],
+                device=latent_dense.device,
+                dtype=torch.long,
+            ).view(1, -1).expand(rows, -1)
+            latent_mask = torch.ones_like(latent_dense)
+        latent = latent_dense * latent_mask
+        selected_abs = torch.gather(latent_abs, 1, topk_idx) if topk_idx.numel() > 0 else torch.empty_like(topk_idx, dtype=latent_abs.dtype)
+        denom = selected_abs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        latent_weights = selected_abs / denom if selected_abs.numel() > 0 else selected_abs
+        return latent, latent_mask, topk_idx, latent_weights
+
+    def _route_learned_basis_semantic(self, hidden_states: torch.Tensor) -> SparseRouteSelection:
+        latent_dense, effective_rank = self._compute_latent_dense(hidden_states)
+        latent, _latent_mask, latent_idx, latent_weights = self._select_latent_support(latent_dense)
+        decoder = self.sparse_basis_decoder[:, :effective_rank, :].to(device=hidden_states.device, dtype=latent.dtype)
+        decoder_norm = decoder.norm(dim=-1)
+        if bool(getattr(self.config, "semantic_block_score_normalized", False)):
+            decoder_norm = F.normalize(decoder_norm, p=2.0, dim=0, eps=1e-6)
+        block_scores = latent.abs() @ decoder_norm.transpose(0, 1)
+
+        block_top_k = int(min(max(self._effective_block_top_k(), 1), block_scores.shape[-1]))
+        active_score, active_idx = torch.topk(block_scores, k=block_top_k, dim=-1, largest=True, sorted=True)
+        active_idx, active_score = self._apply_adaptive_block_top_k(active_idx=active_idx, active_score=active_score)
+        score_weights = self._normalize_selected_weights(active_idx=active_idx, active_score=active_score)
+        return SparseRouteSelection(
+            active_idx=active_idx.long(),
+            score_weights=score_weights,
+            latent_idx=latent_idx.long(),
+            latent_weights=latent_weights.to(dtype=torch.float32),
+            block_scores=block_scores.to(dtype=torch.float32),
+        )
 
     def _apply_output_scale(self, out: torch.Tensor) -> torch.Tensor:
         if self.output_scale_fn is None:
@@ -747,28 +869,22 @@ class SparseLlamaMLP(nn.Module):
     def _forward_learned_basis(
         self,
         hidden_states: torch.Tensor,
-        active_idx: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        route: SparseRouteSelection,
     ) -> torch.Tensor:
+        active_idx = route.active_idx
+        score_weights = route.score_weights if self.config.soft_mask else None
         rows = int(hidden_states.shape[0] * hidden_states.shape[1])
-        flat_hidden = hidden_states.reshape(rows, self.hidden_size)
-        latent_dense = F.silu(self.sparse_basis_encoder(flat_hidden.to(dtype=self.sparse_basis_encoder.weight.dtype)))
-        basis_top_k = int(min(max(int(getattr(self.config, "basis_top_k", 1)), 1), latent_dense.shape[-1]))
-        if basis_top_k < int(latent_dense.shape[-1]):
-            topk_idx = torch.topk(latent_dense.abs(), k=basis_top_k, dim=-1).indices
-            latent_mask = torch.zeros_like(latent_dense)
-            latent_mask.scatter_(1, topk_idx, 1.0)
-            latent = latent_dense * latent_mask
-        else:
-            latent_mask = torch.ones_like(latent_dense)
-            latent = latent_dense
-            topk_idx = torch.arange(latent_dense.shape[-1], device=latent_dense.device, dtype=torch.long).view(1, -1).expand(rows, -1)
+        latent_dense, effective_rank = self._compute_latent_dense(hidden_states)
+        latent, latent_mask, topk_idx, latent_weights = self._select_latent_support(
+            latent_dense,
+            preset_idx=route.latent_idx,
+        )
         out_blocks = torch.zeros(
             (rows, self.num_blocks, self.block_size),
             device=hidden_states.device,
             dtype=latent.dtype,
         )
-        decoder = self.sparse_basis_decoder.to(device=hidden_states.device, dtype=latent.dtype)
+        decoder = self.sparse_basis_decoder[:, :effective_rank, :].to(device=hidden_states.device, dtype=latent.dtype)
         bias = self.sparse_basis_bias.to(device=hidden_states.device, dtype=latent.dtype)
         row_idx = torch.arange(rows, device=hidden_states.device)
         for slot in range(active_idx.shape[1]):
@@ -789,16 +905,43 @@ class SparseLlamaMLP(nn.Module):
         out_flat = out_flat * self.sparse_basis_scale.to(device=out_flat.device, dtype=out_flat.dtype)
         if rows > 0:
             mean_latent_norm = float(latent.norm(dim=-1).mean().detach().cpu().item())
-            usage = latent_mask.detach().float().mean(dim=0)
-            active_fraction = float(usage.mean().cpu().item())
-            coords_used = float((usage > 0).float().sum().cpu().item())
-            coord_probs = usage / usage.sum().clamp_min(1e-6)
+            latent_load = latent_mask.float().mean(dim=0)
+            active_fraction = float(latent_load.mean().detach().cpu().item())
+            coords_used = float((latent_load > 0).float().sum().detach().cpu().item())
+            latent_importance = latent.abs().sum(dim=0)
+            latent_importance = latent_importance / latent_importance.sum().clamp_min(1e-6)
+            latent_load_probs = latent_load / latent_load.sum().clamp_min(1e-6)
             row_probs = latent.abs() / latent.abs().sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            usage_entropy = float((-(coord_probs * coord_probs.clamp_min(1e-6).log()).sum()).cpu().item())
-            support_overlap = float(((latent_mask @ latent_mask.transpose(0, 1)).float() / max(basis_top_k, 1)).mean().detach().cpu().item())
+            usage_entropy = float((-(latent_importance * latent_importance.clamp_min(1e-6).log()).sum()).detach().cpu().item())
+            support_overlap = float(
+                ((latent_mask @ latent_mask.transpose(0, 1)).float() / max(int(topk_idx.shape[1]), 1))
+                .mean()
+                .detach()
+                .cpu()
+                .item()
+            )
             unique_fraction = 0.0
-            if rows > 1 and basis_top_k <= 16:
+            if rows > 1 and int(topk_idx.shape[1]) <= 16:
                 unique_fraction = float(torch.unique(topk_idx.detach().to(dtype=torch.int64), dim=0).shape[0] / rows)
+
+            valid_blocks = active_idx >= 0
+            if score_weights is None:
+                block_selected = valid_blocks.to(dtype=latent.dtype)
+                denom = block_selected.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                block_selected = block_selected / denom
+            else:
+                block_selected = score_weights.to(device=latent.device, dtype=latent.dtype)
+            block_importance = torch.zeros((self.num_blocks,), device=latent.device, dtype=latent.dtype)
+            block_load = torch.zeros((self.num_blocks,), device=latent.device, dtype=latent.dtype)
+            if torch.any(valid_blocks):
+                block_importance.scatter_add_(0, active_idx[valid_blocks], block_selected[valid_blocks])
+                block_load.scatter_add_(
+                    0,
+                    active_idx[valid_blocks],
+                    torch.ones_like(active_idx[valid_blocks], dtype=latent.dtype),
+                )
+            block_importance = block_importance / block_importance.sum().clamp_min(1e-6)
+            block_load_probs = block_load / block_load.sum().clamp_min(1e-6)
             self._last_learned_basis_stats = {
                 "mean_latent_norm": mean_latent_norm,
                 "active_latent_fraction": active_fraction,
@@ -806,8 +949,17 @@ class SparseLlamaMLP(nn.Module):
                 "latent_usage_entropy": usage_entropy,
                 "support_overlap_mean": support_overlap,
                 "support_unique_fraction": unique_fraction,
-                "_coord_probs": coord_probs,
+                "max_latent_importance_fraction": float(latent_importance.max().detach().cpu().item()),
+                "max_latent_load_fraction": float(latent_load_probs.max().detach().cpu().item()),
+                "max_block_importance_fraction": float(block_importance.max().detach().cpu().item()),
+                "max_block_load_fraction": float(block_load_probs.max().detach().cpu().item()),
+                "_coord_probs": latent_importance,
                 "_row_probs": row_probs,
+                "_latent_importance_probs": latent_importance,
+                "_latent_load_probs": latent_load_probs,
+                "_block_importance_probs": block_importance,
+                "_block_load_probs": block_load_probs,
+                "_latent_selected_weights": latent_weights,
             }
         else:
             self._last_learned_basis_stats = {
@@ -817,8 +969,17 @@ class SparseLlamaMLP(nn.Module):
                 "latent_usage_entropy": 0.0,
                 "support_overlap_mean": 0.0,
                 "support_unique_fraction": 0.0,
+                "max_latent_importance_fraction": 0.0,
+                "max_latent_load_fraction": 0.0,
+                "max_block_importance_fraction": 0.0,
+                "max_block_load_fraction": 0.0,
                 "_coord_probs": torch.empty((0,), device=hidden_states.device, dtype=torch.float32),
                 "_row_probs": torch.empty((0, 0), device=hidden_states.device, dtype=torch.float32),
+                "_latent_importance_probs": torch.empty((0,), device=hidden_states.device, dtype=torch.float32),
+                "_latent_load_probs": torch.empty((0,), device=hidden_states.device, dtype=torch.float32),
+                "_block_importance_probs": torch.empty((0,), device=hidden_states.device, dtype=torch.float32),
+                "_block_load_probs": torch.empty((0,), device=hidden_states.device, dtype=torch.float32),
+                "_latent_selected_weights": torch.empty((0, 0), device=hidden_states.device, dtype=torch.float32),
             }
         return out_flat.view_as(hidden_states).to(dtype=hidden_states.dtype)
 
@@ -1307,11 +1468,16 @@ class SparseLlamaMLP(nn.Module):
         if capture:
             with torch.no_grad():
                 dense_ref = self.base_mlp(hidden_states)
+        semantic_learned_basis = bool(
+            self.config.sparse_placement == "learned_basis"
+            and getattr(self.config, "routing_mode", "spatial_grid") == "semantic_latent"
+        )
+        route_slots_upper = int(self._effective_block_top_k() if semantic_learned_basis else max(int(self.config.route_top_k), 1))
 
         def _record_alignment(
             sparse_out: torch.Tensor,
             feature_mask: Optional[torch.Tensor],
-            active_idx: Optional[torch.Tensor],
+            route: Optional[SparseRouteSelection],
             fallback_triggered: bool,
         ) -> None:
             if dense_ref is None:
@@ -1323,6 +1489,7 @@ class SparseLlamaMLP(nn.Module):
                 device=hidden_states.device,
                 dtype=hidden_states.dtype,
             )
+            active_idx = None if route is None else route.active_idx
             self._last_alignment = {
                 "mlp_input": hidden_states.detach(),
                 "dense_mlp_out": dense_ref.detach(),
@@ -1336,7 +1503,7 @@ class SparseLlamaMLP(nn.Module):
                     active_idx.detach()
                     if active_idx is not None
                     else torch.full(
-                        (hidden_states.shape[0] * hidden_states.shape[1], max(int(self.config.route_top_k), 1)),
+                        (hidden_states.shape[0] * hidden_states.shape[1], route_slots_upper),
                         -1,
                         device=hidden_states.device,
                         dtype=torch.long,
@@ -1344,6 +1511,28 @@ class SparseLlamaMLP(nn.Module):
                 ),
                 "fallback_triggered": fallback_tensor,
             }
+            if route is not None:
+                if route.latent_idx is not None:
+                    self._last_alignment["latent_idx"] = route.latent_idx.detach()
+                if route.latent_weights is not None:
+                    self._last_alignment["latent_weights"] = route.latent_weights.detach().to(dtype=torch.float32)
+                if route.block_scores is not None:
+                    self._last_alignment["block_scores"] = route.block_scores.detach().to(dtype=torch.float32)
+                self._last_alignment["effective_basis_rank"] = torch.tensor(
+                    int(self._effective_basis_rank()),
+                    device=hidden_states.device,
+                    dtype=torch.int32,
+                )
+                self._last_alignment["effective_basis_top_k"] = torch.tensor(
+                    int(self._effective_basis_top_k()),
+                    device=hidden_states.device,
+                    dtype=torch.int32,
+                )
+                self._last_alignment["effective_block_top_k"] = torch.tensor(
+                    int(self._effective_block_top_k()),
+                    device=hidden_states.device,
+                    dtype=torch.int32,
+                )
 
         if not self.enabled_fn(self.layer_idx):
             self._last_diagnostics = SparseMLPDiagnostics(
@@ -1361,28 +1550,32 @@ class SparseLlamaMLP(nn.Module):
             return out
 
         threshold = float(getattr(self.config, "stability_dense_fallback_threshold", 0.0))
-        touched_ratio_upper = float(self.config.route_top_k) / float(max(self.num_blocks, 1))
+        touched_ratio_upper = float(route_slots_upper) / float(max(self.num_blocks, 1))
         if threshold > 0.0 and touched_ratio_upper < threshold:
             rows = int(hidden_states.shape[0] * hidden_states.shape[1])
-            slots = int(max(self.config.route_top_k, 1))
+            slots = int(max(route_slots_upper, 1))
             active_idx = (
                 torch.arange(slots, device=hidden_states.device, dtype=torch.long)
                 .view(1, -1)
                 .expand(rows, -1)
                 .contiguous()
             )
+            fallback_route = SparseRouteSelection(active_idx=active_idx)
             self._update_diagnostics(active_idx)
             out = self.base_mlp(hidden_states)
             out = self._apply_output_scale(out)
             _record_alignment(
                 out,
                 torch.ones_like(hidden_states, device=hidden_states.device, dtype=hidden_states.dtype),
-                active_idx,
+                fallback_route,
                 fallback_triggered=True,
             )
             return out
 
-        route = self.route_fn(hidden_states, self.layer_idx)
+        if semantic_learned_basis:
+            route = self._route_learned_basis_semantic(hidden_states)
+        else:
+            route = self.route_fn(hidden_states, self.layer_idx)
         active_idx = route.active_idx
         score_weights = route.score_weights if self.config.soft_mask else None
         if self.capture_route_snapshot:
@@ -1405,7 +1598,16 @@ class SparseLlamaMLP(nn.Module):
                 "batch_size": torch.tensor(int(hidden_states.shape[0]), device=hidden_states.device, dtype=torch.int32),
                 "seq_len": torch.tensor(int(hidden_states.shape[1]), device=hidden_states.device, dtype=torch.int32),
                 "layer_idx": torch.tensor(int(self.layer_idx), device=hidden_states.device, dtype=torch.int32),
+                "effective_basis_rank": torch.tensor(int(self._effective_basis_rank()), device=hidden_states.device, dtype=torch.int32),
+                "effective_basis_top_k": torch.tensor(int(self._effective_basis_top_k()), device=hidden_states.device, dtype=torch.int32),
+                "effective_block_top_k": torch.tensor(int(self._effective_block_top_k()), device=hidden_states.device, dtype=torch.int32),
             }
+            if route.latent_idx is not None:
+                self._last_route_snapshot["latent_idx"] = route.latent_idx.detach()
+            if route.latent_weights is not None:
+                self._last_route_snapshot["latent_weights"] = route.latent_weights.detach().to(dtype=torch.float32)
+            if route.block_scores is not None:
+                self._last_route_snapshot["block_scores"] = route.block_scores.detach().to(dtype=torch.float32)
         self._update_diagnostics(active_idx)
         if threshold > 0.0 and self._last_diagnostics is not None:
             if float(self._last_diagnostics.touched_weight_fraction) < threshold:
@@ -1414,7 +1616,7 @@ class SparseLlamaMLP(nn.Module):
                 _record_alignment(
                     out,
                     torch.ones_like(hidden_states, device=hidden_states.device, dtype=hidden_states.dtype),
-                    active_idx,
+                    route,
                     fallback_triggered=True,
                 )
                 return out
@@ -1422,7 +1624,7 @@ class SparseLlamaMLP(nn.Module):
         if active_idx.numel() == 0:
             out = torch.zeros_like(hidden_states)
             out = self._apply_output_scale(out)
-            _record_alignment(out, torch.zeros_like(hidden_states), active_idx, fallback_triggered=False)
+            _record_alignment(out, torch.zeros_like(hidden_states), route, fallback_triggered=False)
             return out
 
         flat_mask = self._build_feature_mask(
@@ -1434,14 +1636,14 @@ class SparseLlamaMLP(nn.Module):
         feature_mask = flat_mask.view_as(hidden_states)
         if self._block_bank is not None:
             if self.config.sparse_placement == "learned_basis":
-                out = self._forward_learned_basis(hidden_states, active_idx, score_weights=score_weights)
+                out = self._forward_learned_basis(hidden_states, route)
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             if self.config.sparse_placement != "input_mask":
                 out = self._forward_output_sparse(hidden_states, active_idx, score_weights=score_weights)
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             out = self._forward_block_bank_sparse(
                 hidden_states=hidden_states,
@@ -1450,48 +1652,48 @@ class SparseLlamaMLP(nn.Module):
                 score_weights=score_weights,
             )
             out = self._apply_output_scale(out)
-            _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+            _record_alignment(out, feature_mask, route, fallback_triggered=False)
             return out
         if self.config.grouped_row_gemm:
             if self.config.sparse_placement == "learned_basis":
-                out = self._forward_learned_basis(hidden_states, active_idx, score_weights=score_weights)
+                out = self._forward_learned_basis(hidden_states, route)
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             if self.config.sparse_placement != "input_mask":
                 out = self._forward_output_sparse(hidden_states, active_idx, score_weights=score_weights)
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             out = self._forward_grouped_row_gemm(hidden_states, active_idx, feature_mask)
             out = self._apply_output_scale(out)
-            _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+            _record_alignment(out, feature_mask, route, fallback_triggered=False)
             return out
 
         if self.config.spmm_impl == "dense":
             if self.config.sparse_placement == "input_mask":
                 out = self._forward_dense_masked(hidden_states, feature_mask)
             elif self.config.sparse_placement == "learned_basis":
-                out = self._forward_learned_basis(hidden_states, active_idx, score_weights=score_weights)
+                out = self._forward_learned_basis(hidden_states, route)
             elif self.config.sparse_placement == "output_sparse":
                 out = self._forward_output_sparse(hidden_states, active_idx, score_weights=score_weights)
             else:
                 out = self._forward_intermediate_group_sparse(hidden_states, active_idx, score_weights=score_weights)
             out = self._apply_output_scale(out)
-            _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+            _record_alignment(out, feature_mask, route, fallback_triggered=False)
             return out
         if self.config.spmm_impl == "cuda_spmm":
             if not hidden_states.is_cuda or not active_idx.is_cuda:
                 raise RuntimeError("cuda_spmm requires CUDA tensors")
             if self.config.sparse_placement == "learned_basis":
-                out = self._forward_learned_basis(hidden_states, active_idx, score_weights=score_weights)
+                out = self._forward_learned_basis(hidden_states, route)
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             if self.config.sparse_placement != "input_mask":
                 out = self._forward_output_sparse(hidden_states, active_idx, score_weights=score_weights)
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             if self._can_use_triton_4bit():
                 out = self._forward_materialized_block_sparse(
@@ -1501,7 +1703,7 @@ class SparseLlamaMLP(nn.Module):
                     score_weights=score_weights,
                 )
                 out = self._apply_output_scale(out)
-                _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+                _record_alignment(out, feature_mask, route, fallback_triggered=False)
                 return out
             if not triton_sparse_mlp_available():
                 raise RuntimeError("cuda_spmm requires Triton")
@@ -1511,7 +1713,7 @@ class SparseLlamaMLP(nn.Module):
                 raise RuntimeError("cuda_spmm 4-bit path does not support quantized weight gradients")
             out = self._forward_triton_sparse(hidden_states, active_idx, feature_mask)
             out = self._apply_output_scale(out)
-            _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+            _record_alignment(out, feature_mask, route, fallback_triggered=False)
             return out
         if self.config.spmm_impl == "torch_block_sparse":
             if not self._can_use_torch_block_sparse():
@@ -1519,12 +1721,12 @@ class SparseLlamaMLP(nn.Module):
             if self.config.sparse_placement == "input_mask":
                 out = self._forward_torch_block_sparse(hidden_states, active_idx, feature_mask, score_weights=score_weights)
             elif self.config.sparse_placement == "learned_basis":
-                out = self._forward_learned_basis(hidden_states, active_idx, score_weights=score_weights)
+                out = self._forward_learned_basis(hidden_states, route)
             elif self.config.sparse_placement == "output_sparse":
                 out = self._forward_output_sparse(hidden_states, active_idx, score_weights=score_weights)
             else:
                 out = self._forward_intermediate_group_sparse(hidden_states, active_idx, score_weights=score_weights)
             out = self._apply_output_scale(out)
-            _record_alignment(out, feature_mask, active_idx, fallback_triggered=False)
+            _record_alignment(out, feature_mask, route, fallback_triggered=False)
             return out
         raise ValueError(f"Unsupported spmm_impl: {self.config.spmm_impl}")

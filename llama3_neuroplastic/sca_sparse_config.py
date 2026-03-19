@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Dict
 
 import torch
@@ -26,6 +26,11 @@ class SCASparseConfig:
     grid_size: int = 16
     spmm_impl: str = "dense"
     sparse_placement: str = "input_mask"
+    routing_mode: str = "spatial_grid"
+    semantic_block_score_normalized: bool = False
+    basis_rank_by_layer: Dict[int, int] = field(default_factory=dict)
+    basis_top_k_by_layer: Dict[int, int] = field(default_factory=dict)
+    top_k_by_layer: Dict[int, int] = field(default_factory=dict)
     soft_mask: bool = True
     grouped_row_gemm: bool = False
     grouped_row_min_bucket: int = 2
@@ -77,10 +82,43 @@ class SCASparseConfig:
             raise ValueError("spmm_impl must be one of: dense, torch_block_sparse, cuda_spmm")
         if self.sparse_placement not in {"input_mask", "output_sparse", "intermediate_group", "learned_basis"}:
             raise ValueError("sparse_placement must be one of: input_mask, output_sparse, intermediate_group, learned_basis")
+        if self.routing_mode not in {"spatial_grid", "semantic_latent"}:
+            raise ValueError("routing_mode must be one of: spatial_grid, semantic_latent")
         if self.grouped_row_min_bucket <= 0:
             raise ValueError("grouped_row_min_bucket must be > 0")
         if self.stability_dense_fallback_threshold < 0.0 or self.stability_dense_fallback_threshold > 1.0:
             raise ValueError("stability_dense_fallback_threshold must be in [0, 1]")
+
+        self.basis_rank_by_layer = self._normalize_layer_map(self.basis_rank_by_layer)
+        self.basis_top_k_by_layer = self._normalize_layer_map(self.basis_top_k_by_layer)
+        self.top_k_by_layer = self._normalize_layer_map(self.top_k_by_layer)
+
+        for layer_idx, value in self.basis_rank_by_layer.items():
+            if value <= 0:
+                raise ValueError(f"basis_rank_by_layer[{layer_idx}] must be > 0")
+            if value > self.basis_rank:
+                raise ValueError(f"basis_rank_by_layer[{layer_idx}] must be <= basis_rank")
+        for layer_idx, value in self.basis_top_k_by_layer.items():
+            if value <= 0:
+                raise ValueError(f"basis_top_k_by_layer[{layer_idx}] must be > 0")
+            max_rank = self.basis_rank_for_layer(layer_idx)
+            if value > max_rank:
+                raise ValueError(f"basis_top_k_by_layer[{layer_idx}] must be <= effective basis rank")
+        for layer_idx, value in self.top_k_by_layer.items():
+            if value <= 0:
+                raise ValueError(f"top_k_by_layer[{layer_idx}] must be > 0")
+            if value > self.num_blocks:
+                raise ValueError(f"top_k_by_layer[{layer_idx}] must be <= num_blocks")
+
+    @staticmethod
+    def _normalize_layer_map(raw: Dict[int, int] | Dict[str, int]) -> Dict[int, int]:
+        out: Dict[int, int] = {}
+        for key, value in dict(raw).items():
+            layer_idx = int(key)
+            if layer_idx < 0:
+                raise ValueError("layer override keys must be >= 0")
+            out[layer_idx] = int(value)
+        return out
 
     @property
     def num_blocks(self) -> int:
@@ -91,6 +129,18 @@ class SCASparseConfig:
         if self.adaptive_top_k:
             return int(self.adaptive_top_k_max)
         return int(self.top_k)
+
+    def basis_rank_for_layer(self, layer_idx: int) -> int:
+        return int(max(1, min(self.basis_rank_by_layer.get(int(layer_idx), self.basis_rank), self.basis_rank)))
+
+    def basis_top_k_for_layer(self, layer_idx: int) -> int:
+        default = self.basis_top_k_by_layer.get(int(layer_idx), self.basis_top_k)
+        effective_rank = self.basis_rank_for_layer(layer_idx)
+        return int(max(1, min(int(default), effective_rank)))
+
+    def top_k_for_layer(self, layer_idx: int) -> int:
+        default = self.top_k_by_layer.get(int(layer_idx), self.route_top_k)
+        return int(max(1, min(int(default), self.num_blocks)))
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -119,7 +169,6 @@ def build_block_centers(config: SCASparseConfig) -> torch.Tensor:
     y = torch.floor(idx / base) % base
     z = torch.floor(idx / (base * base))
     coords = torch.stack((x, y, z), dim=-1).float()
-    # Rescale the canonical lattice [0, base-1] to [0, grid_size-1].
     if base > 1.0:
         coords = coords * ((grid - 1.0) / (base - 1.0))
     centers = coords.view(config.num_blocks, config.block_size, 3).mean(dim=1)

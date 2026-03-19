@@ -422,6 +422,8 @@ class NeuroplasticLlama(nn.Module):
         sca_basis_rank: int = 32,
         sca_basis_top_k: int = 8,
         sca_top_k: int = 3,
+        sca_routing_mode: str = "spatial_grid",
+        sca_semantic_block_score_normalized: bool = False,
         sca_adaptive_top_k: bool = False,
         sca_adaptive_top_k_min: Optional[int] = None,
         sca_adaptive_top_k_max: Optional[int] = None,
@@ -438,10 +440,15 @@ class NeuroplasticLlama(nn.Module):
         sca_grouped_row_min_bucket: int = 2,
         sca_grouped_row_allow_4bit_dequant: bool = False,
         sca_stability_dense_fallback_threshold: float = 0.0,
+        sca_bottom_buffer_layers: int = 2,
         sca_decode_guard_layers: int = 12,
+        sca_basis_rank_by_layer: Optional[Dict[int, int]] = None,
+        sca_basis_top_k_by_layer: Optional[Dict[int, int]] = None,
+        sca_top_k_by_layer: Optional[Dict[int, int]] = None,
         strict_decode_repetition_penalty: float = 1.35,
         strict_decode_penalty_window: int = 64,
         strict_decode_enable_repetition_penalty: bool = False,
+        strict_decode_upper_layer_cap_enabled: bool = True,
         strict_runtime_allow_noncuda_spmm_diagnostic: bool = False,
         kv_int4_quantization: bool = True,
         kv_cpu_offload: bool = True,
@@ -496,10 +503,12 @@ class NeuroplasticLlama(nn.Module):
         self.num_tasks = int(num_tasks)
         self.neuroplasticity_enabled = bool(neuroplasticity_enabled)
         self.buffer_layers = 2
+        self.bottom_buffer_layers = max(int(sca_bottom_buffer_layers), 0)
         self.decode_guard_layers = max(int(sca_decode_guard_layers), 0)
         self.strict_decode_repetition_penalty = float(max(strict_decode_repetition_penalty, 1.0))
         self.strict_decode_penalty_window = int(max(strict_decode_penalty_window, 0))
         self.strict_decode_enable_repetition_penalty = bool(strict_decode_enable_repetition_penalty)
+        self.strict_decode_upper_layer_cap_enabled = bool(strict_decode_upper_layer_cap_enabled)
         self.strict_runtime_allow_noncuda_spmm_diagnostic = bool(strict_runtime_allow_noncuda_spmm_diagnostic)
         self.collect_bio_gate_telemetry = False  # compatibility flag
         self.kv_int4_quantization = bool(kv_int4_quantization)
@@ -598,6 +607,11 @@ class NeuroplasticLlama(nn.Module):
             basis_rank=sca_basis_rank,
             basis_top_k=sca_basis_top_k,
             top_k=sca_top_k,
+            routing_mode=str(sca_routing_mode),
+            semantic_block_score_normalized=bool(sca_semantic_block_score_normalized),
+            basis_rank_by_layer=dict(sca_basis_rank_by_layer or {}),
+            basis_top_k_by_layer=dict(sca_basis_top_k_by_layer or {}),
+            top_k_by_layer=dict(sca_top_k_by_layer or {}),
             adaptive_top_k=bool(sca_adaptive_top_k),
             adaptive_top_k_min=int(sca_adaptive_top_k_min if sca_adaptive_top_k_min is not None else sca_top_k),
             adaptive_top_k_max=int(sca_adaptive_top_k_max if sca_adaptive_top_k_max is not None else sca_top_k),
@@ -689,10 +703,12 @@ class NeuroplasticLlama(nn.Module):
         self._cached_task_emb: Optional[torch.Tensor] = None
         self.disable_task_bias_injection: bool = False
         self._sca_recalibration_layer_indices: List[int] = []
+        self._sca_recalibration_active_sparse_layer_indices: List[int] = []
         self._sca_recalibration_mode: str = "local_mlp_geometry"
         self._sca_recalibration_trainable_modules: List[str] = []
         self._sca_recalibration_hybrid_checkpoint_path: str = ""
         self._sca_disable_task_bias_injection_from_artifact: Optional[bool] = None
+        self._sca_sparse_layer_override: Optional[set[int]] = None
         self.decoder_mirror_config: Optional[DecoderMirrorConfig] = None
         self.decoder_mirror: Optional[SparseDecoderMirrorSCA] = None
         self._decoder_mirror_enabled: bool = bool(decoder_mirror_enabled)
@@ -730,7 +746,7 @@ class NeuroplasticLlama(nn.Module):
         scale = self.sca_layer_output_scale[idx].to(device=device, dtype=dtype)
         scale = scale.clamp(min=0.0, max=1.5)
         # In strict sparse decode, cap upper-layer SCA contribution to reduce repetitive lexical attractors.
-        if bool(getattr(self, "sparse_attention_config", None) is not None) and bool(
+        if bool(self.strict_decode_upper_layer_cap_enabled) and bool(getattr(self, "sparse_attention_config", None) is not None) and bool(
             getattr(self.sparse_attention_config, "strict_fully_sparse", False)
         ):
             decode_band_start = max(int(self.sca_layer_output_scale.shape[0] * 0.75), 0)
@@ -1371,20 +1387,35 @@ class NeuroplasticLlama(nn.Module):
         include_adapter_scale: bool = False,
         include_layer_output_scale: bool = True,
         layer_indices: Optional[List[int]] = None,
+        active_sparse_layer_indices: Optional[List[int]] = None,
         recalibration_mode: str = "local_mlp_geometry",
         hybrid_checkpoint_path: str = "",
     ) -> List[nn.Parameter]:
         for param in self.parameters():
             param.requires_grad = False
 
+        decode_manifold_mode = str(recalibration_mode) == "decode_manifold_alignment"
+        total_layers = len(getattr(self, "sca_sparse_mlps", []))
         self._sca_recalibration_layer_indices = (
-            sorted(set(int(v) for v in layer_indices))
+            sorted(set(int(v) for v in layer_indices if 0 <= int(v) < total_layers))
             if layer_indices is not None
-            else list(range(len(self.sca_sparse_mlps)))
+            else list(range(total_layers))
         )
+        if active_sparse_layer_indices is not None:
+            active_sparse = sorted(set(int(v) for v in active_sparse_layer_indices if 0 <= int(v) < total_layers))
+        elif layer_indices is not None:
+            active_sparse = list(self._sca_recalibration_layer_indices)
+        else:
+            active_sparse = []
+        self._sca_recalibration_active_sparse_layer_indices = list(active_sparse)
         self._sca_recalibration_mode = str(recalibration_mode)
         self._sca_recalibration_hybrid_checkpoint_path = str(hybrid_checkpoint_path or "")
+        self.set_sparse_layer_override(active_sparse if active_sparse else None)
         self.set_mlp_alignment_capture(True, self._sca_recalibration_layer_indices)
+        if decode_manifold_mode:
+            include_spatial_proj = False
+            include_task_embedding = False
+            self._decoder_mirror_enabled = False
 
         trainable: List[nn.Parameter] = []
         trainable_names: List[str] = []
@@ -1426,6 +1457,15 @@ class NeuroplasticLlama(nn.Module):
 
         self._sca_recalibration_trainable_modules = trainable_names
         return trainable
+
+    def set_sparse_layer_override(self, layer_indices: Optional[List[int]]) -> None:
+        if layer_indices is None:
+            self._sca_sparse_layer_override = None
+            return
+        total_layers = len(getattr(self, "sca_sparse_mlps", []))
+        self._sca_sparse_layer_override = {
+            int(v) for v in layer_indices if 0 <= int(v) < total_layers
+        }
 
     def compute_sca_local_recalibration_loss(
         self,
@@ -1529,10 +1569,16 @@ class NeuroplasticLlama(nn.Module):
         return total, metrics
 
     def export_sca_recalibration_state(self) -> Dict[str, Any]:
+        active_sparse_layers = [
+            int(v) for v in getattr(self, "_sca_recalibration_active_sparse_layer_indices", []) if int(v) >= 0
+        ]
+        export_layers = sorted(set(active_sparse_layers or self._sca_recalibration_layer_indices))
+        export_layer_set = set(export_layers)
         payload: Dict[str, Any] = {
             "model_name": self.model_name,
             "hybrid_checkpoint_path": self._sca_recalibration_hybrid_checkpoint_path,
-            "layer_selection": list(self._sca_recalibration_layer_indices),
+            "layer_selection": list(export_layers),
+            "active_sparse_layer_selection": list(active_sparse_layers),
             "sca_config": self.sca_config.to_dict(),
             "recalibration_mode": self._sca_recalibration_mode,
             "trainable_modules": list(self._sca_recalibration_trainable_modules),
@@ -1548,6 +1594,8 @@ class NeuroplasticLlama(nn.Module):
             "router_metadata_snapshot": {
                 "sparse_mlp_bank_status": self.get_sparse_mlp_bank_status(),
                 "disable_task_bias_injection": bool(self.disable_task_bias_injection),
+                "strict_decode_upper_layer_cap_enabled": bool(self.strict_decode_upper_layer_cap_enabled),
+                "bottom_buffer_layers": int(getattr(self, "bottom_buffer_layers", 0)),
             },
         }
         if any(name.startswith("task_embedding.") for name in self._sca_recalibration_trainable_modules):
@@ -1558,7 +1606,7 @@ class NeuroplasticLlama(nn.Module):
             payload["sca_layer_output_scale"] = self.sca_layer_output_scale.detach().cpu()
         sparse_wrapper_state: Dict[str, Dict[str, torch.Tensor]] = {}
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
-            if any(name.startswith(f"sca_sparse_mlps.{layer_idx}.") for name in self._sca_recalibration_trainable_modules):
+            if int(layer_idx) in export_layer_set and hasattr(wrapper, "export_sparse_recalibration_state"):
                 sparse_wrapper_state[str(layer_idx)] = wrapper.export_sparse_recalibration_state()
         if sparse_wrapper_state:
             payload["sparse_mlp_wrapper_state"] = sparse_wrapper_state
@@ -1574,8 +1622,17 @@ class NeuroplasticLlama(nn.Module):
             raise RuntimeError("SCA recalibration checkpoint must be a dict")
 
         sca_cfg = blob.get("sca_config")
-        if isinstance(sca_cfg, dict) and "sparse_placement" in sca_cfg:
-            self.sca_config.sparse_placement = str(sca_cfg["sparse_placement"])
+        if isinstance(sca_cfg, dict):
+            if "sparse_placement" in sca_cfg:
+                self.sca_config.sparse_placement = str(sca_cfg["sparse_placement"])
+            if "routing_mode" in sca_cfg:
+                self.sca_config.routing_mode = str(sca_cfg["routing_mode"])
+            if "basis_rank_by_layer" in sca_cfg:
+                self.sca_config.basis_rank_by_layer = self.sca_config._normalize_layer_map(sca_cfg["basis_rank_by_layer"])
+            if "basis_top_k_by_layer" in sca_cfg:
+                self.sca_config.basis_top_k_by_layer = self.sca_config._normalize_layer_map(sca_cfg["basis_top_k_by_layer"])
+            if "top_k_by_layer" in sca_cfg:
+                self.sca_config.top_k_by_layer = self.sca_config._normalize_layer_map(sca_cfg["top_k_by_layer"])
 
         loaded = 0
         missing = 0
@@ -1621,6 +1678,9 @@ class NeuroplasticLlama(nn.Module):
         layer_selection = blob.get("layer_selection")
         if isinstance(layer_selection, list):
             self._sca_recalibration_layer_indices = [int(v) for v in layer_selection]
+        active_sparse_layer_selection = blob.get("active_sparse_layer_selection")
+        if isinstance(active_sparse_layer_selection, list):
+            self._sca_recalibration_active_sparse_layer_indices = [int(v) for v in active_sparse_layer_selection]
         self._sca_recalibration_mode = str(blob.get("recalibration_mode", self._sca_recalibration_mode))
         self._sca_recalibration_trainable_modules = [
             str(v) for v in blob.get("trainable_modules", self._sca_recalibration_trainable_modules)
@@ -1633,6 +1693,10 @@ class NeuroplasticLlama(nn.Module):
             disable_bias = bool(router_metadata["disable_task_bias_injection"])
             self.disable_task_bias_injection = disable_bias
             self._sca_disable_task_bias_injection_from_artifact = disable_bias
+        if isinstance(router_metadata, dict) and "strict_decode_upper_layer_cap_enabled" in router_metadata:
+            self.strict_decode_upper_layer_cap_enabled = bool(router_metadata["strict_decode_upper_layer_cap_enabled"])
+        if isinstance(router_metadata, dict) and "bottom_buffer_layers" in router_metadata:
+            self.bottom_buffer_layers = max(int(router_metadata["bottom_buffer_layers"]), 0)
         return {"loaded_items": int(loaded), "missing_items": int(missing)}
 
     def load_learned_basis_init(self, checkpoint_path: str, strict: bool = True) -> Dict[str, int]:
@@ -1644,6 +1708,14 @@ class NeuroplasticLlama(nn.Module):
             config = {}
         if "sparse_placement" in config:
             self.sca_config.sparse_placement = str(config.get("sparse_placement"))
+        if "routing_mode" in config:
+            self.sca_config.routing_mode = str(config.get("routing_mode"))
+        if "basis_rank_by_layer" in config:
+            self.sca_config.basis_rank_by_layer = self.sca_config._normalize_layer_map(config.get("basis_rank_by_layer", {}))
+        if "basis_top_k_by_layer" in config:
+            self.sca_config.basis_top_k_by_layer = self.sca_config._normalize_layer_map(config.get("basis_top_k_by_layer", {}))
+        if "top_k_by_layer" in config:
+            self.sca_config.top_k_by_layer = self.sca_config._normalize_layer_map(config.get("top_k_by_layer", {}))
         if self.sca_config.sparse_placement != "learned_basis":
             raise RuntimeError(
                 "learned-basis init requires sparse_placement='learned_basis'; "
@@ -2046,6 +2118,10 @@ class NeuroplasticLlama(nn.Module):
         latent_usage_entropies: List[float] = []
         latent_support_overlaps: List[float] = []
         latent_support_unique_fractions: List[float] = []
+        max_latent_importance_fractions: List[float] = []
+        max_latent_load_fractions: List[float] = []
+        max_block_importance_fractions: List[float] = []
+        max_block_load_fractions: List[float] = []
         for wrapper in self.sca_sparse_mlps:
             diag = wrapper.get_last_diagnostics()
             if diag is None:
@@ -2060,6 +2136,10 @@ class NeuroplasticLlama(nn.Module):
                 latent_usage_entropies.append(float(learned_basis.get("latent_usage_entropy", 0.0)))
                 latent_support_overlaps.append(float(learned_basis.get("support_overlap_mean", 0.0)))
                 latent_support_unique_fractions.append(float(learned_basis.get("support_unique_fraction", 0.0)))
+                max_latent_importance_fractions.append(float(learned_basis.get("max_latent_importance_fraction", 0.0)))
+                max_latent_load_fractions.append(float(learned_basis.get("max_latent_load_fraction", 0.0)))
+                max_block_importance_fractions.append(float(learned_basis.get("max_block_importance_fraction", 0.0)))
+                max_block_load_fractions.append(float(learned_basis.get("max_block_load_fraction", 0.0)))
             row.update(wrapper.get_fallback_stats())
             layers.append(row)
             total_bytes += float(diag.estimated_bytes_fetched_per_token)
@@ -2081,6 +2161,16 @@ class NeuroplasticLlama(nn.Module):
             "mean_latent_support_unique_fraction": float(
                 sum(latent_support_unique_fractions) / max(len(latent_support_unique_fractions), 1)
             ),
+            "mean_max_latent_importance_fraction": float(
+                sum(max_latent_importance_fractions) / max(len(max_latent_importance_fractions), 1)
+            ),
+            "mean_max_latent_load_fraction": float(
+                sum(max_latent_load_fractions) / max(len(max_latent_load_fractions), 1)
+            ),
+            "mean_max_block_importance_fraction": float(
+                sum(max_block_importance_fractions) / max(len(max_block_importance_fractions), 1)
+            ),
+            "mean_max_block_load_fraction": float(sum(max_block_load_fractions) / max(len(max_block_load_fractions), 1)),
         }
 
     def _maybe_update_summary(self, generated: torch.LongTensor) -> None:
@@ -2256,8 +2346,16 @@ class NeuroplasticLlama(nn.Module):
     def _sparse_layer_enabled(self, layer_idx: int) -> bool:
         if not self.neuroplasticity_enabled:
             return False
-        cutoff = len(self.model.model.layers) - self.buffer_layers - int(self.decode_guard_layers)
-        return layer_idx < max(cutoff, 0)
+        num_layers = len(self.model.model.layers)
+        lower = max(int(getattr(self, "bottom_buffer_layers", 0)), 0)
+        upper = num_layers - int(getattr(self, "buffer_layers", 0)) - int(getattr(self, "decode_guard_layers", 0))
+        enabled = lower <= int(layer_idx) < max(upper, 0)
+        if not enabled:
+            return False
+        override = getattr(self, "_sca_sparse_layer_override", None)
+        if override is None:
+            return True
+        return int(layer_idx) in override
 
     def _prepare_routing_state(
         self,
@@ -2741,10 +2839,12 @@ class NeuroplasticLlama(nn.Module):
         config["num_tasks"] = self.num_tasks
         config["base_model_name"] = self.model_name
         config["sca_config"] = self.sca_config.to_dict()
+        config["sca_bottom_buffer_layers"] = int(getattr(self, "bottom_buffer_layers", 0))
         config["sca_decode_guard_layers"] = int(self.decode_guard_layers)
         config["strict_decode_repetition_penalty"] = float(self.strict_decode_repetition_penalty)
         config["strict_decode_penalty_window"] = int(self.strict_decode_penalty_window)
         config["strict_decode_enable_repetition_penalty"] = bool(self.strict_decode_enable_repetition_penalty)
+        config["strict_decode_upper_layer_cap_enabled"] = bool(self.strict_decode_upper_layer_cap_enabled)
         config["strict_runtime_allow_noncuda_spmm_diagnostic"] = bool(self.strict_runtime_allow_noncuda_spmm_diagnostic)
         config["kv_cache"] = {
             "int4_quantization": self.kv_int4_quantization,
@@ -2800,10 +2900,12 @@ class NeuroplasticLlama(nn.Module):
             model_name = config.get("base_model_name", "unsloth/Meta-Llama-3.1-8B-bnb-4bit")
             num_tasks = int(config.get("num_tasks", 10))
             sca_cfg = config.get("sca_config", {})
+            sca_bottom_buffer_layers = int(config.get("sca_bottom_buffer_layers", 2))
             sca_decode_guard_layers = int(config.get("sca_decode_guard_layers", 12))
             strict_decode_repetition_penalty = float(config.get("strict_decode_repetition_penalty", 1.35))
             strict_decode_penalty_window = int(config.get("strict_decode_penalty_window", 64))
             strict_decode_enable_repetition_penalty = bool(config.get("strict_decode_enable_repetition_penalty", False))
+            strict_decode_upper_layer_cap_enabled = bool(config.get("strict_decode_upper_layer_cap_enabled", True))
             strict_runtime_allow_noncuda_spmm_diagnostic = bool(
                 config.get("strict_runtime_allow_noncuda_spmm_diagnostic", False)
             )
@@ -2815,10 +2917,12 @@ class NeuroplasticLlama(nn.Module):
             model_name = "unsloth/Meta-Llama-3.1-8B-bnb-4bit"
             num_tasks = 10
             sca_cfg = {}
+            sca_bottom_buffer_layers = 2
             sca_decode_guard_layers = 12
             strict_decode_repetition_penalty = 1.35
             strict_decode_penalty_window = 64
             strict_decode_enable_repetition_penalty = False
+            strict_decode_upper_layer_cap_enabled = True
             strict_runtime_allow_noncuda_spmm_diagnostic = False
             kv_cfg = {}
             bounded_cfg = {}
@@ -2841,6 +2945,7 @@ class NeuroplasticLlama(nn.Module):
             sca_basis_rank=int(sca_cfg.get("basis_rank", 32)),
             sca_basis_top_k=int(sca_cfg.get("basis_top_k", 8)),
             sca_top_k=int(sca_cfg.get("top_k", 3)),
+            sca_routing_mode=str(sca_cfg.get("routing_mode", "spatial_grid")),
             sca_adaptive_top_k=bool(sca_cfg.get("adaptive_top_k", False)),
             sca_adaptive_top_k_min=int(sca_cfg.get("adaptive_top_k_min", sca_cfg.get("top_k", 3))),
             sca_adaptive_top_k_max=int(sca_cfg.get("adaptive_top_k_max", sca_cfg.get("top_k", 3))),
@@ -2857,6 +2962,10 @@ class NeuroplasticLlama(nn.Module):
             sca_grouped_row_min_bucket=int(sca_cfg.get("grouped_row_min_bucket", 2)),
             sca_grouped_row_allow_4bit_dequant=bool(sca_cfg.get("grouped_row_allow_4bit_dequant", False)),
             sca_stability_dense_fallback_threshold=float(sca_cfg.get("stability_dense_fallback_threshold", 0.0)),
+            sca_bottom_buffer_layers=int(kwargs.pop("sca_bottom_buffer_layers", sca_bottom_buffer_layers)),
+            sca_basis_rank_by_layer=kwargs.pop("sca_basis_rank_by_layer", sca_cfg.get("basis_rank_by_layer", {})),
+            sca_basis_top_k_by_layer=kwargs.pop("sca_basis_top_k_by_layer", sca_cfg.get("basis_top_k_by_layer", {})),
+            sca_top_k_by_layer=kwargs.pop("sca_top_k_by_layer", sca_cfg.get("top_k_by_layer", {})),
             sca_decode_guard_layers=int(kwargs.pop("sca_decode_guard_layers", sca_decode_guard_layers)),
             strict_decode_repetition_penalty=float(
                 kwargs.pop("strict_decode_repetition_penalty", strict_decode_repetition_penalty)
@@ -2864,6 +2973,9 @@ class NeuroplasticLlama(nn.Module):
             strict_decode_penalty_window=int(kwargs.pop("strict_decode_penalty_window", strict_decode_penalty_window)),
             strict_decode_enable_repetition_penalty=bool(
                 kwargs.pop("strict_decode_enable_repetition_penalty", strict_decode_enable_repetition_penalty)
+            ),
+            strict_decode_upper_layer_cap_enabled=bool(
+                kwargs.pop("strict_decode_upper_layer_cap_enabled", strict_decode_upper_layer_cap_enabled)
             ),
             strict_runtime_allow_noncuda_spmm_diagnostic=bool(
                 kwargs.pop(

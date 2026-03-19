@@ -235,6 +235,185 @@ def test_sparse_llama_mlp_learned_basis_reports_sparse_latent_stats():
     assert reg_tensors["_coord_probs"].shape[0] == cfg.basis_rank
 
 
+def test_sparse_llama_mlp_semantic_latent_routing_bypasses_route_fn():
+    torch.manual_seed(1041)
+    cfg = _config(
+        spmm_impl="dense",
+        soft_mask=False,
+        sparse_placement="learned_basis",
+        routing_mode="semantic_latent",
+        basis_rank=4,
+        basis_top_k=1,
+        top_k=1,
+    )
+    mlp = _ToyMLP(hidden_size=cfg.hidden_size)
+
+    def _route_never_called(_hidden_states: torch.Tensor, _layer_idx: int):
+        raise RuntimeError("semantic_latent learned_basis should not call route_fn")
+
+    wrapper = SparseLlamaMLP(
+        base_mlp=mlp,
+        config=cfg,
+        layer_idx=0,
+        route_fn=_route_never_called,
+        enabled_fn=lambda _idx: True,
+    )
+    wrapper.set_route_capture(True)
+    with torch.no_grad():
+        wrapper.sparse_basis_encoder.weight.zero_()
+        wrapper.sparse_basis_encoder.bias.zero_()
+        wrapper.sparse_basis_encoder.weight[0, 0] = 1.0
+        wrapper.sparse_basis_decoder.zero_()
+        wrapper.sparse_basis_bias.zero_()
+        wrapper.sparse_basis_decoder[0, 0, :] = 2.0
+        wrapper.sparse_basis_decoder[1, 0, :] = 0.5
+
+    hidden = torch.zeros(2, 3, cfg.hidden_size)
+    hidden[..., 0] = 1.0
+    _ = wrapper(hidden)
+    snapshot = wrapper.get_last_route_snapshot()
+    assert snapshot is not None
+    assert torch.all(snapshot["active_idx"] == 0)
+    assert snapshot["latent_idx"].shape == (hidden.shape[0] * hidden.shape[1], 1)
+    assert torch.all(snapshot["latent_idx"] == 0)
+    assert torch.all(snapshot["block_scores"][:, 0] > snapshot["block_scores"][:, 1])
+
+
+def test_sparse_llama_mlp_semantic_latent_can_normalize_block_scores():
+    torch.manual_seed(10415)
+    configs = {
+        False: _config(
+            spmm_impl="dense",
+            soft_mask=False,
+            sparse_placement="learned_basis",
+            routing_mode="semantic_latent",
+            basis_rank=2,
+            basis_top_k=2,
+            top_k=1,
+            semantic_block_score_normalized=False,
+        ),
+        True: _config(
+            spmm_impl="dense",
+            soft_mask=False,
+            sparse_placement="learned_basis",
+            routing_mode="semantic_latent",
+            basis_rank=2,
+            basis_top_k=2,
+            top_k=1,
+            semantic_block_score_normalized=True,
+        ),
+    }
+    scores = {}
+    for normalized, cfg in configs.items():
+        mlp = _ToyMLP(hidden_size=cfg.hidden_size)
+        wrapper = SparseLlamaMLP(
+            base_mlp=mlp,
+            config=cfg,
+            layer_idx=0,
+            route_fn=_fixed_route,
+            enabled_fn=lambda _idx: True,
+        )
+        wrapper.set_route_capture(True)
+        with torch.no_grad():
+            wrapper.sparse_basis_encoder.weight.zero_()
+            wrapper.sparse_basis_encoder.bias.zero_()
+            wrapper.sparse_basis_encoder.weight[0, 0] = 1.0
+            wrapper.sparse_basis_encoder.weight[1, 1] = 1.0
+            wrapper.sparse_basis_decoder.zero_()
+            wrapper.sparse_basis_bias.zero_()
+            wrapper.sparse_basis_decoder[0, 0, :] = 10.0
+            wrapper.sparse_basis_decoder[0, 1, :] = 0.1
+            wrapper.sparse_basis_decoder[1, 0, :] = 1.0
+            wrapper.sparse_basis_decoder[1, 1, :] = 1.0
+        hidden = torch.zeros(1, 1, cfg.hidden_size)
+        hidden[..., 0] = 1.0
+        hidden[..., 1] = 1.0
+        _ = wrapper(hidden)
+        snapshot = wrapper.get_last_route_snapshot()
+        assert snapshot is not None
+        scores[normalized] = snapshot["block_scores"][0, :2].detach().cpu()
+
+    raw_gap = float((scores[False][0] - scores[False][1]).abs().item())
+    norm_gap = float((scores[True][0] - scores[True][1]).abs().item())
+    assert norm_gap < raw_gap
+
+
+def test_sparse_llama_mlp_semantic_latent_respects_per_layer_basis_rank():
+    torch.manual_seed(1042)
+    cfg = _config(
+        spmm_impl="dense",
+        soft_mask=False,
+        sparse_placement="learned_basis",
+        routing_mode="semantic_latent",
+        basis_rank=6,
+        basis_top_k=2,
+        top_k=1,
+        basis_rank_by_layer={0: 2},
+        basis_top_k_by_layer={0: 2},
+    )
+    mlp = _ToyMLP(hidden_size=cfg.hidden_size)
+    wrapper = SparseLlamaMLP(
+        base_mlp=mlp,
+        config=cfg,
+        layer_idx=0,
+        route_fn=_fixed_route,
+        enabled_fn=lambda _idx: True,
+    )
+    wrapper.set_route_capture(True)
+    with torch.no_grad():
+        wrapper.sparse_basis_encoder.weight.zero_()
+        wrapper.sparse_basis_encoder.bias.zero_()
+        wrapper.sparse_basis_encoder.weight[2, 0] = 4.0
+        wrapper.sparse_basis_decoder.zero_()
+        wrapper.sparse_basis_bias.zero_()
+        wrapper.sparse_basis_decoder[:, 2, :] = 3.0
+
+    hidden = torch.zeros(1, 2, cfg.hidden_size)
+    hidden[..., 0] = 1.0
+    out = wrapper(hidden)
+    snapshot = wrapper.get_last_route_snapshot()
+    reg_tensors = wrapper.get_last_learned_basis_regularizer_tensors()
+    assert snapshot is not None
+    assert reg_tensors is not None
+    assert int(snapshot["effective_basis_rank"].item()) == 2
+    assert int(snapshot["effective_basis_top_k"].item()) == 2
+    assert int(snapshot["latent_idx"].max().item()) < 2
+    assert reg_tensors["_coord_probs"].shape[0] == 2
+    assert torch.allclose(out, torch.zeros_like(out), atol=1e-7)
+
+
+def test_sparse_llama_mlp_semantic_latent_uses_per_layer_block_top_k():
+    torch.manual_seed(1043)
+    cfg = _config(
+        spmm_impl="dense",
+        soft_mask=False,
+        sparse_placement="learned_basis",
+        routing_mode="semantic_latent",
+        basis_rank=4,
+        basis_top_k=2,
+        top_k=2,
+        top_k_by_layer={0: 1},
+    )
+    mlp = _ToyMLP(hidden_size=cfg.hidden_size)
+    wrapper = SparseLlamaMLP(
+        base_mlp=mlp,
+        config=cfg,
+        layer_idx=0,
+        route_fn=_fixed_route,
+        enabled_fn=lambda _idx: True,
+    )
+    wrapper.set_route_capture(True)
+
+    hidden = torch.randn(2, 3, cfg.hidden_size)
+    out = wrapper(hidden)
+    snapshot = wrapper.get_last_route_snapshot()
+    assert snapshot is not None
+    assert snapshot["active_idx"].shape == (hidden.shape[0] * hidden.shape[1], 1)
+    assert int(snapshot["effective_block_top_k"].item()) == 1
+    assert tuple(wrapper.sparse_basis_decoder.shape) == (cfg.num_blocks, cfg.basis_rank, cfg.block_size)
+    assert out.shape == hidden.shape
+
+
 def test_sparse_llama_mlp_initialize_sparse_basis_from_dense_init():
     torch.manual_seed(105)
     cfg = _config(spmm_impl="dense", soft_mask=False, sparse_placement="learned_basis", basis_rank=6, basis_top_k=2)

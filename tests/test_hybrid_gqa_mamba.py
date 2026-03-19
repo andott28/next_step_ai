@@ -3,6 +3,7 @@ import os
 import sys
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +19,8 @@ from neuroplastic_llama_gqa_mamba import (  # noqa: E402
 )
 from paged_sparse_attention import SparseAttentionConfig, SparseAttentionRuntime
 from run_hybrid_gqa_mamba_inference import _build_arg_parser
+from run_sca_recalibration_from_hybrid_baseline import _compute_latent_support_regularizer
+from sca_sparse_config import SCASparseConfig
 
 
 class _FakeAttention(nn.Module):
@@ -109,7 +112,30 @@ def _build_fake_neuroplastic_model(layers: list[_Layer]) -> NeuroplasticLlama:
     fake.attention_hybrid_force_no_cache = True
     fake.attention_gqa_mamba_enabled = False
     fake.sca_sparse_mlps = []
+    fake.strict_decode_upper_layer_cap_enabled = True
     return fake
+
+
+def _sca_config(**kwargs) -> SCASparseConfig:
+    base = dict(
+        hidden_size=8,
+        block_size=4,
+        block_rank=2,
+        basis_rank=4,
+        basis_top_k=2,
+        top_k=2,
+        adaptive_top_k_min=1,
+        adaptive_top_k_max=2,
+        sigma=1.0,
+        refractory_steps=0,
+        inhibition_lambda=0.0,
+        use_cuda=False,
+        grid_size=2,
+        spmm_impl="dense",
+        soft_mask=False,
+    )
+    base.update(kwargs)
+    return SCASparseConfig(**base)
 
 
 def test_hybrid_attention_mix_zero_matches_original():
@@ -189,6 +215,18 @@ def test_sparse_attention_mode_keeps_cache_enabled_even_in_hybrid_mode():
     model = _build_fake_neuroplastic_model([])
     model.sparse_attention_config = types.SimpleNamespace(enabled=True)
     assert NeuroplasticLlama._should_disable_generation_cache(model, True) is False
+
+
+def test_sparse_layer_enabled_respects_bottom_buffer_and_top_guard():
+    model = _build_fake_neuroplastic_model([_Layer(_FakeAttention(0.0)) for _ in range(6)])
+    model.neuroplasticity_enabled = True
+    model.bottom_buffer_layers = 2
+    model.buffer_layers = 1
+    model.decode_guard_layers = 1
+    expected_sparse = {2, 3}
+    for layer_idx in range(6):
+        is_sparse = NeuroplasticLlama._sparse_layer_enabled(model, layer_idx)
+        assert is_sparse is (layer_idx in expected_sparse)
 
 
 class _DummySparseWrapper:
@@ -284,6 +322,34 @@ class _DummyBasisWrapper(nn.Module):
             param.data = tensor.to(device=param.device, dtype=param.dtype)
             loaded += 1
         return {"loaded_items": loaded, "missing_items": missing}
+
+
+class _DummyRegularizerWrapper:
+    def __init__(self, *, latent_importance, latent_load, block_importance, block_load) -> None:
+        self._stats = {
+            "mean_latent_norm": 1.0,
+            "active_latent_fraction": 0.5,
+            "active_latent_coords_used": float(len(latent_importance)),
+            "latent_usage_entropy": 0.0,
+            "support_overlap_mean": 0.0,
+            "support_unique_fraction": 1.0,
+            "max_latent_importance_fraction": float(max(latent_importance)),
+            "max_latent_load_fraction": float(max(latent_load)),
+            "max_block_importance_fraction": float(max(block_importance)),
+            "max_block_load_fraction": float(max(block_load)),
+        }
+        self._reg = {
+            "_latent_importance_probs": torch.tensor(latent_importance, dtype=torch.float32),
+            "_latent_load_probs": torch.tensor(latent_load, dtype=torch.float32),
+            "_block_importance_probs": torch.tensor(block_importance, dtype=torch.float32),
+            "_block_load_probs": torch.tensor(block_load, dtype=torch.float32),
+        }
+
+    def get_last_learned_basis_stats(self):
+        return self._stats
+
+    def get_last_learned_basis_regularizer_tensors(self):
+        return self._reg
 
 
 class _ToyInnerModel(nn.Module):
@@ -433,13 +499,14 @@ def _build_fake_sca_model_for_recalibration() -> NeuroplasticLlama:
     model.attention_hybrid_state_dim = None
     model.attention_hybrid_force_no_cache = True
     model.sca_sparse_mlps = [_DummySparseAlignmentWrapper(), _DummySparseAlignmentWrapper()]
-    model.sca_config = types.SimpleNamespace(to_dict=lambda: {"block_size": 8, "top_k": 2})
+    model.sca_config = _sca_config()
     model._sparse_mlp_bank_manifest_path = None
     model.disable_task_bias_injection = False
     model.spatial_proj = nn.Linear(8, 3, bias=True)
     model.task_embedding = nn.Embedding(4, 8)
     model.adapter_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
     model.lm_head = nn.Linear(8, 8, bias=False)
+    model.strict_decode_upper_layer_cap_enabled = True
     model._sca_recalibration_layer_indices = []
     model._sca_recalibration_mode = "local_mlp_geometry"
     model._sca_recalibration_trainable_modules = []
@@ -469,17 +536,7 @@ def _build_forward_ready_decoder_mirror_model() -> NeuroplasticLlama:
     model.sparse_attention_config = types.SimpleNamespace(enabled=False)
     model._sparse_attention_runtime = None
     model._last_sparse_attention_step = {}
-    model.sca_config = types.SimpleNamespace(
-        block_size=2,
-        num_blocks=4,
-        top_k=1,
-        grid_size=2,
-        sigma=1.0,
-        use_cuda=False,
-        spmm_impl="dense",
-        stability_dense_fallback_threshold=0.0,
-        to_dict=lambda: {"block_size": 2, "top_k": 1, "num_blocks": 4},
-    )
+    model.sca_config = _sca_config(block_size=2, top_k=1)
     model.task_embedding = nn.Embedding(4, 8)
     model.spatial_proj = nn.Linear(8, 3, bias=True)
     model.adapter_scale = nn.Parameter(torch.tensor(1.0), requires_grad=False)
@@ -508,6 +565,7 @@ def _build_forward_ready_decoder_mirror_model() -> NeuroplasticLlama:
     model._current_task_id = 0
     model._cached_task_emb = None
     model.disable_task_bias_injection = True
+    model.strict_decode_upper_layer_cap_enabled = True
     model._sca_recalibration_layer_indices = []
     model._sca_recalibration_mode = "local_mlp_geometry"
     model._sca_recalibration_trainable_modules = []
@@ -599,9 +657,12 @@ def test_export_sca_recalibration_state_round_trip(tmp_path):
 def test_export_sca_recalibration_state_round_trip_with_learned_basis_wrapper(tmp_path):
     model_a = _build_fake_sca_model_for_recalibration()
     model_a.sca_sparse_mlps = [_DummyBasisWrapper(), _DummyBasisWrapper()]
-    model_a.sca_config = types.SimpleNamespace(
+    model_a.sca_config = _sca_config(
         sparse_placement="learned_basis",
-        to_dict=lambda: {"block_size": 8, "top_k": 2, "sparse_placement": "learned_basis"},
+        routing_mode="semantic_latent",
+        basis_rank_by_layer={0: 3},
+        basis_top_k_by_layer={0: 2},
+        top_k_by_layer={0: 1},
     )
     NeuroplasticLlama.prepare_sca_local_recalibration(
         model_a,
@@ -619,13 +680,14 @@ def test_export_sca_recalibration_state_round_trip_with_learned_basis_wrapper(tm
 
     model_b = _build_fake_sca_model_for_recalibration()
     model_b.sca_sparse_mlps = [_DummyBasisWrapper(), _DummyBasisWrapper()]
-    model_b.sca_config = types.SimpleNamespace(
-        sparse_placement="input_mask",
-        to_dict=lambda: {"block_size": 8, "top_k": 2, "sparse_placement": "input_mask"},
-    )
+    model_b.sca_config = _sca_config()
     info = NeuroplasticLlama.load_sca_recalibration_state(model_b, str(ckpt), strict=True)
     assert info["loaded_items"] >= 3
     assert model_b.sca_config.sparse_placement == "learned_basis"
+    assert model_b.sca_config.routing_mode == "semantic_latent"
+    assert model_b.sca_config.basis_rank_by_layer == {0: 3}
+    assert model_b.sca_config.basis_top_k_by_layer == {0: 2}
+    assert model_b.sca_config.top_k_by_layer == {0: 1}
     assert torch.allclose(model_b.sca_sparse_mlps[0].weight, model_a.sca_sparse_mlps[0].weight)
     assert torch.allclose(model_b.sca_sparse_mlps[0].bias, model_a.sca_sparse_mlps[0].bias)
 
@@ -633,10 +695,23 @@ def test_export_sca_recalibration_state_round_trip_with_learned_basis_wrapper(tm
 def test_load_learned_basis_init_into_wrappers(tmp_path):
     model = _build_fake_sca_model_for_recalibration()
     model.sca_sparse_mlps = [_DummyBasisWrapper(), _DummyBasisWrapper()]
-    model.sca_config = types.SimpleNamespace(sparse_placement="learned_basis", basis_rank=1)
+    model.sca_config = _sca_config(
+        sparse_placement="learned_basis",
+        routing_mode="semantic_latent",
+        basis_rank=1,
+        basis_top_k=1,
+        top_k=1,
+    )
     ckpt = tmp_path / "learned_basis_init.pt"
     payload = {
-        "config": {"sparse_placement": "learned_basis", "basis_rank": 1},
+        "config": {
+            "sparse_placement": "learned_basis",
+            "routing_mode": "semantic_latent",
+            "basis_rank": 1,
+            "basis_rank_by_layer": {"0": 1},
+            "basis_top_k_by_layer": {"0": 1},
+            "top_k_by_layer": {"0": 1},
+        },
         "layer_states": {
             "0": {"decoder_blocks": torch.tensor([3.0]), "decoder_bias": torch.tensor([4.0])},
             "1": {"decoder_blocks": torch.tensor([5.0]), "decoder_bias": torch.tensor([6.0])},
@@ -645,8 +720,112 @@ def test_load_learned_basis_init_into_wrappers(tmp_path):
     torch.save(payload, ckpt)
     info = NeuroplasticLlama.load_learned_basis_init(model, str(ckpt), strict=True)
     assert info["loaded_items"] >= 4
+    assert model.sca_config.routing_mode == "semantic_latent"
+    assert model.sca_config.basis_rank_by_layer == {0: 1}
+    assert model.sca_config.basis_top_k_by_layer == {0: 1}
+    assert model.sca_config.top_k_by_layer == {0: 1}
     assert torch.allclose(model.sca_sparse_mlps[0].weight, torch.tensor([3.0]))
     assert torch.allclose(model.sca_sparse_mlps[0].bias, torch.tensor([4.0]))
+
+
+def test_prepare_sca_local_recalibration_decode_manifold_alignment_freezes_spatial_proj():
+    model = _build_fake_sca_model_for_recalibration()
+    for p in model.parameters():
+        p.requires_grad = True
+    NeuroplasticLlama.prepare_sca_local_recalibration(
+        model,
+        include_spatial_proj=True,
+        include_task_embedding=True,
+        recalibration_mode="decode_manifold_alignment",
+    )
+    assert all(p.requires_grad is False for p in model.spatial_proj.parameters())
+    assert all(p.requires_grad is False for p in model.task_embedding.parameters())
+
+
+def test_prepare_sca_local_recalibration_can_run_lower_layers_sparse_but_frozen():
+    model = _build_fake_sca_model_for_recalibration()
+    NeuroplasticLlama.prepare_sca_local_recalibration(
+        model,
+        include_spatial_proj=False,
+        include_task_embedding=False,
+        layer_indices=[1],
+        active_sparse_layer_indices=[0, 1],
+        recalibration_mode="decode_manifold_alignment",
+    )
+    assert model._sca_recalibration_layer_indices == [1]
+    assert model._sca_recalibration_active_sparse_layer_indices == [0, 1]
+    assert model._sca_sparse_layer_override == {0, 1}
+
+
+def test_export_sca_recalibration_state_keeps_all_active_sparse_layers(tmp_path):
+    model_a = _build_fake_sca_model_for_recalibration()
+    model_a.sca_sparse_mlps = [_DummyBasisWrapper(), _DummyBasisWrapper(), _DummyBasisWrapper()]
+    model_a.sca_config = _sca_config(
+        sparse_placement="learned_basis",
+        routing_mode="semantic_latent",
+        basis_rank_by_layer={0: 3, 1: 3, 2: 3},
+        basis_top_k_by_layer={0: 2, 1: 2, 2: 2},
+        top_k_by_layer={0: 1, 1: 1, 2: 1},
+    )
+    NeuroplasticLlama.prepare_sca_local_recalibration(
+        model_a,
+        include_spatial_proj=False,
+        include_task_embedding=False,
+        layer_indices=[2],
+        active_sparse_layer_indices=[0, 1, 2],
+        recalibration_mode="decode_manifold_alignment",
+        hybrid_checkpoint_path="hybrid.pt",
+    )
+    with torch.no_grad():
+        model_a.sca_sparse_mlps[0].weight.fill_(1.25)
+        model_a.sca_sparse_mlps[1].weight.fill_(2.5)
+        model_a.sca_sparse_mlps[2].weight.fill_(3.75)
+    payload = NeuroplasticLlama.export_sca_recalibration_state(model_a)
+    assert payload["layer_selection"] == [0, 1, 2]
+    assert payload["active_sparse_layer_selection"] == [0, 1, 2]
+    assert sorted(int(k) for k in payload["sparse_mlp_wrapper_state"].keys()) == [0, 1, 2]
+
+    ckpt = tmp_path / "progressive_sparse_state.pt"
+    torch.save(payload, ckpt)
+    model_b = _build_fake_sca_model_for_recalibration()
+    model_b.sca_sparse_mlps = [_DummyBasisWrapper(), _DummyBasisWrapper(), _DummyBasisWrapper()]
+    model_b.sca_config = _sca_config()
+    info = NeuroplasticLlama.load_sca_recalibration_state(model_b, str(ckpt), strict=True)
+    assert info["loaded_items"] >= 3
+    assert model_b._sca_recalibration_layer_indices == [0, 1, 2]
+    assert model_b._sca_recalibration_active_sparse_layer_indices == [0, 1, 2]
+    assert torch.allclose(model_b.sca_sparse_mlps[0].weight, model_a.sca_sparse_mlps[0].weight)
+    assert torch.allclose(model_b.sca_sparse_mlps[1].weight, model_a.sca_sparse_mlps[1].weight)
+    assert torch.allclose(model_b.sca_sparse_mlps[2].weight, model_a.sca_sparse_mlps[2].weight)
+
+
+def test_latent_support_regularizer_penalizes_collapsed_routing_more_than_balanced():
+    collapsed = _build_fake_sca_model_for_recalibration()
+    collapsed.sca_sparse_mlps = [
+        _DummyRegularizerWrapper(
+            latent_importance=[1.0, 0.0, 0.0],
+            latent_load=[1.0, 0.0, 0.0],
+            block_importance=[1.0, 0.0],
+            block_load=[1.0, 0.0],
+        )
+    ]
+    balanced = _build_fake_sca_model_for_recalibration()
+    balanced.sca_sparse_mlps = [
+        _DummyRegularizerWrapper(
+            latent_importance=[1 / 3, 1 / 3, 1 / 3],
+            latent_load=[1 / 3, 1 / 3, 1 / 3],
+            block_importance=[0.5, 0.5],
+            block_load=[0.5, 0.5],
+        )
+    ]
+
+    collapsed_latent, collapsed_block, collapsed_metrics = _compute_latent_support_regularizer(collapsed)
+    balanced_latent, balanced_block, balanced_metrics = _compute_latent_support_regularizer(balanced)
+
+    assert float(collapsed_latent.item()) > float(balanced_latent.item())
+    assert float(collapsed_block.item()) > float(balanced_block.item())
+    assert collapsed_metrics["max_latent_importance_fraction"] > balanced_metrics["max_latent_importance_fraction"]
+    assert collapsed_metrics["max_block_importance_fraction"] > balanced_metrics["max_block_importance_fraction"]
 
 
 def test_disable_task_bias_injection_recalibration_flag():
@@ -805,6 +984,9 @@ def test_inference_loader_accepts_decoder_mirror_checkpoint():
         ]
     )
     assert args.decoder_mirror_checkpoint == "decoder_mirror.pt"
+    assert args.sca_routing_mode == "semantic_latent"
+    assert args.sca_bottom_buffer_layers == 2
+    assert args.strict_decode_upper_layer_cap_enabled is False
 
 
 def test_sparse_attention_mode_set_and_reset():
