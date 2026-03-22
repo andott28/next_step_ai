@@ -1,120 +1,94 @@
 # next_step_ai
 
-This repository contains the current Neuroplastic Llama experimentation stack, with the active work centered on sparse MLP routing, hybrid GQA/Mamba attention, and strict autoregressive decode stability.
+This repository contains the current Neuroplastic Llama experimentation stack focused on sparse MLP routing, hybrid GQA/Mamba attention, and strict autoregressive decode stability.
 
-The canonical production model for current work is [`llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py). The current sparse MLP path of interest is `sparse_placement="learned_basis"` with `routing_mode="semantic_latent"`.
+The canonical model class is `llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`.
+The canonical sparse path is:
 
-## The model being built
+- `sparse_placement="learned_basis"`
+- `routing_mode="semantic_latent"`
 
-This repo is not training a language model from scratch. It is building a modified Llama-family causal decoder that starts from a dense base model and then swaps in sparse or hybrid components while trying to keep normal greedy next-token decoding intact.
+## What this project is building
 
-In the current exercised setup, the base model is usually `unsloth/Meta-Llama-3.1-8B-bnb-4bit`, loaded through Hugging Face as a 4-bit quantized `LlamaForCausalLM`. The dense teacher for all sparse work is the same model with neuroplastic routing disabled, not a separate checkpoint.
+This repo does not train from scratch. It starts from a dense Llama-family checkpoint (usually `unsloth/Meta-Llama-3.1-8B-bnb-4bit`) and replaces parts of runtime/training with sparse and hybrid components while trying to preserve normal greedy decode quality.
 
-The immediate proving ground is the 8B model, but the actual project target is much more aggressive: push the architecture and runtime toward something 405B-class in capability density while remaining runnable on an 8 GB VRAM GPU through a combination of extreme sparsity, selective dense fallback elimination, hybrid attention/state-space replacements, quantization, and CPU/off-GPU memory streaming. The 8B model is therefore the experimental platform, not the final ambition.
+Current long-term target:
 
-Architecturally, the target model has four main pieces:
-
-- A frozen Llama decoder backbone that still provides the token embeddings, residual stream, layer norms, and LM head.
-- Optional hybrid attention layers where selected self-attention modules are replaced with a GQA/Mamba-style collapsed state-space block mixed with the original attention path.
-- Sparse MLP wrappers around the transformer MLPs, with the current canonical path using a learned semantic latent basis rather than masking raw hidden units directly.
-- Strict runtime controls for long-context and sparse decode, including bounded context, paged sparse attention, and decode-time guards intended to preserve stable autoregressive behavior.
-
-For the current sparse MLP design, each wrapped MLP is conceptually:
-
-- encoder from residual stream to latent coordinates
-- SiLU activation in latent space
-- top-k latent support selection in that semantic basis
-- block scoring from latent magnitude times decoder block norms
-- sparse reconstruction of the MLP update back into residual-stream coordinates
-
-The critical point is that sparsity is supposed to live in the learned latent basis, not in the raw hidden basis. The goal is to make the sparse MLP produce updates that still lie close to the dense model's decode manifold, so downstream layers and the LM head continue to decode coherent text without decode-time hacks.
-
-By default, the model now keeps the earliest `sca_bottom_buffer_layers=2` MLP layers dense and also keeps a top decode guard band dense. That means the intended sparse regime is the middle band of layers, where the representation is semantic enough for learned-basis routing to be viable but not so late that small errors immediately corrupt token selection.
+- Use the 8B model as the proving platform.
+- Push architecture/runtime ideas toward a 405B-class deployment strategy on 8 GB VRAM using sparsity, quantization, and off-GPU streaming.
 
 ## How this differs from the original Unsloth model
 
-This codebase is heavily modified relative to the original `unsloth/Meta-Llama-3.1-8B-bnb-4bit` runtime. It should not be thought of as "just Unsloth plus a small plugin." The base weights still come from that model family, but large parts of the execution path, diagnostics, and calibration machinery have been replaced or wrapped.
+Compared to the original Unsloth execution path, this repo is heavily modified:
 
-The most important differences are:
+- Transformer MLPs are wrapped by `llama3_neuroplastic/sca_sparse_mlp.py`.
+- Attention can be hybridized/collapsed in `llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`.
+- Runtime adds bounded-context and paged sparse-attention features.
+- KV cache paths include quantized/offload variants.
+- The model includes extra calibration/runtime controls not present in base Unsloth.
+- Training/eval includes strict decode diagnostics and gating artifacts.
 
-- Transformer MLPs are wrapped by [`llama3_neuroplastic/sca_sparse_mlp.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/sca_sparse_mlp.py), which can replace the dense MLP update with sparse compute paths, including the current semantic-latent learned-basis route.
-- Selected attention layers can be replaced with hybrid GQA/Mamba modules or fully collapsed Mamba-style attention surrogates inside [`llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py).
-- The runtime adds bounded-context and paged sparse-attention logic for long-context operation and strict sparse decode, rather than relying on the original dense attention/cache behavior.
-- KV cache handling is modified to support int4 quantization and CPU offload paths, which are part of the memory budget strategy for low-VRAM hardware.
-- The model includes new trainable control components such as `task_embedding`, `sca_layer_output_scale`, sparse routing state, and optional decoder-mirror modules that do not exist in the original base model.
-- The forward path collects extensive sparse-routing and alignment telemetry, including latent support usage, block load, fallback rate, and hidden/logit alignment data, because this repo optimizes for decode stability under sparse execution rather than only ordinary inference throughput.
-- The repo adds explicit recalibration and checkpoint formats for hybrid attention state, learned-basis initialization, sparse recalibration state, and strict diagnostic artifacts.
+In short: base weights are reused, but execution and calibration logic are substantially different.
 
-At a practical level, this means the current model should be understood as:
+## Current state (March 2026)
 
-- original Llama weights and tokenizer as the base
-- heavily modified attention runtime
-- heavily modified MLP runtime
-- additional calibration and sparse-control modules
-- additional offload, cache, and strict-decode logic
+What is working:
 
-That is why results from the original Unsloth checkpoint do not directly answer whether this modified model works: the inference graph has changed substantially.
+- Bottom buffer guard (`sca_bottom_buffer_layers=2`) fixes the early-layer collapse issue.
+- Semantic-latent routing path is implemented and tested.
+- Routing collapse mitigations (balance penalties, per-layer controls) are in place.
+- Runtime cleanup pass (March 22, 2026) landed without feature removal:
+  - bounded-context attention now uses an explicit wrapper module instead of forward monkeypatching
+  - generation/cache runtime mode checks are cached in internal runtime flags
+  - decode loop reduces hot-path overhead (vectorized EOS/repetition penalty logic, lower per-step churn)
+  - sparse config now validates incompatible runtime combinations earlier and supports per-layer canonicalized overrides
 
-## Current focus
+What is still failing:
 
-The main engineering target in this repo is:
+- Deep continuous sparse stacking still degrades beyond a depth boundary.
+- Typical failure boundary is around guards equivalent to sparse layers reaching into the 2-11 range.
+- Strict quality gate is still failing for deep bands, even when short prompts may look coherent.
 
-- semantic-latent sparse MLP routing
-- dense-informed learned-basis initialization
-- decode-manifold recalibration
-- strict decode diagnostics and gating
+Practical implication:
 
-Current guardrail defaults for the new path:
+- Mid-band sparse operation is usable.
+- Full deep sparse stacking is not yet production-stable under strict decode metrics.
 
-- `sca_sparse_placement=learned_basis`
-- `sca_routing_mode=semantic_latent`
-- `strict_decode_enable_repetition_penalty=False`
-- `strict_decode_upper_layer_cap_enabled=False`
-- `sca_bottom_buffer_layers=2`
+## Current architectural problems
 
-The bottom-buffer guard exists because the earliest layers operate close to embedding space and can destabilize sparse routing if they are forced sparse too early.
+- The current attention-collapse backend is heuristic, not a direct mathematical compile of Llama attention. The existing GQA/Mamba path is based on grouped SVD collapse plus a small recurrent block, so it is lighter than dense attention but not a faithful attention-to-SSM translation.
+- The current `learned_basis` sparse MLP is a different operator class than the dense SwiGLU MLP it is trying to replace. Even with deterministic basis initialization, it still relies on latent support selection, block selection, and sparse reconstruction rather than preserving the original dense block weights.
+- The current semantic-latent router is still only an approximation to dense block usage. It routes from latent magnitudes and decoder statistics rather than from a compiled per-sample dense block-support target, which is one reason the project has needed heavy recalibration.
+- Deep stacked sparse MLP execution accumulates error across layers. A layer can look acceptable in isolation but still push the residual stream off-manifold when many sparse layers are active at once, which is the main source of repetition collapse and junk decode in current experiments.
+- The runtime stack is still strongly coupled to standard KV-cache attention. Cache packing, KV quantization, CPU offload, bounded context, and paged sparse-attention paths all assume attention layers expose conventional key/value cache structure, which makes alternative recurrent attention backends a larger integration task.
+- Short prompts can look superficially coherent even when the architecture is failing under strict decode metrics. In practice, the real acceptance criteria are rollout KL, hidden-state cosine, degeneration rate, and strict greedy continuation quality rather than one-off prompt samples.
 
-## Design target
+## Key files
 
-The model being built here is a strict-decode-compatible sparse Llama variant:
-
-- dense enough at the bottom and decode-critical top to avoid catastrophic drift
-- sparse through the middle MLP stack using semantic-latent routing
-- optionally hybridized in attention through GQA/Mamba replacements
-- evaluated by actual greedy autoregressive continuation quality, not only reconstruction loss
-
-The immediate success condition is not "maximum sparsity." It is coherent text generation under shipped runtime settings with zero dense fallback and without repetition-penalty tricks compensating for model drift.
-
-Longer-term, the design target is a model/runtime stack that scales the same ideas far beyond 8B and makes a 405B-class deployment story plausible on commodity 8 GB VRAM by aggressively reducing active compute and active memory per token. That target is not solved in this repository yet; the current work is the engineering path toward it.
+- `llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`: canonical runtime model
+- `llama3_neuroplastic/sca_sparse_mlp.py`: sparse MLP wrapper, semantic routing, curriculum/banking hooks
+- `llama3_neuroplastic/sca_sparse_config.py`: sparse config, runtime compatibility validation, and per-layer override canonicalization
+- `llama3_neuroplastic/experiments/run_sca_recalibration_from_hybrid_baseline.py`: recalibration runner
+- `llama3_neuroplastic/experiments/init_learned_basis_from_dense_mlp.py`: dense-informed basis init
+- `llama3_neuroplastic/experiments/run_hybrid_gqa_mamba_inference.py`: runtime decode sanity checks
+- `llama3_neuroplastic/experiments/strict_decode_metrics.py`: strict decode metric utilities
 
 ## Repository layout
 
-- [`llama3_neuroplastic/`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic) - core model code, sparse MLP wrappers, diagnostics, and runners
-- [`tests/`](c:/Users/andre/Desktop/Overføre/next_step_ai/tests) - targeted regression tests for sparse routing, recalibration, and decode metrics
-- [`run_semantic_sparse_pipeline.ps1`](c:/Users/andre/Desktop/Overføre/next_step_ai/run_semantic_sparse_pipeline.ps1) - PowerShell wrapper that runs profile -> learned-basis init -> recalibration -> strict diagnostic
-- [`written_documentation/`](c:/Users/andre/Desktop/Overføre/next_step_ai/written_documentation) - research notes, execution reports, and root-cause writeups
-- [`verification_env/`](c:/Users/andre/Desktop/Overføre/next_step_ai/verification_env) - local Python environment used for the current workflow in this repo
-
-## Canonical scripts
-
-- [`llama3_neuroplastic/run_sca_layer_decode_profile.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/run_sca_layer_decode_profile.py)
-  Profiles one sparse layer at a time under strict decode and writes per-layer impact scores plus recommended budget overrides.
-- [`llama3_neuroplastic/init_learned_basis_from_dense_mlp.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/init_learned_basis_from_dense_mlp.py)
-  Builds dense-informed learned-basis initialization from teacher-forced and dense greedy-rollout prefixes.
-- [`llama3_neuroplastic/run_sca_recalibration_from_hybrid_baseline.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/run_sca_recalibration_from_hybrid_baseline.py)
-  Trains sparse MLP recalibration, including `recalibration_mode="decode_manifold_alignment"`.
-- [`llama3_neuroplastic/run_sca_diagnostic_wipe.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/run_sca_diagnostic_wipe.py)
-  Runs strict decode evaluation and emits a consolidated JSON artifact.
-- [`llama3_neuroplastic/run_hybrid_gqa_mamba_inference.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/run_hybrid_gqa_mamba_inference.py)
-  Fast runtime sanity-check script for dense vs sparse text quality and runtime flags.
+- `llama3_neuroplastic/`: core model and experiment scripts
+- `tests/`: regression tests
+- `results/`: generated checkpoints and metrics
+- `written_documentation/`: notes and reports
+- `verification_env/`: local Python environment
 
 ## Recommended workflow
 
-Run everything from the repo root in PowerShell.
+Run from repo root in PowerShell.
 
-### 1. Targeted tests
+### 1) Targeted tests
 
 ```powershell
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 .\verification_env\Scripts\python.exe -m pytest `
   tests/test_sca_sparse_mlp.py `
   tests/test_hybrid_gqa_mamba.py `
@@ -123,74 +97,56 @@ Run everything from the repo root in PowerShell.
   -q
 ```
 
-### 2. End-to-end semantic sparse pipeline
-
-This is the recommended entrypoint when you want the full profile -> init -> recalibration -> diagnostic flow without running unrelated tasks:
+### 2) Recalibration run (direct runner)
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_semantic_sparse_pipeline.ps1 `
-  -ModelName "unsloth/Meta-Llama-3.1-8B-bnb-4bit" `
-  -HybridCheckpoint ".\results\hybrid_8b_export\hybrid_attention_state.pt" `
-  -OutputRoot ".\results\semantic_pipeline_run" `
-  -LayerSelection "2-17" `
-  -LimitBasisInitToSelectedLayers `
-  -ScaBottomBufferLayers 2 `
-  -ValidationPrefixCount 32 `
-  -MaxNewTokens 6 `
-  -MaxSamples 64 `
-  -MaxSeqLength 96 `
-  -Steps 24 `
-  -SkipTests
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
+.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_sca_recalibration_from_hybrid_baseline.py `
+  --model-name "unsloth/Meta-Llama-3.1-8B-bnb-4bit" `
+  --hybrid-checkpoint ".\results\hybrid_8b_export\hybrid_attention_state.pt" `
+  --learned-basis-init-checkpoint ".\results\semantic_pipeline_clean_b2_l2_17\learned_basis_init_profiled.pt" `
+  --output-dir ".\results\recal_run" `
+  --recalibration-mode decode_manifold_alignment `
+  --layers "2-9" `
+  --sca-routing-mode semantic_latent `
+  --sca-bottom-buffer-layers 2 `
+  --sca-decode-guard-layers 22 `
+  --basis-rank 96 `
+  --basis-top-k 12 `
+  --top-k 6 `
+  --steps 32 `
+  --max-samples 16 `
+  --max-seq-length 64 `
+  --validation-prefix-count 4 `
+  --validation-prefix-length 48 `
+  --progressive-depth-enabled `
+  --progressive-depth-group-size 2 `
+  --no-include-spatial-proj `
+  --no-strict-decode-upper-layer-cap-enabled
 ```
 
-### 3. Very fast text-quality sanity check
-
-Use this after a recalibration run to see whether strict sparse decode still collapses into gibberish:
+### 3) Fast text-quality sanity check
 
 ```powershell
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\run_hybrid_gqa_mamba_inference.py `
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
+.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_hybrid_gqa_mamba_inference.py `
   --checkpoint ".\results\hybrid_8b_export\hybrid_attention_state.pt" `
-  --sca-recalibrated-checkpoint ".\results\semantic_pipeline_run\recal_decode_manifold\sca_recalibrated_state.pt" `
+  --sca-recalibrated-checkpoint ".\results\recal_run\sca_recalibrated_state.pt" `
   --enable-sparse-mlp `
   --sca-sparse-placement learned_basis `
   --sca-routing-mode semantic_latent `
   --sca-bottom-buffer-layers 2 `
+  --sca-decode-guard-layers 22 `
   --sca-basis-rank 96 `
   --sca-basis-top-k 12 `
-  --sca-top-k 3 `
+  --sca-top-k 6 `
   --allow-cache `
   --max-new-tokens 12 `
   --prompt "Write two clear factual sentences about Oslo."
 ```
 
-## Important code paths
+## Notes
 
-- [`llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py)
-  Canonical runtime model.
-- [`llama3_neuroplastic/sca_sparse_mlp.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/sca_sparse_mlp.py)
-  Sparse MLP wrapper and semantic-latent routing logic.
-- [`llama3_neuroplastic/sca_sparse_config.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/sca_sparse_config.py)
-  Sparse routing config, per-layer override maps, and helper methods.
-- [`llama3_neuroplastic/strict_decode_metrics.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/strict_decode_metrics.py)
-  Reusable decode metrics and balance summaries.
-
-## Legacy paths
-
-These remain in the tree but are not the primary implementation target for the semantic-latent sparse work:
-
-- [`llama3_neuroplastic/neuroplastic_llama.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/neuroplastic_llama.py)
-- [`llama3_neuroplastic/train_llama_sca_objective.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/llama3_neuroplastic/train_llama_sca_objective.py)
-- decoder-mirror paths, except for explicit ablation use
-
-## Environment notes
-
-- The working flow in this repo uses repo-local scripts directly, not a polished package install path.
-- [`setup.py`](c:/Users/andre/Desktop/Overføre/next_step_ai/setup.py) is partly legacy and should not be treated as the primary way to run the project.
-- The repo expects local code layout rather than downloading `neuroplastic_lib` from elsewhere. If `neuroplastic_lib` exists in or near the repo, the PowerShell pipeline attempts to add it to `PYTHONPATH`.
-- Windows + PowerShell is the currently exercised path.
-
-## Known caveats
-
-- A recalibration checkpoint that fails the strict quality gate can still be saved for inspection. Do not treat such a checkpoint as decode-stable.
-- Full `pytest` collection may still hit legacy tests that depend on modules outside the currently validated path. Use the targeted test set above unless you are intentionally fixing those legacy paths.
-- Sparse text quality should be judged under strict runtime settings, not only teacher-forced reconstruction metrics.
+- A checkpoint can be saved even when quality gate fails. Treat failed-gate checkpoints as diagnostic artifacts only.
+- For this repo, targeted tests are more reliable than full test collection for day-to-day iteration.
+- Current bottleneck is deep sparse-stack decode stability, not basic routing functionality.
