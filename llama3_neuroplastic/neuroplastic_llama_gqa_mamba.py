@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import types
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -17,11 +16,6 @@ try:
     from transformers.cache_utils import DynamicCache
 except Exception:  # pragma: no cover
     DynamicCache = None
-from transformers.models.llama.modeling_llama import (
-    ALL_ATTENTION_FUNCTIONS,
-    apply_rotary_pos_emb,
-    eager_attention_forward,
-)
 
 try:
     from .bounded_context import (
@@ -45,6 +39,10 @@ try:
         collapse_llama_gqa_attention_layer,
         transplant_svd_group_to_mamba_projection,
     )
+    from .gqa_taylor_ssd import (
+        GQATaylorSSDSelfAttention,
+        TaylorSSDLayerCache,
+    )
     from .paged_sparse_attention import SparseAttentionConfig, SparseAttentionRuntime
 except ImportError:  # Script-mode fallback
     from bounded_context import (
@@ -67,6 +65,10 @@ except ImportError:  # Script-mode fallback
         GQAMambaRankCollapseBlock,
         collapse_llama_gqa_attention_layer,
         transplant_svd_group_to_mamba_projection,
+    )
+    from gqa_taylor_ssd import (
+        GQATaylorSSDSelfAttention,
+        TaylorSSDLayerCache,
     )
     from paged_sparse_attention import SparseAttentionConfig, SparseAttentionRuntime
 
@@ -112,6 +114,81 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
         if torch.is_tensor(buffer):
             return buffer.device
     return fallback
+
+
+class _TierMaskedLlamaAttention(nn.Module):
+    def __init__(self, base_attn: nn.Module, tier_mask_bundle_getter: Callable[[], Optional[TieredAttentionMaskBundle]]) -> None:
+        super().__init__()
+        self.base_attn = base_attn
+        self._tier_mask_bundle_getter = tier_mask_bundle_getter
+        self._bounded_context_hooked = True
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_attn, name)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Any] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Any,
+    ) -> Any:
+        if past_key_values is None and "past_key_value" in kwargs:
+            past_key_values = kwargs.pop("past_key_value")
+        tier_mask_bundle = kwargs.pop("tier_mask_bundle", None)
+        if tier_mask_bundle is None:
+            tier_mask_bundle = self._tier_mask_bundle_getter()
+
+        layer_attention_mask = attention_mask
+        if isinstance(tier_mask_bundle, TieredAttentionMaskBundle):
+            layer_idx = int(getattr(self.base_attn, "layer_idx", -1))
+            if layer_idx >= 0:
+                if attention_mask is not None and attention_mask.ndim >= 2:
+                    kv_length = int(attention_mask.shape[-1])
+                else:
+                    kv_length = int(hidden_states.shape[-2])
+                num_attention_heads = int(
+                    getattr(
+                        self.base_attn,
+                        "num_heads",
+                        getattr(getattr(self.base_attn, "config", None), "num_attention_heads", 1),
+                    )
+                )
+                layer_attention_mask = tier_mask_bundle.build_layer_mask(
+                    layer_idx=layer_idx,
+                    base_mask=attention_mask,
+                    kv_length=kv_length,
+                    num_attention_heads=num_attention_heads,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+
+        call_kwargs: Dict[str, Any] = dict(kwargs)
+        call_kwargs["hidden_states"] = hidden_states
+        call_kwargs["attention_mask"] = layer_attention_mask
+        if position_embeddings is not None:
+            call_kwargs["position_embeddings"] = position_embeddings
+        if cache_position is not None:
+            call_kwargs["cache_position"] = cache_position
+        if past_key_values is not None:
+            call_kwargs["past_key_values"] = past_key_values
+        try:
+            return self.base_attn(**call_kwargs)
+        except TypeError:
+            if "past_key_values" in call_kwargs:
+                call_kwargs["past_key_value"] = call_kwargs.pop("past_key_values")
+            return self.base_attn(**call_kwargs)
+
+
+def _unwrap_tier_masked_attention(attn: nn.Module) -> nn.Module:
+    while isinstance(attn, _TierMaskedLlamaAttention):
+        attn = attn.base_attn
+    return attn
 
 
 class _CollapsedMambaSelfAttention(nn.Module):
@@ -276,7 +353,8 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
         self.output_bias = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
         self.enable_output_bias = bool(enable_output_bias)
         self.capture_alignment = False
-        self._last_alignment: Optional[Dict[str, torch.Tensor]] = None
+        self.capture_alignment_tensors = False
+        self._last_alignment: Optional[Dict[str, Any]] = None
 
     @property
     def mix_value(self) -> torch.Tensor:
@@ -320,12 +398,13 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
             dtype=dtype,
         )
 
-    def set_alignment_capture(self, enabled: bool) -> None:
+    def set_alignment_capture(self, enabled: bool, heavy_tensors: bool = False) -> None:
         self.capture_alignment = bool(enabled)
+        self.capture_alignment_tensors = bool(heavy_tensors and enabled)
         if not enabled:
             self._last_alignment = None
 
-    def get_last_alignment(self) -> Optional[Dict[str, torch.Tensor]]:
+    def get_last_alignment(self) -> Optional[Dict[str, Any]]:
         return self._last_alignment
 
     def export_hybrid_state(self) -> Dict[str, Any]:
@@ -398,11 +477,18 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
         attn_output = ((1.0 - mix) * original_out) + (mix * mamba_out)
 
         if self.capture_alignment:
-            self._last_alignment = {
-                "original_out": original_out,
-                "mamba_out": mamba_out,
-                "mix": mix,
-            }
+            if self.capture_alignment_tensors:
+                self._last_alignment = {
+                    "original_out": original_out.detach(),
+                    "mamba_out": mamba_out.detach(),
+                    "mix": mix.detach(),
+                }
+            else:
+                self._last_alignment = {
+                    "original_out_norm": float(original_out.detach().float().norm().item()),
+                    "mamba_out_norm": float(mamba_out.detach().float().norm().item()),
+                    "mix": float(mix.detach().float().mean().item()),
+                }
 
         if use_cache:
             return attn_output, attn_weights, present
@@ -412,6 +498,19 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
 
 
 class NeuroplasticLlama(nn.Module):
+    _BnbConfigSingleton: Optional[BitsAndBytesConfig] = None
+
+    @classmethod
+    def _get_bnb_config(cls) -> BitsAndBytesConfig:
+        if cls._BnbConfigSingleton is None:
+            cls._BnbConfigSingleton = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+        return cls._BnbConfigSingleton
+
     def __init__(
         self,
         model_name: str = "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
@@ -424,6 +523,7 @@ class NeuroplasticLlama(nn.Module):
         sca_top_k: int = 3,
         sca_routing_mode: str = "spatial_grid",
         sca_semantic_block_score_normalized: bool = False,
+        sca_output_compensation_bias_enabled: bool = False,
         sca_adaptive_top_k: bool = False,
         sca_adaptive_top_k_min: Optional[int] = None,
         sca_adaptive_top_k_max: Optional[int] = None,
@@ -489,6 +589,19 @@ class NeuroplasticLlama(nn.Module):
         attention_hybrid_variance_threshold: float = 0.90,
         attention_hybrid_state_dim: Optional[int] = None,
         attention_hybrid_force_no_cache: bool = True,
+        attention_taylor_ssd_enabled: bool = False,
+        attention_taylor_layers: Optional[List[int]] = None,
+        attention_taylor_order: int = 2,
+        attention_taylor_symmetric_quadratic: bool = True,
+        attention_taylor_temperature: float = 1.0,
+        attention_taylor_eps: float = 1e-6,
+        attention_taylor_force_disable_optimized_cache: bool = True,
+        attention_taylor_feature_map: str = "hybrid_performer",
+        attention_taylor_state_decay: float = 1.0,
+        attention_taylor_local_window: int = 64,
+        attention_taylor_feature_dim: int = 64,
+        attention_taylor_bottom_buffer: int = 4,
+        attention_taylor_top_buffer: int = 4,
         decoder_mirror_enabled: bool = False,
         decoder_mirror_top_k: Optional[int] = None,
         decoder_mirror_rank: int = 4,
@@ -558,15 +671,9 @@ class NeuroplasticLlama(nn.Module):
         self._sparse_attention_runtime: Optional[SparseAttentionRuntime] = None
         self._last_sparse_attention_step: Dict[str, Any] = {}
 
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
         self.model = LlamaForCausalLM.from_pretrained(
             model_name,
-            quantization_config=bnb_config,
+            quantization_config=self._get_bnb_config(),
             device_map="auto",
             torch_dtype=torch.float16,
         )
@@ -577,28 +684,29 @@ class NeuroplasticLlama(nn.Module):
 
         self.config = self.model.config
         self.hidden_size = int(self.config.hidden_size)
-        num_hidden_layers = int(getattr(self.config, "num_hidden_layers", len(self.model.model.layers)))
-        num_key_value_heads = int(getattr(self.config, "num_key_value_heads", getattr(self.config, "num_attention_heads", 1)))
-        num_attention_heads = int(getattr(self.config, "num_attention_heads", num_key_value_heads))
+        self.num_hidden_layers = int(getattr(self.config, "num_hidden_layers", len(self.model.model.layers)))
+        self.num_key_value_heads = int(getattr(self.config, "num_key_value_heads", getattr(self.config, "num_attention_heads", 1)))
+        self.num_attention_heads = int(getattr(self.config, "num_attention_heads", self.num_key_value_heads))
+        self.head_dim = int(getattr(self.config, "head_dim", self.hidden_size // max(self.num_attention_heads, 1)))
         self._tier_policy = TieredContextPolicy(
             config=self.bounded_context_config,
-            num_hidden_layers=num_hidden_layers,
-            num_key_value_heads=num_key_value_heads,
-            num_attention_heads=num_attention_heads,
+            num_hidden_layers=self.num_hidden_layers,
+            num_key_value_heads=self.num_key_value_heads,
+            num_attention_heads=self.num_attention_heads,
         )
         self._tier_cache_compressor = TieredCacheCompressor(self._tier_policy)
         self._tier_mask_bundle = TieredAttentionMaskBundle(self._tier_policy)
         self._bounded_memory_estimate = self.bounded_context_config.estimate_memory(
-            num_hidden_layers=num_hidden_layers,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=int(getattr(self.config, "head_dim", self.hidden_size // max(num_attention_heads, 1))),
+            num_hidden_layers=self.num_hidden_layers,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
         )
         self._sparse_attention_runtime = SparseAttentionRuntime(
             config=self.sparse_attention_config,
-            num_layers=num_hidden_layers,
-            num_attention_heads=num_attention_heads,
-            num_key_value_heads=num_key_value_heads,
-            head_dim=int(getattr(self.config, "head_dim", self.hidden_size // max(num_attention_heads, 1))),
+            num_layers=self.num_hidden_layers,
+            num_attention_heads=self.num_attention_heads,
+            num_key_value_heads=self.num_key_value_heads,
+            head_dim=self.head_dim,
         )
         self.sca_config = SCASparseConfig(
             hidden_size=self.hidden_size,
@@ -609,6 +717,7 @@ class NeuroplasticLlama(nn.Module):
             top_k=sca_top_k,
             routing_mode=str(sca_routing_mode),
             semantic_block_score_normalized=bool(sca_semantic_block_score_normalized),
+            output_compensation_bias_enabled=bool(sca_output_compensation_bias_enabled),
             basis_rank_by_layer=dict(sca_basis_rank_by_layer or {}),
             basis_top_k_by_layer=dict(sca_basis_top_k_by_layer or {}),
             top_k_by_layer=dict(sca_top_k_by_layer or {}),
@@ -629,6 +738,7 @@ class NeuroplasticLlama(nn.Module):
             grouped_row_allow_4bit_dequant=sca_grouped_row_allow_4bit_dequant,
             stability_dense_fallback_threshold=float(sca_stability_dense_fallback_threshold),
         )
+        self.sca_config.canonicalize_for_num_layers(self.num_hidden_layers)
 
         self.task_embedding = nn.Embedding(self.num_tasks, self.hidden_size)
         self.spatial_proj = nn.Linear(self.hidden_size, 3, bias=True)
@@ -645,7 +755,7 @@ class NeuroplasticLlama(nn.Module):
         self.adapter_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float16), requires_grad=False)
         self.score = nn.Linear(self.hidden_size, 1)  # compatibility for old scripts
         self.sca_sparse_mlps: list[SparseLlamaMLP] = []
-        num_layers = len(self.model.model.layers)
+        num_layers = self.num_hidden_layers
         self.sca_layer_output_scale = nn.Parameter(torch.ones((num_layers,), dtype=torch.float32), requires_grad=False)
         # Mildly dampen upper decode-critical layers by default to reduce lexical attractor collapse.
         decode_band_start = max(int(num_layers * 0.75), 0)
@@ -659,7 +769,7 @@ class NeuroplasticLlama(nn.Module):
         # otherwise torch fallback, while sparse SpMM stays on CUDA path.
         self.sca_cuda_kernels = None
 
-        num_layers = len(self.model.model.layers)
+        num_layers = self.num_hidden_layers
         self.register_buffer(
             "refractory_until",
             torch.zeros((num_layers, self.sca_config.num_blocks), dtype=torch.int32),
@@ -678,8 +788,40 @@ class NeuroplasticLlama(nn.Module):
         self.attention_hybrid_state_dim = attention_hybrid_state_dim
         self._sparse_mlp_bank_manifest_path: Optional[str] = None
         self.attention_gqa_mamba_enabled = bool(attention_gqa_mamba_enabled)
-        if self.attention_hybrid_enabled:
-            self._install_bounded_context_attention_hooks()
+        self.attention_taylor_ssd_enabled = bool(attention_taylor_ssd_enabled)
+        self.attention_taylor_layers = _normalize_layer_indices(attention_taylor_layers, num_layers)
+        self.attention_taylor_order = int(attention_taylor_order)
+        self.attention_taylor_symmetric_quadratic = bool(attention_taylor_symmetric_quadratic)
+        self.attention_taylor_temperature = float(attention_taylor_temperature)
+        self.attention_taylor_eps = float(attention_taylor_eps)
+        self.attention_taylor_force_disable_optimized_cache = bool(attention_taylor_force_disable_optimized_cache)
+        self.attention_taylor_feature_map = str(attention_taylor_feature_map)
+        self.attention_taylor_state_decay = float(attention_taylor_state_decay)
+        self.attention_taylor_local_window = max(int(attention_taylor_local_window), 1)
+        self.attention_taylor_feature_dim = max(int(attention_taylor_feature_dim), 1)
+        self.attention_taylor_bottom_buffer = max(int(attention_taylor_bottom_buffer), 0)
+        self.attention_taylor_top_buffer = max(int(attention_taylor_top_buffer), 0)
+        self._validate_attention_backend_selection(
+            attention_hybrid_enabled=self.attention_hybrid_enabled,
+            attention_gqa_mamba_enabled=self.attention_gqa_mamba_enabled,
+            attention_taylor_ssd_enabled=self.attention_taylor_ssd_enabled,
+        )
+        if self.attention_taylor_ssd_enabled:
+            self._replace_attention_with_taylor_ssd(
+                layer_indices=self.attention_taylor_layers,
+                order=self.attention_taylor_order,
+                symmetric_quadratic=self.attention_taylor_symmetric_quadratic,
+                taylor_temperature=self.attention_taylor_temperature,
+                eps=self.attention_taylor_eps,
+                feature_map=self.attention_taylor_feature_map,
+                state_decay=self.attention_taylor_state_decay,
+                local_window=self.attention_taylor_local_window,
+                feature_dim=self.attention_taylor_feature_dim,
+                bottom_buffer=self.attention_taylor_bottom_buffer,
+                top_buffer=self.attention_taylor_top_buffer,
+                verbose=attention_gqa_verbose,
+            )
+        elif self.attention_hybrid_enabled:
             self._replace_attention_with_hybrid_gqa_mamba(
                 target_rank=self.attention_hybrid_target_rank,
                 variance_threshold=self.attention_hybrid_variance_threshold,
@@ -696,11 +838,13 @@ class NeuroplasticLlama(nn.Module):
                 max_layers=attention_gqa_max_layers,
                 verbose=attention_gqa_verbose,
             )
-        else:
-            self._install_bounded_context_attention_hooks()
+        if self.attention_taylor_ssd_enabled and self.attention_taylor_force_disable_optimized_cache:
+            self._enforce_taylor_safe_cache_policy()
+        self._install_bounded_context_attention_hooks()
 
         self._current_task_id = 0
         self._cached_task_emb: Optional[torch.Tensor] = None
+        self._cached_task_emb_task_id: Optional[int] = None
         self.disable_task_bias_injection: bool = False
         self._sca_recalibration_layer_indices: List[int] = []
         self._sca_recalibration_active_sparse_layer_indices: List[int] = []
@@ -738,6 +882,7 @@ class NeuroplasticLlama(nn.Module):
         if bool(decoder_mirror_enabled):
             self._ensure_decoder_mirror_module()
             self.set_decoder_mirror_enabled(True)
+        self._refresh_runtime_flags()
 
     def _layer_output_scale(self, layer_idx: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if not hasattr(self, "sca_layer_output_scale"):
@@ -746,14 +891,73 @@ class NeuroplasticLlama(nn.Module):
         scale = self.sca_layer_output_scale[idx].to(device=device, dtype=dtype)
         scale = scale.clamp(min=0.0, max=1.5)
         # In strict sparse decode, cap upper-layer SCA contribution to reduce repetitive lexical attractors.
-        if bool(self.strict_decode_upper_layer_cap_enabled) and bool(getattr(self, "sparse_attention_config", None) is not None) and bool(
-            getattr(self.sparse_attention_config, "strict_fully_sparse", False)
-        ):
+        if bool(self.strict_decode_upper_layer_cap_enabled) and bool(self._runtime_flags.get("strict_sparse_decode", False)):
             decode_band_start = max(int(self.sca_layer_output_scale.shape[0] * 0.75), 0)
             if idx >= decode_band_start:
                 cap = torch.tensor(0.7, device=device, dtype=dtype)
                 scale = torch.minimum(scale, cap)
         return scale
+
+    @staticmethod
+    def _validate_attention_backend_selection(
+        *,
+        attention_hybrid_enabled: bool,
+        attention_gqa_mamba_enabled: bool,
+        attention_taylor_ssd_enabled: bool,
+    ) -> None:
+        enabled = []
+        if bool(attention_hybrid_enabled):
+            enabled.append("attention_hybrid_enabled")
+        if bool(attention_gqa_mamba_enabled):
+            enabled.append("attention_gqa_mamba_enabled")
+        if bool(attention_taylor_ssd_enabled):
+            enabled.append("attention_taylor_ssd_enabled")
+        if len(enabled) > 1:
+            raise ValueError(
+                "Exactly one attention replacement backend may be enabled at a time; "
+                f"got {', '.join(enabled)}"
+            )
+
+    def _enforce_taylor_safe_cache_policy(self) -> None:
+        if not bool(getattr(self, "attention_taylor_ssd_enabled", False)):
+            return
+        if not bool(getattr(self, "attention_taylor_force_disable_optimized_cache", True)):
+            return
+        self.kv_int4_quantization = False
+        self.kv_cpu_offload = False
+        if hasattr(self, "bounded_context_config"):
+            self.bounded_context_config.enabled = False
+        if hasattr(self, "sparse_attention_config"):
+            self.sparse_attention_config.enabled = False
+        sparse_runtime = getattr(self, "_sparse_attention_runtime", None)
+        if sparse_runtime is not None and hasattr(self, "sparse_attention_config"):
+            sparse_runtime.config = self.sparse_attention_config
+
+    def reset_taylor_attention_state(self) -> None:
+        for _layer_idx, attn in self.iter_taylor_attention_modules():
+            attn.reset_runtime_cache()
+
+    def _refresh_runtime_flags(self) -> None:
+        self._enforce_taylor_safe_cache_policy()
+        bounded_objects_ready = bool(
+            getattr(self, "_tier_policy", None) is not None
+            and getattr(self, "_tier_cache_compressor", None) is not None
+            and getattr(self, "_tier_mask_bundle", None) is not None
+        )
+        sparse_enabled = bool(getattr(getattr(self, "sparse_attention_config", None), "enabled", False))
+        strict_sparse_decode = bool(getattr(getattr(self, "sparse_attention_config", None), "strict_fully_sparse", False))
+        bounded_enabled = bool(getattr(getattr(self, "bounded_context_config", None), "enabled", False))
+        kv_int4 = bool(getattr(self, "kv_int4_quantization", False))
+        kv_cpu = bool(getattr(self, "kv_cpu_offload", False))
+        self._runtime_flags = {
+            "kv_optimized_generation": bool(kv_int4 or kv_cpu or sparse_enabled),
+            "bounded_context_enabled": bool(bounded_enabled and bounded_objects_ready),
+            "sparse_attention_enabled": bool(sparse_enabled),
+            "strict_sparse_decode": bool(strict_sparse_decode),
+            "hybrid_forces_no_cache": bool(getattr(self, "attention_hybrid_enabled", False) and getattr(self, "attention_hybrid_force_no_cache", True)),
+            "gqa_mamba_disables_cache": bool(getattr(self, "attention_gqa_mamba_enabled", False)),
+            "taylor_attention_enabled": bool(getattr(self, "attention_taylor_ssd_enabled", False)),
+        }
 
     @property
     def device(self) -> torch.device:
@@ -766,6 +970,7 @@ class NeuroplasticLlama(nn.Module):
             self.kv_cpu_offload = bool(cpu_offload)
         if self.kv_int4_quantization:
             self.kv_cpu_offload = True
+        self._refresh_runtime_flags()
 
     def set_bounded_context_mode(
         self,
@@ -799,6 +1004,7 @@ class NeuroplasticLlama(nn.Module):
             )
             self._tier_cache_compressor = TieredCacheCompressor(self._tier_policy)
             self._tier_mask_bundle = TieredAttentionMaskBundle(self._tier_policy)
+        self._refresh_runtime_flags()
 
     def register_summary_provider(self, provider: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]) -> None:
         self._summary_provider = provider
@@ -867,6 +1073,7 @@ class NeuroplasticLlama(nn.Module):
         self.sparse_attention_config.validate()
         if self._sparse_attention_runtime is not None:
             self._sparse_attention_runtime.config = self.sparse_attention_config
+        self._refresh_runtime_flags()
 
     def get_sparse_attention_diagnostics(self) -> Dict[str, Any]:
         if self._sparse_attention_runtime is None:
@@ -925,19 +1132,35 @@ class NeuroplasticLlama(nn.Module):
         return torch.where(valid, weights, torch.zeros_like(weights))
 
     def _kv_optimized_generation_enabled(self) -> bool:
-        return bool(self.kv_int4_quantization or self.kv_cpu_offload or self.sparse_attention_config.enabled)
+        runtime_flags = getattr(self, "_runtime_flags", None)
+        if isinstance(runtime_flags, dict):
+            return bool(runtime_flags.get("kv_optimized_generation", False))
+        sparse_enabled = bool(getattr(getattr(self, "sparse_attention_config", None), "enabled", False))
+        return bool(getattr(self, "kv_int4_quantization", False) or getattr(self, "kv_cpu_offload", False) or sparse_enabled)
 
     def _should_disable_generation_cache(self, requested_use_cache: bool) -> bool:
         if not requested_use_cache:
             return True
+        runtime_flags = getattr(self, "_runtime_flags", None)
+        if not isinstance(runtime_flags, dict):
+            runtime_flags = {
+                "sparse_attention_enabled": bool(getattr(getattr(self, "sparse_attention_config", None), "enabled", False)),
+                "hybrid_forces_no_cache": bool(
+                    getattr(self, "attention_hybrid_enabled", False) and getattr(self, "attention_hybrid_force_no_cache", True)
+                ),
+                "gqa_mamba_disables_cache": bool(getattr(self, "attention_gqa_mamba_enabled", False)),
+                "taylor_attention_enabled": bool(getattr(self, "attention_taylor_ssd_enabled", False)),
+            }
         # Sparse-attention decode requires cache and provides its own bounded behavior.
-        if bool(getattr(self, "sparse_attention_config", None) is not None) and bool(
-            getattr(self.sparse_attention_config, "enabled", False)
-        ):
+        if bool(runtime_flags.get("sparse_attention_enabled", False)):
             return False
-        if bool(getattr(self, "attention_hybrid_enabled", False)) and bool(getattr(self, "attention_hybrid_force_no_cache", True)):
+        # Taylor V1 disables KV/offload optimizations via _enforce_taylor_safe_cache_policy,
+        # but recurrent decode cache is supported and should stay enabled.
+        if bool(runtime_flags.get("taylor_attention_enabled", False)):
+            return False
+        if bool(runtime_flags.get("hybrid_forces_no_cache", False)):
             return True
-        if bool(getattr(self, "attention_gqa_mamba_enabled", False)):
+        if bool(runtime_flags.get("gqa_mamba_disables_cache", False)):
             return True
         return False
 
@@ -970,10 +1193,12 @@ class NeuroplasticLlama(nn.Module):
 
     @staticmethod
     def _pack_int4_tensor(tensor: torch.Tensor) -> _PackedInt4Tensor:
-        source = tensor.detach().to(device="cpu", dtype=torch.float32)
-        max_abs = float(source.abs().amax().item()) if source.numel() > 0 else 0.0
+        source = tensor.detach().to(device="cpu")
+        if source.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            source = source.float()
+        max_abs = float(source.float().abs().amax().item()) if source.numel() > 0 else 0.0
         scale = max(max_abs / 7.0, 1e-8)
-        quant = torch.round(source / scale).clamp(-8, 7).to(torch.int16) + 8
+        quant = torch.round(source.float() / scale).clamp(-8, 7).to(torch.int16) + 8
         flat = quant.reshape(-1).to(torch.uint8)
         numel = int(flat.numel())
         if numel % 2 != 0:
@@ -1005,8 +1230,11 @@ class NeuroplasticLlama(nn.Module):
 
     @staticmethod
     def _offload_tensor_to_cpu(tensor: torch.Tensor) -> _CPUOffloadedTensor:
+        cpu_tensor = tensor.detach().to(device="cpu", non_blocking=False)
+        if torch.cuda.is_available():
+            cpu_tensor = cpu_tensor.pin_memory()
         return _CPUOffloadedTensor(
-            tensor=tensor.detach().to(device="cpu"),
+            tensor=cpu_tensor,
             source_device=str(tensor.device),
         )
 
@@ -1018,12 +1246,10 @@ class NeuroplasticLlama(nn.Module):
         )
 
     def _bounded_context_enabled(self) -> bool:
-        return bool(
-            self.bounded_context_config.enabled
-            and self._tier_policy is not None
-            and self._tier_cache_compressor is not None
-            and self._tier_mask_bundle is not None
-        )
+        runtime_flags = getattr(self, "_runtime_flags", None)
+        if isinstance(runtime_flags, dict):
+            return bool(runtime_flags.get("bounded_context_enabled", False))
+        return bool(getattr(getattr(self, "bounded_context_config", None), "enabled", False))
 
     def _get_tier_mask_bundle(self) -> Optional[TieredAttentionMaskBundle]:
         if not self._bounded_context_enabled():
@@ -1033,70 +1259,62 @@ class NeuroplasticLlama(nn.Module):
     def _install_bounded_context_attention_hooks(self) -> None:
         for layer in self.model.model.layers:
             attn = layer.self_attn
-            if getattr(attn, "_bounded_context_hooked", False):
+            if isinstance(attn, _TierMaskedLlamaAttention):
                 continue
+            layer.self_attn = _TierMaskedLlamaAttention(attn, self._get_tier_mask_bundle)
 
-            def _forward_with_tier_mask(
-                attn_self,
-                hidden_states: torch.Tensor,
-                position_embeddings: tuple[torch.Tensor, torch.Tensor],
-                attention_mask: Optional[torch.Tensor],
-                past_key_values: Optional[Any] = None,
-                cache_position: Optional[torch.LongTensor] = None,
-                **kwargs: Any,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                tier_mask_bundle = kwargs.pop("tier_mask_bundle", None)
-                input_shape = hidden_states.shape[:-1]
-                hidden_shape = (*input_shape, -1, attn_self.head_dim)
-
-                query_states = attn_self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                key_states = attn_self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-                value_states = attn_self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-                cos, sin = position_embeddings
-                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-                if past_key_values is not None:
-                    cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-                    key_states, value_states = past_key_values.update(
-                        key_states,
-                        value_states,
-                        attn_self.layer_idx,
-                        cache_kwargs,
-                    )
-
-                layer_attention_mask = attention_mask
-                if isinstance(tier_mask_bundle, TieredAttentionMaskBundle):
-                    layer_attention_mask = tier_mask_bundle.build_layer_mask(
-                        layer_idx=int(attn_self.layer_idx),
-                        base_mask=attention_mask,
-                        kv_length=int(key_states.shape[-2]),
-                        num_attention_heads=int(query_states.shape[1]),
-                        dtype=query_states.dtype,
-                        device=query_states.device,
-                    )
-
-                attention_interface: Callable = eager_attention_forward
-                if attn_self.config._attn_implementation != "eager":
-                    attention_interface = ALL_ATTENTION_FUNCTIONS[attn_self.config._attn_implementation]
-
-                attn_output, attn_weights = attention_interface(
-                    attn_self,
-                    query_states,
-                    key_states,
-                    value_states,
-                    layer_attention_mask,
-                    dropout=0.0 if not attn_self.training else attn_self.attention_dropout,
-                    scaling=attn_self.scaling,
-                    **kwargs,
-                )
-
-                attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-                attn_output = attn_self.o_proj(attn_output)
-                return attn_output, attn_weights
-
-            attn.forward = types.MethodType(_forward_with_tier_mask, attn)
-            attn._bounded_context_hooked = True
+    def _replace_attention_with_taylor_ssd(
+        self,
+        *,
+        layer_indices: Optional[List[int]] = None,
+        order: int = 2,
+        symmetric_quadratic: bool = True,
+        taylor_temperature: float = 1.0,
+        eps: float = 1e-6,
+        feature_map: str = "hybrid_performer",
+        state_decay: float = 1.0,
+        local_window: int = 64,
+        feature_dim: int = 64,
+        bottom_buffer: int = 0,
+        top_buffer: int = 0,
+        verbose: bool = False,
+    ) -> None:
+        total_layers = len(self.model.model.layers)
+        selected = set(_normalize_layer_indices(layer_indices, total_layers))
+        buf_lower = max(int(bottom_buffer), 0)
+        buf_upper = max(total_layers - max(int(top_buffer), 0), 0)
+        selected = {idx for idx in selected if buf_lower <= idx < buf_upper}
+        if verbose:
+            print(
+                f"[taylor-ssd] buffer guards: bottom={buf_lower}, top_cutoff={buf_upper}, "
+                f"effective_layers={sorted(selected)}",
+                flush=True,
+            )
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            if layer_idx not in selected:
+                if verbose:
+                    print(f"[taylor-ssd] keeping original self_attn for layer {layer_idx}/{total_layers-1}", flush=True)
+                continue
+            if bool(getattr(layer.self_attn, "_converted_from_llama", False)):
+                continue
+            if verbose:
+                print(f"[taylor-ssd] replacing self_attn layer {layer_idx}/{total_layers-1}", flush=True)
+            source_attn = _unwrap_tier_masked_attention(layer.self_attn)
+            source_device = _infer_module_device(source_attn, self.device)
+            replacement = GQATaylorSSDSelfAttention.from_llama_attention(
+                source_attn=source_attn,
+                layer_idx=layer_idx,
+                order=int(order),
+                symmetric_quadratic=bool(symmetric_quadratic),
+                taylor_temperature=float(taylor_temperature),
+                eps=float(eps),
+                feature_map=str(feature_map),
+                state_decay=float(state_decay),
+                local_window=int(local_window),
+                feature_dim=int(feature_dim),
+            ).to(device=source_device)
+            replacement._converted_from_llama = True
+            layer.self_attn = replacement
 
     def _replace_attention_with_gqa_mamba(
         self,
@@ -1117,11 +1335,14 @@ class NeuroplasticLlama(nn.Module):
                 if verbose:
                     print(f"[gqa-mamba] keeping original self_attn for layer {layer_idx}/{total_layers-1}", flush=True)
                 continue
+            if bool(getattr(layer.self_attn, "_converted_from_llama", False)):
+                continue
             if verbose:
                 print(f"[gqa-mamba] replacing self_attn layer {layer_idx}/{total_layers-1}", flush=True)
-            source_device = _infer_module_device(layer.self_attn, self.device)
+            source_attn = _unwrap_tier_masked_attention(layer.self_attn)
+            source_device = _infer_module_device(source_attn, self.device)
             replacement = _CollapsedMambaSelfAttention.from_llama_attention(
-                source_attn=layer.self_attn,
+                source_attn=source_attn,
                 layer_idx=layer_idx,
                 num_attention_heads=num_attention_heads,
                 num_key_value_heads=num_key_value_heads,
@@ -1131,6 +1352,7 @@ class NeuroplasticLlama(nn.Module):
                 state_dim=state_dim,
                 dtype=torch.float16,
             ).to(device=source_device, dtype=torch.float16)
+            replacement._converted_from_llama = True
             layer.self_attn = replacement
 
     def _replace_attention_with_hybrid_gqa_mamba(
@@ -1153,9 +1375,11 @@ class NeuroplasticLlama(nn.Module):
                 if verbose:
                     print(f"[hybrid-gqa-mamba] keeping original self_attn for layer {layer_idx}/{total_layers-1}", flush=True)
                 continue
+            if bool(getattr(layer.self_attn, "_converted_from_llama", False)):
+                continue
             if verbose:
                 print(f"[hybrid-gqa-mamba] wrapping self_attn layer {layer_idx}/{total_layers-1}", flush=True)
-            original_attn = layer.self_attn
+            original_attn = _unwrap_tier_masked_attention(layer.self_attn)
             source_device = _infer_module_device(original_attn, self.device)
             replacement = HybridCollapsedMambaSelfAttention.from_llama_attention(
                 source_attn=original_attn,
@@ -1170,12 +1394,24 @@ class NeuroplasticLlama(nn.Module):
                 dtype=torch.float16,
             ).to(device=source_device)
             replacement.mamba_block.to(device=source_device, dtype=torch.float16)
+            replacement._converted_from_llama = True
             layer.self_attn = replacement
+
+    def iter_taylor_attention_modules(self) -> List[Tuple[int, GQATaylorSSDSelfAttention]]:
+        modules: List[Tuple[int, GQATaylorSSDSelfAttention]] = []
+        for layer_idx, layer in enumerate(self.model.model.layers):
+            attn = _unwrap_tier_masked_attention(layer.self_attn)
+            if isinstance(attn, GQATaylorSSDSelfAttention):
+                modules.append((layer_idx, attn))
+        return modules
+
+    def get_effective_taylor_layers(self) -> List[int]:
+        return [layer_idx for layer_idx, _attn in self.iter_taylor_attention_modules()]
 
     def iter_hybrid_attention_modules(self) -> List[Tuple[int, HybridCollapsedMambaSelfAttention]]:
         modules: List[Tuple[int, HybridCollapsedMambaSelfAttention]] = []
         for layer_idx, layer in enumerate(self.model.model.layers):
-            attn = layer.self_attn
+            attn = _unwrap_tier_masked_attention(layer.self_attn)
             if isinstance(attn, HybridCollapsedMambaSelfAttention):
                 modules.append((layer_idx, attn))
         return modules
@@ -1191,6 +1427,47 @@ class NeuroplasticLlama(nn.Module):
         selected = set(layer_indices) if layer_indices is not None else None
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             wrapper.set_alignment_capture(bool(enabled) and (selected is None or layer_idx in selected))
+
+    def set_sparse_curriculum(self, enabled: bool, alpha: float, layer_indices: Optional[List[int]] = None) -> None:
+        selected = set(layer_indices) if layer_indices is not None else None
+        for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
+            use_layer = selected is None or layer_idx in selected
+            wrapper.set_dense_sparse_curriculum(bool(enabled and use_layer), float(alpha))
+
+    def configure_sparse_block_banking(
+        self,
+        *,
+        enabled: bool,
+        low_usage_threshold: float = 0.001,
+        vote_threshold: int = 3,
+        cooldown_steps: int = 64,
+        max_fraction: float = 0.25,
+        usage_ema_decay: float = 0.95,
+        layer_indices: Optional[List[int]] = None,
+    ) -> None:
+        selected = set(layer_indices) if layer_indices is not None else None
+        for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
+            use_layer = selected is None or layer_idx in selected
+            wrapper.configure_block_banking(
+                enabled=bool(enabled and use_layer),
+                low_usage_threshold=float(low_usage_threshold),
+                vote_threshold=int(vote_threshold),
+                cooldown_steps=int(cooldown_steps),
+                max_fraction=float(max_fraction),
+                usage_ema_decay=float(usage_ema_decay),
+            )
+
+    def get_sparse_block_banking_stats(self) -> Dict[str, Any]:
+        per_layer: Dict[str, Dict[str, float]] = {}
+        banked_fractions: List[float] = []
+        for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
+            stats = wrapper.get_block_banking_stats()
+            per_layer[str(layer_idx)] = stats
+            banked_fractions.append(float(stats.get("banked_fraction", 0.0)))
+        return {
+            "mean_banked_fraction": float(sum(banked_fractions) / max(len(banked_fractions), 1)),
+            "per_layer": per_layer,
+        }
 
     def _default_decoder_mirror_source_layers(self) -> List[int]:
         total_layers = len(getattr(self, "sca_sparse_mlps", []))
@@ -1386,6 +1663,7 @@ class NeuroplasticLlama(nn.Module):
         include_spatial_proj: bool = True,
         include_adapter_scale: bool = False,
         include_layer_output_scale: bool = True,
+        freeze_basis_decoder: bool = False,
         layer_indices: Optional[List[int]] = None,
         active_sparse_layer_indices: Optional[List[int]] = None,
         recalibration_mode: str = "local_mlp_geometry",
@@ -1450,6 +1728,8 @@ class NeuroplasticLlama(nn.Module):
                 if selected_layers and layer_idx not in selected_layers:
                     continue
                 for name, param in wrapper.iter_sparse_basis_parameters():
+                    if freeze_basis_decoder and name == "sparse_basis_decoder":
+                        continue
                     param.data = param.data.to(device=param.device, dtype=torch.float32)
                     param.requires_grad = True
                     trainable.append(param)
@@ -1587,9 +1867,23 @@ class NeuroplasticLlama(nn.Module):
                 "enabled": bool(self.attention_hybrid_enabled),
                 "layers": list(self.get_effective_hybrid_layers()),
                 "target_rank": self.attention_hybrid_target_rank,
-                "variance_threshold": self.attention_hybrid_variance_threshold,
+                "variance_threshold": float(self.attention_hybrid_variance_threshold),
                 "state_dim": self.attention_hybrid_state_dim,
                 "force_no_cache": bool(self.attention_hybrid_force_no_cache),
+            },
+            "taylor_config_summary": {
+                "enabled": bool(self.attention_taylor_ssd_enabled),
+                "layers": list(self.get_effective_taylor_layers()),
+                "order": self.attention_taylor_order,
+                "symmetric_quadratic": self.attention_taylor_symmetric_quadratic,
+                "taylor_temperature": self.attention_taylor_temperature,
+                "eps": self.attention_taylor_eps,
+                "feature_map": str(getattr(self, "attention_taylor_feature_map", "hybrid_performer")),
+                "state_decay": float(getattr(self, "attention_taylor_state_decay", 1.0)),
+                "local_window": int(getattr(self, "attention_taylor_local_window", 64)),
+                "feature_dim": int(getattr(self, "attention_taylor_feature_dim", 64)),
+                "bottom_buffer": int(getattr(self, "attention_taylor_bottom_buffer", 4)),
+                "top_buffer": int(getattr(self, "attention_taylor_top_buffer", 4)),
             },
             "router_metadata_snapshot": {
                 "sparse_mlp_bank_status": self.get_sparse_mlp_bank_status(),
@@ -1620,6 +1914,8 @@ class NeuroplasticLlama(nn.Module):
         blob = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(blob, dict):
             raise RuntimeError("SCA recalibration checkpoint must be a dict")
+        if "spatial_proj_state_dict" not in blob and "spatial_proj" in blob:
+            blob["spatial_proj_state_dict"] = blob["spatial_proj"]
 
         sca_cfg = blob.get("sca_config")
         if isinstance(sca_cfg, dict):
@@ -1627,12 +1923,18 @@ class NeuroplasticLlama(nn.Module):
                 self.sca_config.sparse_placement = str(sca_cfg["sparse_placement"])
             if "routing_mode" in sca_cfg:
                 self.sca_config.routing_mode = str(sca_cfg["routing_mode"])
+            if "output_compensation_bias_enabled" in sca_cfg:
+                self.sca_config.output_compensation_bias_enabled = bool(sca_cfg["output_compensation_bias_enabled"])
             if "basis_rank_by_layer" in sca_cfg:
                 self.sca_config.basis_rank_by_layer = self.sca_config._normalize_layer_map(sca_cfg["basis_rank_by_layer"])
             if "basis_top_k_by_layer" in sca_cfg:
                 self.sca_config.basis_top_k_by_layer = self.sca_config._normalize_layer_map(sca_cfg["basis_top_k_by_layer"])
             if "top_k_by_layer" in sca_cfg:
                 self.sca_config.top_k_by_layer = self.sca_config._normalize_layer_map(sca_cfg["top_k_by_layer"])
+        top_k_by_layer = blob.get("top_k_by_layer")
+        if isinstance(top_k_by_layer, dict):
+            self.sca_config.top_k_by_layer = self.sca_config._normalize_layer_map(top_k_by_layer)
+        self.sca_config.canonicalize_for_num_layers(len(self.sca_sparse_mlps))
 
         loaded = 0
         missing = 0
@@ -1643,6 +1945,10 @@ class NeuroplasticLlama(nn.Module):
             missing += 1
         else:
             self.spatial_proj.load_state_dict(spatial_state, strict=True)
+            loaded += 1
+        block_centers = blob.get("block_centers")
+        if torch.is_tensor(block_centers) and hasattr(self, "block_centers"):
+            self.block_centers.copy_(block_centers.to(device=self.block_centers.device, dtype=self.block_centers.dtype))
             loaded += 1
 
         task_state = blob.get("task_embedding_state_dict")
@@ -1698,6 +2004,23 @@ class NeuroplasticLlama(nn.Module):
         if isinstance(router_metadata, dict) and "bottom_buffer_layers" in router_metadata:
             self.bottom_buffer_layers = max(int(router_metadata["bottom_buffer_layers"]), 0)
         return {"loaded_items": int(loaded), "missing_items": int(missing)}
+
+    def export_sparse_router_state(self) -> Dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "sca_config": self.sca_config.to_dict(),
+            "spatial_proj_state_dict": self.spatial_proj.state_dict(),
+            "block_centers": self.block_centers.detach().cpu(),
+            "top_k_by_layer": {str(k): int(v) for k, v in dict(self.sca_config.top_k_by_layer).items()},
+            "compiler_metrics": {
+                "num_layers": int(len(self.sca_sparse_mlps)),
+                "num_blocks": int(self.sca_config.num_blocks),
+                "block_size": int(self.sca_config.block_size),
+            },
+        }
+
+    def load_sparse_router_state(self, checkpoint_path: str, strict: bool = False) -> Dict[str, int]:
+        return self.load_sca_recalibration_state(checkpoint_path=checkpoint_path, strict=bool(strict))
 
     def load_learned_basis_init(self, checkpoint_path: str, strict: bool = True) -> Dict[str, int]:
         blob = torch.load(checkpoint_path, map_location="cpu")
@@ -2173,10 +2496,13 @@ class NeuroplasticLlama(nn.Module):
             "mean_max_block_load_fraction": float(sum(max_block_load_fractions) / max(len(max_block_load_fractions), 1)),
         }
 
-    def _maybe_update_summary(self, generated: torch.LongTensor) -> None:
+    def _maybe_update_summary(self, generated: Union[torch.LongTensor, int]) -> None:
         if generated is None:
             return
-        total_tokens = int(generated.shape[-1])
+        if isinstance(generated, int):
+            total_tokens = int(generated)
+        else:
+            total_tokens = int(generated.shape[-1])
         if not self._summary_manager.observe(total_tokens):
             return
         if self._summary_provider is None:
@@ -2220,35 +2546,62 @@ class NeuroplasticLlama(nn.Module):
             return legacy_cache
         packed_layers = []
         for layer_cache in legacy_cache:
-            packed_entries = []
-            for entry_idx, entry in enumerate(layer_cache):
-                if not torch.is_tensor(entry):
-                    packed_entries.append(entry)
-                    continue
-                if self.kv_int4_quantization and entry_idx < 2 and entry.is_floating_point():
-                    packed_entries.append(self._pack_int4_tensor(entry))
-                elif self.kv_cpu_offload:
-                    packed_entries.append(self._offload_tensor_to_cpu(entry))
-                else:
-                    packed_entries.append(entry)
-            packed_layers.append(tuple(packed_entries))
+            if isinstance(layer_cache, TaylorSSDLayerCache):
+                packed_layers.append(layer_cache)
+                continue
+            if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) < 2:
+                packed_layers.append(layer_cache)
+                continue
+            k, v, *rest = layer_cache
+            if torch.is_tensor(k) and self.kv_int4_quantization and k.is_floating_point():
+                k_out: Any = self._pack_int4_tensor(k)
+            elif torch.is_tensor(k) and self.kv_cpu_offload:
+                k_out = self._offload_tensor_to_cpu(k)
+            else:
+                k_out = k
+
+            if torch.is_tensor(v) and self.kv_int4_quantization and v.is_floating_point():
+                v_out: Any = self._pack_int4_tensor(v)
+            elif torch.is_tensor(v) and self.kv_cpu_offload:
+                v_out = self._offload_tensor_to_cpu(v)
+            else:
+                v_out = v
+
+            packed_layers.append(tuple([k_out, v_out, *rest]))
         return tuple(packed_layers)
 
     def _restore_past_key_values(self, packed_past_key_values: Any) -> Any:
         if packed_past_key_values is None or not self._kv_optimized_generation_enabled():
             return packed_past_key_values
         restored_layers = []
+        has_taylor_cache = False
         for layer_cache in packed_past_key_values:
-            restored_entries = []
-            for entry in layer_cache:
-                if isinstance(entry, _PackedInt4Tensor):
-                    restored_entries.append(self._unpack_int4_tensor(entry))
-                elif isinstance(entry, _CPUOffloadedTensor):
-                    restored_entries.append(self._restore_offloaded_tensor(entry))
-                else:
-                    restored_entries.append(entry)
-            restored_layers.append(tuple(restored_entries))
+            if isinstance(layer_cache, TaylorSSDLayerCache):
+                restored_layers.append(layer_cache)
+                has_taylor_cache = True
+                continue
+            if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) < 2:
+                restored_layers.append(layer_cache)
+                continue
+            k, v, *rest = layer_cache
+            if isinstance(k, _PackedInt4Tensor):
+                k_out: Any = self._unpack_int4_tensor(k)
+            elif isinstance(k, _CPUOffloadedTensor):
+                k_out = self._restore_offloaded_tensor(k)
+            else:
+                k_out = k
+
+            if isinstance(v, _PackedInt4Tensor):
+                v_out: Any = self._unpack_int4_tensor(v)
+            elif isinstance(v, _CPUOffloadedTensor):
+                v_out = self._restore_offloaded_tensor(v)
+            else:
+                v_out = v
+
+            restored_layers.append(tuple([k_out, v_out, *rest]))
         legacy = tuple(restored_layers)
+        if has_taylor_cache:
+            return legacy
         if DynamicCache is not None:
             try:
                 return DynamicCache.from_legacy_cache(legacy)
@@ -2308,13 +2661,18 @@ class NeuroplasticLlama(nn.Module):
             return scores
         out = scores.clone()
         tail = generated[:, -int(window) :]
-        for row in range(out.shape[0]):
-            seen = torch.unique(tail[row])
-            if seen.numel() == 0:
-                continue
-            selected = out[row, seen]
-            penalized = torch.where(selected > 0, selected / float(penalty), selected * float(penalty))
-            out[row, seen] = penalized
+        vocab_size = int(out.shape[-1])
+        valid = (tail >= 0) & (tail < vocab_size)
+        if not torch.any(valid):
+            return out
+
+        safe_tail = torch.where(valid, tail, torch.zeros_like(tail))
+        penalty_mask = torch.zeros((out.shape[0], vocab_size), dtype=torch.bool, device=out.device)
+        penalty_mask.scatter_(1, safe_tail.long(), valid)
+        positive = (out > 0) & penalty_mask
+        negative = (out <= 0) & penalty_mask
+        out = torch.where(positive, out / float(penalty), out)
+        out = torch.where(negative, out * float(penalty), out)
         return out
 
     def register_hooks(self) -> None:
@@ -2445,7 +2803,16 @@ class NeuroplasticLlama(nn.Module):
         **kwargs: Any,
     ):
         self._current_task_id = int(task_id)
-        self._cached_task_emb = self.task_embedding(torch.tensor(self._current_task_id, device=self.device))
+        cached_task_emb = getattr(self, "_cached_task_emb", None)
+        cached_task_emb_task_id = getattr(self, "_cached_task_emb_task_id", None)
+        if (
+            cached_task_emb_task_id != self._current_task_id
+            or cached_task_emb is None
+            or cached_task_emb.device != self.device
+        ):
+            task_id_tensor = torch.full((1,), self._current_task_id, device=self.device, dtype=torch.long)
+            self._cached_task_emb = self.task_embedding(task_id_tensor)[0]
+            self._cached_task_emb_task_id = self._current_task_id
         self._last_decoder_mirror_diagnostics = {}
 
         # Keep clean baseline path when disabled: no task embedding injection.
@@ -2455,8 +2822,10 @@ class NeuroplasticLlama(nn.Module):
             and inputs_embeds is None
             and input_ids is not None
         ):
-            embeds = self.model.get_input_embeddings()(input_ids).to(dtype=torch.float16)
-            task_bias = (self._cached_task_emb * 0.01).to(dtype=embeds.dtype).view(1, 1, -1)
+            embed_layer = self.model.get_input_embeddings()
+            embed_dtype = embed_layer.weight.dtype
+            embeds = embed_layer(input_ids).to(dtype=embed_dtype)
+            task_bias = (self._cached_task_emb * 0.01).to(dtype=embed_dtype).view(1, 1, -1)
             inputs_embeds = embeds + task_bias
             input_ids = None
 
@@ -2621,6 +2990,8 @@ class NeuroplasticLlama(nn.Module):
         retrieved_chunk_ids: Optional[List[torch.LongTensor]] = None,
     ) -> torch.LongTensor:
         use_cache = not self._should_disable_generation_cache(bool(use_cache))
+        if bool(self._runtime_flags.get("taylor_attention_enabled", False)):
+            self.reset_taylor_attention_state()
         if self.sparse_attention_config.enabled:
             self.reset_sparse_attention_state()
         if self.sparse_attention_config.strict_fully_sparse:
@@ -2688,9 +3059,29 @@ class NeuroplasticLlama(nn.Module):
             pad_token_id = int(eos_ids[0])
 
         generated = input_ids
+        generated_chunks: List[torch.Tensor] = [generated]
         unfinished = torch.ones((generated.shape[0],), dtype=torch.bool, device=generated.device)
-        cached_state = None
+        cached_state: Any = None
+        use_packed_cache = bool(use_cache and self._kv_optimized_generation_enabled())
         prefill_outputs = None
+        total_tokens = int(generated.shape[-1])
+        eos_tensor = None
+        if eos_ids is not None:
+            eos_tensor = torch.tensor(eos_ids, device=generated.device, dtype=generated.dtype)
+        penalty_tail = generated[:, -int(self.strict_decode_penalty_window) :] if self.strict_decode_penalty_window > 0 else generated[:, :0]
+
+        def _restore_cache_for_step() -> Any:
+            if not use_cache or cached_state is None:
+                return None
+            if use_packed_cache:
+                return self._restore_past_key_values(cached_state)
+            return cached_state
+
+        def _cache_step(past_key_values: Any) -> None:
+            nonlocal cached_state
+            if not use_cache:
+                return
+            cached_state = self._pack_past_key_values(past_key_values) if use_packed_cache else past_key_values
 
         stream_prefill = bool(use_cache and self._bounded_context_enabled() and generated.shape[-1] > 1)
         if stream_prefill:
@@ -2698,7 +3089,7 @@ class NeuroplasticLlama(nn.Module):
             prefill_mask = attention_mask[:, :1]
             for pos in range(int(generated.shape[-1]) - 1):
                 model_inputs = prefill_tokens if cached_state is None else prefill_tokens[:, -1:]
-                past_key_values = self._restore_past_key_values(cached_state) if cached_state is not None else None
+                past_key_values = _restore_cache_for_step()
                 outputs = self(
                     input_ids=model_inputs,
                     attention_mask=prefill_mask,
@@ -2707,14 +3098,14 @@ class NeuroplasticLlama(nn.Module):
                     return_dict=True,
                     task_id=task_id,
                 )
-                cached_state = self._pack_past_key_values(outputs.past_key_values)
+                _cache_step(outputs.past_key_values)
                 next_prompt_token = generated[:, pos + 1 : pos + 2]
                 next_prompt_mask = attention_mask[:, pos + 1 : pos + 2]
                 prefill_tokens = torch.cat([prefill_tokens, next_prompt_token], dim=-1)
                 prefill_mask = torch.cat([prefill_mask, next_prompt_mask], dim=-1)
                 self._maybe_update_summary(prefill_tokens)
 
-            past_key_values = self._restore_past_key_values(cached_state) if cached_state is not None else None
+            past_key_values = _restore_cache_for_step()
             prefill_outputs = self(
                 input_ids=prefill_tokens[:, -1:],
                 attention_mask=prefill_mask,
@@ -2723,16 +3114,20 @@ class NeuroplasticLlama(nn.Module):
                 return_dict=True,
                 task_id=task_id,
             )
-            cached_state = self._pack_past_key_values(prefill_outputs.past_key_values)
+            _cache_step(prefill_outputs.past_key_values)
             generated = prefill_tokens
             attention_mask = prefill_mask
+            generated_chunks = [generated]
+            total_tokens = int(generated.shape[-1])
+            penalty_tail = generated[:, -int(self.strict_decode_penalty_window) :] if self.strict_decode_penalty_window > 0 else generated[:, :0]
 
+        decode_input = generated[:, -1:]
         for step_idx in range(max_new_tokens):
             if step_idx == 0 and prefill_outputs is not None:
                 outputs = prefill_outputs
             else:
-                model_inputs = generated[:, -1:] if (cached_state is not None and use_cache) else generated
-                past_key_values = self._restore_past_key_values(cached_state) if (cached_state is not None and use_cache) else None
+                model_inputs = decode_input if (use_cache and cached_state is not None) else generated
+                past_key_values = _restore_cache_for_step()
                 outputs = self(
                     input_ids=model_inputs,
                     attention_mask=attention_mask,
@@ -2742,10 +3137,10 @@ class NeuroplasticLlama(nn.Module):
                     task_id=task_id,
                 )
             next_token_logits = outputs.logits[:, -1, :].float()
-            if bool(self.sparse_attention_config.strict_fully_sparse) and bool(self.strict_decode_enable_repetition_penalty):
+            if bool(self._runtime_flags.get("strict_sparse_decode", False)) and bool(self.strict_decode_enable_repetition_penalty):
                 next_token_logits = self._apply_repetition_penalty_to_scores(
                     next_token_logits,
-                    generated=generated,
+                    generated=penalty_tail,
                     penalty=float(self.strict_decode_repetition_penalty),
                     window=int(self.strict_decode_penalty_window),
                 )
@@ -2763,23 +3158,32 @@ class NeuroplasticLlama(nn.Module):
                 pad_tokens = torch.full_like(next_tokens, int(pad_token_id))
                 next_tokens = torch.where(unfinished, next_tokens, pad_tokens)
 
-            generated = torch.cat([generated, next_tokens.unsqueeze(-1)], dim=-1)
+            next_token_chunk = next_tokens.unsqueeze(-1)
+            generated_chunks.append(next_token_chunk)
+            if not use_cache:
+                generated = torch.cat([generated, next_token_chunk], dim=-1)
             mask_step = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)
             attention_mask = torch.cat([attention_mask, mask_step], dim=-1)
+            decode_input = next_token_chunk
+            total_tokens += 1
 
             if use_cache:
-                cached_state = self._pack_past_key_values(outputs.past_key_values)
+                _cache_step(outputs.past_key_values)
 
-            self._maybe_update_summary(generated)
+            self._maybe_update_summary(total_tokens)
+            if self.strict_decode_penalty_window > 0:
+                penalty_tail = torch.cat([penalty_tail, decode_input], dim=-1)
+                if penalty_tail.shape[-1] > int(self.strict_decode_penalty_window):
+                    penalty_tail = penalty_tail[:, -int(self.strict_decode_penalty_window) :]
 
             if eos_ids is not None:
-                is_eos = torch.zeros_like(unfinished)
-                for eos in eos_ids:
-                    is_eos |= next_tokens.eq(eos)
+                is_eos = (next_tokens.unsqueeze(-1) == eos_tensor).any(dim=-1)
                 unfinished = unfinished & (~is_eos)
                 if not unfinished.any():
                     break
 
+        if len(generated_chunks) > 1:
+            return torch.cat(generated_chunks, dim=-1)
         return generated
 
     def generate(
@@ -2874,6 +3278,23 @@ class NeuroplasticLlama(nn.Module):
             "variance_threshold": float(self.attention_hybrid_variance_threshold),
             "state_dim": self.attention_hybrid_state_dim,
         }
+        config["taylor_attention"] = {
+            "enabled": bool(getattr(self, "attention_taylor_ssd_enabled", False)),
+            "layers": list(self.get_effective_taylor_layers()),
+            "order": int(getattr(self, "attention_taylor_order", 2)),
+            "symmetric_quadratic": bool(getattr(self, "attention_taylor_symmetric_quadratic", True)),
+            "taylor_temperature": float(getattr(self, "attention_taylor_temperature", 1.0)),
+            "eps": float(getattr(self, "attention_taylor_eps", 1e-6)),
+            "force_disable_optimized_cache": bool(
+                getattr(self, "attention_taylor_force_disable_optimized_cache", True)
+            ),
+            "feature_map": str(getattr(self, "attention_taylor_feature_map", "hybrid_performer")),
+            "state_decay": float(getattr(self, "attention_taylor_state_decay", 1.0)),
+            "local_window": int(getattr(self, "attention_taylor_local_window", 64)),
+            "feature_dim": int(getattr(self, "attention_taylor_feature_dim", 64)),
+            "bottom_buffer": int(getattr(self, "attention_taylor_bottom_buffer", 4)),
+            "top_buffer": int(getattr(self, "attention_taylor_top_buffer", 4)),
+        }
         config["sparse_attention"] = {
             "enabled": bool(self.sparse_attention_config.enabled),
             "local_window_tokens": int(self.sparse_attention_config.local_window_tokens),
@@ -2912,6 +3333,7 @@ class NeuroplasticLlama(nn.Module):
             kv_cfg = config.get("kv_cache", {})
             bounded_cfg = config.get("bounded_context", {})
             hybrid_cfg = config.get("hybrid_attention", {})
+            taylor_cfg = config.get("taylor_attention", {})
             sparse_attn_cfg = config.get("sparse_attention", {})
         else:
             model_name = "unsloth/Meta-Llama-3.1-8B-bnb-4bit"
@@ -2927,6 +3349,7 @@ class NeuroplasticLlama(nn.Module):
             kv_cfg = {}
             bounded_cfg = {}
             hybrid_cfg = {}
+            taylor_cfg = {}
             sparse_attn_cfg = {}
 
         kv_int4_arg = kwargs.pop("kv_int4_quantization", kv_cfg.get("int4_quantization", True))
@@ -2946,6 +3369,9 @@ class NeuroplasticLlama(nn.Module):
             sca_basis_top_k=int(sca_cfg.get("basis_top_k", 8)),
             sca_top_k=int(sca_cfg.get("top_k", 3)),
             sca_routing_mode=str(sca_cfg.get("routing_mode", "spatial_grid")),
+            sca_output_compensation_bias_enabled=bool(
+                sca_cfg.get("output_compensation_bias_enabled", False)
+            ),
             sca_adaptive_top_k=bool(sca_cfg.get("adaptive_top_k", False)),
             sca_adaptive_top_k_min=int(sca_cfg.get("adaptive_top_k_min", sca_cfg.get("top_k", 3))),
             sca_adaptive_top_k_max=int(sca_cfg.get("adaptive_top_k_max", sca_cfg.get("top_k", 3))),
@@ -3022,6 +3448,42 @@ class NeuroplasticLlama(nn.Module):
             attention_hybrid_state_dim=kwargs.pop("attention_hybrid_state_dim", hybrid_cfg.get("state_dim")),
             attention_hybrid_force_no_cache=bool(
                 kwargs.pop("attention_hybrid_force_no_cache", hybrid_cfg.get("force_no_cache", True))
+            ),
+            attention_taylor_ssd_enabled=bool(
+                kwargs.pop("attention_taylor_ssd_enabled", taylor_cfg.get("enabled", False))
+            ),
+            attention_taylor_layers=kwargs.pop("attention_taylor_layers", taylor_cfg.get("layers")),
+            attention_taylor_order=int(kwargs.pop("attention_taylor_order", taylor_cfg.get("order", 2))),
+            attention_taylor_symmetric_quadratic=bool(
+                kwargs.pop("attention_taylor_symmetric_quadratic", taylor_cfg.get("symmetric_quadratic", True))
+            ),
+            attention_taylor_temperature=float(
+                kwargs.pop("attention_taylor_temperature", taylor_cfg.get("taylor_temperature", 1.0))
+            ),
+            attention_taylor_eps=float(kwargs.pop("attention_taylor_eps", taylor_cfg.get("eps", 1e-6))),
+            attention_taylor_force_disable_optimized_cache=bool(
+                kwargs.pop(
+                    "attention_taylor_force_disable_optimized_cache",
+                    taylor_cfg.get("force_disable_optimized_cache", True),
+                )
+            ),
+            attention_taylor_feature_map=str(
+                kwargs.pop("attention_taylor_feature_map", taylor_cfg.get("feature_map", "hybrid_performer"))
+            ),
+            attention_taylor_state_decay=float(
+                kwargs.pop("attention_taylor_state_decay", taylor_cfg.get("state_decay", 1.0))
+            ),
+            attention_taylor_local_window=int(
+                kwargs.pop("attention_taylor_local_window", taylor_cfg.get("local_window", 64))
+            ),
+            attention_taylor_feature_dim=int(
+                kwargs.pop("attention_taylor_feature_dim", taylor_cfg.get("feature_dim", 64))
+            ),
+            attention_taylor_bottom_buffer=int(
+                kwargs.pop("attention_taylor_bottom_buffer", taylor_cfg.get("bottom_buffer", 4))
+            ),
+            attention_taylor_top_buffer=int(
+                kwargs.pop("attention_taylor_top_buffer", taylor_cfg.get("top_buffer", 4))
             ),
             attention_sparse_mode=bool(kwargs.pop("attention_sparse_mode", sparse_attn_cfg.get("enabled", False))),
             attention_local_window_tokens=int(
