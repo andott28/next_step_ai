@@ -353,27 +353,16 @@ def main() -> None:
     rollout_tokens = int(max(args.dense_rollout_tokens, 1))
     layer_states: Dict[str, Dict[str, torch.Tensor]] = {}
     stats: Dict[str, Dict[str, float]] = {}
-    _milestone_thresholds = {25, 50, 75}
-    _milestones_saved: set = set()
-
-    # Resume from the latest milestone checkpoint if one exists
     _output_path = Path(args.output_path)
-    _resume_candidates = sorted(
-        _output_path.parent.glob(_output_path.stem + ".ckpt_*pct.pt"),
-        key=lambda p: int(p.stem.split("_")[-1].replace("pct", "")),
-        reverse=True,
-    )
-    if _resume_candidates:
-        _resume_path = _resume_candidates[0]
+    _resume_path = _output_path.with_suffix(".resume.pt")
+    if _resume_path.exists():
         _resume_data = torch.load(_resume_path, map_location="cpu")
         layer_states = _resume_data.get("layer_states", {})
         stats = _resume_data.get("stats", {})
-        # Mark already-fitted layers as complete so collection is skipped
         for _k in layer_states:
             if int(_k) in layer_rows:
                 layer_rows[int(_k)] = max_rows
-        _milestones_saved = {int(p.stem.split("_")[-1].replace("pct", "")) for p in _resume_candidates}
-        print(f"[resume] loaded {len(layer_states)} fitted layers from {_resume_path}")
+        print(f"[resume] loaded {len(layer_states)}/{len(selected_layers)} fitted layers from {_resume_path}")
 
     for batch in dataloader:
         if runtime is not None:
@@ -467,13 +456,9 @@ def main() -> None:
             }
             layer_x[layer_idx].clear()
             layer_y[layer_idx].clear()
-        pct_done = int(len(layer_states) * 100 // max(len(selected_layers), 1))
-        for _thresh in sorted(_milestone_thresholds - _milestones_saved):
-            if pct_done >= _thresh:
-                _ckpt_path = Path(args.output_path).with_suffix(f".ckpt_{_thresh}pct.pt")
-                torch.save({"layer_states": layer_states, "stats": stats}, _ckpt_path)
-                print(f"[checkpoint] {_thresh}% layers fitted — saved to {_ckpt_path}")
-                _milestones_saved.add(_thresh)
+            torch.save({"layer_states": layer_states, "stats": stats}, _resume_path)
+            pct_done = int(len(layer_states) * 100 // max(len(selected_layers), 1))
+            print(f"[checkpoint] {len(layer_states)}/{len(selected_layers)} layers fitted ({pct_done}%) — resume saved")
         if all(v >= max_rows for v in layer_rows.values()):
             break
 
