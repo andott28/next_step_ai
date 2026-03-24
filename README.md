@@ -1,12 +1,17 @@
 # next_step_ai
 
-This repository contains the current Neuroplastic Llama experimentation stack focused on sparse MLP routing, hybrid GQA/Mamba attention, and strict autoregressive decode stability.
+This repository contains the current Neuroplastic Llama experimentation stack focused on sparse MLP routing, hybrid GQA/Mamba attention, Taylor-SSD attention integration, and strict autoregressive decode stability.
 
 The canonical model class is `llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`.
-The canonical sparse path is:
+The canonical sparse path for legacy experiments is:
 
 - `sparse_placement="learned_basis"`
 - `routing_mode="semantic_latent"`
+
+For Taylor rollout experiments, the preferred sparse path is:
+
+- `sparse_placement="input_mask"`
+- block-bank manifest loading through `load_sparse_mlp_bank_manifest(...)`
 
 ## What this project is building
 
@@ -16,6 +21,7 @@ Current long-term target:
 
 - Use the 8B model as the proving platform.
 - Push architecture/runtime ideas toward a 405B-class deployment strategy on 8 GB VRAM using sparsity, quantization, and off-GPU streaming.
+- **No-Training Invariant:** Deep SGD schedules are structurally prohibited. The architecture relies entirely on exact closed-form alignment strategies (e.g., PCA basis initialization, analytical mean-shift compensation, layer-adaptive capacity profiling). Downstream manifold integration must resolve analytically zero-shot.
 
 ## How this differs from the original Unsloth model
 
@@ -42,35 +48,43 @@ What is working:
   - generation/cache runtime mode checks are cached in internal runtime flags
   - decode loop reduces hot-path overhead (vectorized EOS/repetition penalty logic, lower per-step churn)
   - sparse config now validates incompatible runtime combinations earlier and supports per-layer canonicalized overrides
+- Taylor rollout harness stability fixes (March 23, 2026):
+  - Taylor recurrent cache is now surfaced correctly as `present` in `gqa_taylor_ssd.py`
+  - ablation runner isolates each variant in a fresh subprocess to avoid sequential 4-bit model-load VRAM churn/device-map failures
+  - Taylor order-2 feature map now includes the linear term in symmetric mode and uses corrected quadratic scaling coefficients
 
-What is still failing:
-
-- Deep continuous sparse stacking still degrades beyond a depth boundary.
-- Typical failure boundary is around guards equivalent to sparse layers reaching into the 2-11 range.
-- Strict quality gate is still failing for deep bands, even when short prompts may look coherent.
+- Hybrid Softmax-Linear Attention landing (March 23, 2026):
+  - Fixed severe repetition collapse (`Write Write ...`) by implementing an exact causal local softmax window plus a Performer-style compressed recurrent tail.
+  - Fixed a generation bug where `use_cache` was not being correctly forwarded by `transformers` to the Taylor wrapper layers.
+  - The local window (default $W=64$) preserves 100% on-manifold signals for the critical local context, while the Performer tail provides infinite-context retrieval.
 
 Practical implication:
 
-- Mid-band sparse operation is usable.
-- Full deep sparse stacking is not yet production-stable under strict decode metrics.
+- Mid-band sparse operation (layers 3–7) is the recommended sparse path.
+- Taylor attention with **Hybrid Performer** feature map (`feature_map="hybrid_performer"`, the new default) is the recommended attention backend. This uses an exact local window (sliding buffer) to preserve manifold alignment and a Performer-style recurrent tail for long-range context.
 
-## Current architectural problems
+### Safe operating ranges (March 2026)
 
-- The current attention-collapse backend is heuristic, not a direct mathematical compile of Llama attention. The existing GQA/Mamba path is based on grouped SVD collapse plus a small recurrent block, so it is lighter than dense attention but not a faithful attention-to-SSM translation.
-- The current `learned_basis` sparse MLP is a different operator class than the dense SwiGLU MLP it is trying to replace. Even with deterministic basis initialization, it still relies on latent support selection, block selection, and sparse reconstruction rather than preserving the original dense block weights.
-- The current semantic-latent router is still only an approximation to dense block usage. It routes from latent magnitudes and decoder statistics rather than from a compiled per-sample dense block-support target, which is one reason the project has needed heavy recalibration.
-- Deep stacked sparse MLP execution accumulates error across layers. A layer can look acceptable in isolation but still push the residual stream off-manifold when many sparse layers are active at once, which is the main source of repetition collapse and junk decode in current experiments.
-- The runtime stack is still strongly coupled to standard KV-cache attention. Cache packing, KV quantization, CPU offload, bounded context, and paged sparse-attention paths all assume attention layers expose conventional key/value cache structure, which makes alternative recurrent attention backends a larger integration task.
-- Short prompts can look superficially coherent even when the architecture is failing under strict decode metrics. In practice, the real acceptance criteria are rollout KL, hidden-state cosine, degeneration rate, and strict greedy continuation quality rather than one-off prompt samples.
+| Component       | Safe layers (32-layer 8B)            | Notes                                              |
+|-----------------|--------------------------------------|----------------------------------------------------|
+| Sparse MLP      | 3–7 (mid-band only)                  | Use `--sca-bottom-buffer-layers 3 --sca-decode-guard-layers 24` |
+| Taylor attention| 4–27 (Hybrid Performer)             | `local_window=64, feature_dim=64` are now the stable defaults |
+| Dense fallback  | all                                  | Always baseline-safe                               |
+
+- **Acceptance Criteria.** Short prompts can look superficially coherent even when the architecture is failing under strict decode metrics. In practice, the real acceptance criteria are rollout KL, hidden-state cosine, degeneration rate, and strict greedy continuation quality rather than one-off prompt samples.
 
 ## Key files
 
 - `llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`: canonical runtime model
+- `llama3_neuroplastic/gqa_taylor_ssd.py`: deterministic Taylor-SSD recurrent attention backend
 - `llama3_neuroplastic/sca_sparse_mlp.py`: sparse MLP wrapper, semantic routing, curriculum/banking hooks
 - `llama3_neuroplastic/sca_sparse_config.py`: sparse config, runtime compatibility validation, and per-layer override canonicalization
 - `llama3_neuroplastic/experiments/run_sca_recalibration_from_hybrid_baseline.py`: recalibration runner
 - `llama3_neuroplastic/experiments/init_learned_basis_from_dense_mlp.py`: dense-informed basis init
 - `llama3_neuroplastic/experiments/run_hybrid_gqa_mamba_inference.py`: runtime decode sanity checks
+- `llama3_neuroplastic/experiments/compile_block_bank_spatial_router.py`: block-bank + router-state compiler
+- `llama3_neuroplastic/experiments/run_taylor_ssd_inference.py`: Taylor-SSD inference + strict-metric runner
+- `llama3_neuroplastic/experiments/run_taylor_fluency_ablation.py`: stepwise dense→Taylor→sparse ablation with per-variant worker isolation
 - `llama3_neuroplastic/experiments/strict_decode_metrics.py`: strict decode metric utilities
 
 ## Repository layout
@@ -107,10 +121,10 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
   --learned-basis-init-checkpoint ".\results\semantic_pipeline_clean_b2_l2_17\learned_basis_init_profiled.pt" `
   --output-dir ".\results\recal_run" `
   --recalibration-mode decode_manifold_alignment `
-  --layers "2-9" `
+  --layers "3-7" `
   --sca-routing-mode semantic_latent `
-  --sca-bottom-buffer-layers 2 `
-  --sca-decode-guard-layers 22 `
+  --sca-bottom-buffer-layers 3 `
+  --sca-decode-guard-layers 24 `
   --basis-rank 96 `
   --basis-top-k 12 `
   --top-k 6 `

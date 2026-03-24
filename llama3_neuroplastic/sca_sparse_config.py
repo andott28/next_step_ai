@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from typing import Dict
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -28,6 +28,7 @@ class SCASparseConfig:
     sparse_placement: str = "input_mask"
     routing_mode: str = "spatial_grid"
     semantic_block_score_normalized: bool = False
+    output_compensation_bias_enabled: bool = False
     basis_rank_by_layer: Dict[int, int] = field(default_factory=dict)
     basis_top_k_by_layer: Dict[int, int] = field(default_factory=dict)
     top_k_by_layer: Dict[int, int] = field(default_factory=dict)
@@ -36,6 +37,9 @@ class SCASparseConfig:
     grouped_row_min_bucket: int = 2
     grouped_row_allow_4bit_dequant: bool = False
     stability_dense_fallback_threshold: float = 0.0
+    _basis_rank_by_layer_arr: Optional[Tuple[int, ...]] = field(default=None, init=False, repr=False)
+    _basis_top_k_by_layer_arr: Optional[Tuple[int, ...]] = field(default=None, init=False, repr=False)
+    _top_k_by_layer_arr: Optional[Tuple[int, ...]] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -110,6 +114,35 @@ class SCASparseConfig:
             if value > self.num_blocks:
                 raise ValueError(f"top_k_by_layer[{layer_idx}] must be <= num_blocks")
 
+        self.validate_runtime_compatibility()
+
+    def validate_runtime_compatibility(self) -> None:
+        if self.routing_mode == "semantic_latent" and self.sparse_placement != "learned_basis":
+            raise ValueError("routing_mode='semantic_latent' requires sparse_placement='learned_basis'")
+        if self.grouped_row_gemm and self.sparse_placement != "input_mask":
+            raise ValueError("grouped_row_gemm=True requires sparse_placement='input_mask'")
+
+    def canonicalize_for_num_layers(self, num_layers: int) -> None:
+        num_layers = int(num_layers)
+        if num_layers <= 0:
+            raise ValueError("num_layers must be > 0")
+
+        basis_rank_vals = []
+        basis_top_k_vals = []
+        top_k_vals = []
+        for layer_idx in range(num_layers):
+            basis_rank = self.basis_rank_for_layer(layer_idx)
+            basis_top_k = self.basis_top_k_for_layer(layer_idx)
+            top_k = self.top_k_for_layer(layer_idx)
+            top_k = max(int(self.adaptive_top_k_min), min(int(top_k), int(self.adaptive_top_k_max)))
+            basis_rank_vals.append(int(basis_rank))
+            basis_top_k_vals.append(int(basis_top_k))
+            top_k_vals.append(int(top_k))
+
+        self._basis_rank_by_layer_arr = tuple(basis_rank_vals)
+        self._basis_top_k_by_layer_arr = tuple(basis_top_k_vals)
+        self._top_k_by_layer_arr = tuple(top_k_vals)
+
     @staticmethod
     def _normalize_layer_map(raw: Dict[int, int] | Dict[str, int]) -> Dict[int, int]:
         out: Dict[int, int] = {}
@@ -131,36 +164,77 @@ class SCASparseConfig:
         return int(self.top_k)
 
     def basis_rank_for_layer(self, layer_idx: int) -> int:
+        if self._basis_rank_by_layer_arr is not None and 0 <= int(layer_idx) < len(self._basis_rank_by_layer_arr):
+            return int(self._basis_rank_by_layer_arr[int(layer_idx)])
         return int(max(1, min(self.basis_rank_by_layer.get(int(layer_idx), self.basis_rank), self.basis_rank)))
 
     def basis_top_k_for_layer(self, layer_idx: int) -> int:
+        if self._basis_top_k_by_layer_arr is not None and 0 <= int(layer_idx) < len(self._basis_top_k_by_layer_arr):
+            return int(self._basis_top_k_by_layer_arr[int(layer_idx)])
         default = self.basis_top_k_by_layer.get(int(layer_idx), self.basis_top_k)
         effective_rank = self.basis_rank_for_layer(layer_idx)
         return int(max(1, min(int(default), effective_rank)))
 
     def top_k_for_layer(self, layer_idx: int) -> int:
+        if self._top_k_by_layer_arr is not None and 0 <= int(layer_idx) < len(self._top_k_by_layer_arr):
+            return int(self._top_k_by_layer_arr[int(layer_idx)])
         default = self.top_k_by_layer.get(int(layer_idx), self.route_top_k)
         return int(max(1, min(int(default), self.num_blocks)))
 
     def to_dict(self) -> Dict[str, object]:
-        return asdict(self)
+        payload: Dict[str, object] = {}
+        for key, value in self.__dict__.items():
+            if key.startswith("_"):
+                continue
+            payload[key] = value
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object]) -> "SCASparseConfig":
         return cls(**payload)
 
+    @classmethod
+    def taylor_rollout_conservative_preset(
+        cls,
+        *,
+        hidden_size: int,
+        block_size: int = 32,
+        block_rank: int = 4,
+        top_k: int = 2,
+        use_cuda: bool = True,
+        spmm_impl: str = "dense",
+    ) -> "SCASparseConfig":
+        return cls(
+            hidden_size=int(hidden_size),
+            block_size=int(block_size),
+            block_rank=int(block_rank),
+            basis_rank=32,
+            basis_top_k=8,
+            top_k=int(top_k),
+            adaptive_top_k=False,
+            sigma=1.0,
+            refractory_steps=100,
+            inhibition_lambda=0.0,
+            use_cuda=bool(use_cuda),
+            grid_size=16,
+            spmm_impl=str(spmm_impl),
+            sparse_placement="input_mask",
+            routing_mode="spatial_grid",
+            soft_mask=False,
+            grouped_row_gemm=False,
+            stability_dense_fallback_threshold=0.05,
+        )
+
 
 def build_block_centers(config: SCASparseConfig) -> torch.Tensor:
     """
     Build fixed 3D centers for each block.
-    For hidden sizes that form an exact cube (e.g. 4096 = 16^3), we map dims
-    onto that base lattice and rescale to the configured grid_size domain.
+    For exact cubes (e.g. 4096 = 16^3), this maps dims onto that lattice.
+    For non-cubic hidden sizes, it uses the smallest enclosing cube lattice.
     """
-    base_grid = round(config.hidden_size ** (1.0 / 3.0))
-    if base_grid ** 3 != config.hidden_size:
-        raise ValueError(
-            f"hidden_size must be a perfect cube for 3D mapping, got hidden_size={config.hidden_size}"
-        )
+    base_grid = int(round(config.hidden_size ** (1.0 / 3.0)))
+    while base_grid ** 3 < config.hidden_size:
+        base_grid += 1
 
     grid = float(config.grid_size)
     base = float(base_grid)

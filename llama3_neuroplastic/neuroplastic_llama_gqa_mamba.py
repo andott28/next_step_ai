@@ -545,6 +545,7 @@ class NeuroplasticLlama(nn.Module):
         sca_basis_rank_by_layer: Optional[Dict[int, int]] = None,
         sca_basis_top_k_by_layer: Optional[Dict[int, int]] = None,
         sca_top_k_by_layer: Optional[Dict[int, int]] = None,
+        sca_dense_anchor_stride: int = 0,
         strict_decode_repetition_penalty: float = 1.35,
         strict_decode_penalty_window: int = 64,
         strict_decode_enable_repetition_penalty: bool = False,
@@ -618,6 +619,7 @@ class NeuroplasticLlama(nn.Module):
         self.buffer_layers = 2
         self.bottom_buffer_layers = max(int(sca_bottom_buffer_layers), 0)
         self.decode_guard_layers = max(int(sca_decode_guard_layers), 0)
+        self.sca_dense_anchor_stride = max(int(sca_dense_anchor_stride), 0)
         self.strict_decode_repetition_penalty = float(max(strict_decode_repetition_penalty, 1.0))
         self.strict_decode_penalty_window = int(max(strict_decode_penalty_window, 0))
         self.strict_decode_enable_repetition_penalty = bool(strict_decode_enable_repetition_penalty)
@@ -1852,32 +1854,34 @@ class NeuroplasticLlama(nn.Module):
         active_sparse_layers = [
             int(v) for v in getattr(self, "_sca_recalibration_active_sparse_layer_indices", []) if int(v) >= 0
         ]
-        export_layers = sorted(set(active_sparse_layers or self._sca_recalibration_layer_indices))
+        recalibration_layers = list(getattr(self, "_sca_recalibration_layer_indices", []))
+        trainable_modules = list(getattr(self, "_sca_recalibration_trainable_modules", []))
+        export_layers = sorted(set(active_sparse_layers or recalibration_layers))
         export_layer_set = set(export_layers)
         payload: Dict[str, Any] = {
             "model_name": self.model_name,
-            "hybrid_checkpoint_path": self._sca_recalibration_hybrid_checkpoint_path,
+            "hybrid_checkpoint_path": str(getattr(self, "_sca_recalibration_hybrid_checkpoint_path", "")),
             "layer_selection": list(export_layers),
             "active_sparse_layer_selection": list(active_sparse_layers),
             "sca_config": self.sca_config.to_dict(),
-            "recalibration_mode": self._sca_recalibration_mode,
-            "trainable_modules": list(self._sca_recalibration_trainable_modules),
+            "recalibration_mode": str(getattr(self, "_sca_recalibration_mode", "local_mlp_geometry")),
+            "trainable_modules": list(trainable_modules),
             "spatial_proj_state_dict": self.spatial_proj.state_dict(),
             "hybrid_config_summary": {
-                "enabled": bool(self.attention_hybrid_enabled),
+                "enabled": bool(getattr(self, "attention_hybrid_enabled", False)),
                 "layers": list(self.get_effective_hybrid_layers()),
-                "target_rank": self.attention_hybrid_target_rank,
-                "variance_threshold": float(self.attention_hybrid_variance_threshold),
-                "state_dim": self.attention_hybrid_state_dim,
-                "force_no_cache": bool(self.attention_hybrid_force_no_cache),
+                "target_rank": getattr(self, "attention_hybrid_target_rank", None),
+                "variance_threshold": float(getattr(self, "attention_hybrid_variance_threshold", 0.90)),
+                "state_dim": getattr(self, "attention_hybrid_state_dim", None),
+                "force_no_cache": bool(getattr(self, "attention_hybrid_force_no_cache", True)),
             },
             "taylor_config_summary": {
-                "enabled": bool(self.attention_taylor_ssd_enabled),
+                "enabled": bool(getattr(self, "attention_taylor_ssd_enabled", False)),
                 "layers": list(self.get_effective_taylor_layers()),
-                "order": self.attention_taylor_order,
-                "symmetric_quadratic": self.attention_taylor_symmetric_quadratic,
-                "taylor_temperature": self.attention_taylor_temperature,
-                "eps": self.attention_taylor_eps,
+                "order": int(getattr(self, "attention_taylor_order", 2)),
+                "symmetric_quadratic": bool(getattr(self, "attention_taylor_symmetric_quadratic", True)),
+                "taylor_temperature": float(getattr(self, "attention_taylor_temperature", 1.0)),
+                "eps": float(getattr(self, "attention_taylor_eps", 1e-6)),
                 "feature_map": str(getattr(self, "attention_taylor_feature_map", "hybrid_performer")),
                 "state_decay": float(getattr(self, "attention_taylor_state_decay", 1.0)),
                 "local_window": int(getattr(self, "attention_taylor_local_window", 64)),
@@ -1887,16 +1891,16 @@ class NeuroplasticLlama(nn.Module):
             },
             "router_metadata_snapshot": {
                 "sparse_mlp_bank_status": self.get_sparse_mlp_bank_status(),
-                "disable_task_bias_injection": bool(self.disable_task_bias_injection),
-                "strict_decode_upper_layer_cap_enabled": bool(self.strict_decode_upper_layer_cap_enabled),
+                "disable_task_bias_injection": bool(getattr(self, "disable_task_bias_injection", False)),
+                "strict_decode_upper_layer_cap_enabled": bool(getattr(self, "strict_decode_upper_layer_cap_enabled", False)),
                 "bottom_buffer_layers": int(getattr(self, "bottom_buffer_layers", 0)),
             },
         }
-        if any(name.startswith("task_embedding.") for name in self._sca_recalibration_trainable_modules):
+        if any(name.startswith("task_embedding.") for name in trainable_modules):
             payload["task_embedding_state_dict"] = self.task_embedding.state_dict()
-        if "adapter_scale" in self._sca_recalibration_trainable_modules:
+        if "adapter_scale" in trainable_modules:
             payload["adapter_scale"] = self.adapter_scale.detach().cpu()
-        if "sca_layer_output_scale" in self._sca_recalibration_trainable_modules and hasattr(self, "sca_layer_output_scale"):
+        if "sca_layer_output_scale" in trainable_modules and hasattr(self, "sca_layer_output_scale"):
             payload["sca_layer_output_scale"] = self.sca_layer_output_scale.detach().cpu()
         sparse_wrapper_state: Dict[str, Dict[str, torch.Tensor]] = {}
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
@@ -2329,18 +2333,19 @@ class NeuroplasticLlama(nn.Module):
         for layer_idx, layer in enumerate(self.model.model.layers):
             key = f"layers.{layer_idx}.self_attn"
             attn = layer.self_attn
+            target_attn = _unwrap_tier_masked_attention(attn)
             layer_state = state_map.get(key)
             if layer_state is None:
-                if strict and isinstance(attn, HybridCollapsedMambaSelfAttention):
+                if strict and isinstance(target_attn, HybridCollapsedMambaSelfAttention):
                     raise RuntimeError(f"Missing hybrid state for {key}")
                 missing += 1
                 continue
-            if isinstance(attn, HybridCollapsedMambaSelfAttention):
-                attn.load_hybrid_state(layer_state, strict=strict)
+            if isinstance(target_attn, HybridCollapsedMambaSelfAttention):
+                target_attn.load_hybrid_state(layer_state, strict=strict)
                 loaded += 1
                 continue
-            if hasattr(attn, "mamba_block"):
-                attn.load_state_dict(layer_state, strict=True)
+            if hasattr(target_attn, "mamba_block"):
+                target_attn.load_state_dict(layer_state, strict=True)
                 loaded += 1
                 continue
             if strict:
@@ -2710,6 +2715,12 @@ class NeuroplasticLlama(nn.Module):
         enabled = lower <= int(layer_idx) < max(upper, 0)
         if not enabled:
             return False
+        # Dense anchor logic: bypass sparsity every N layers to reset the manifold
+        dense_anchor_stride = int(getattr(self, "sca_dense_anchor_stride", 0))
+        if dense_anchor_stride > 0:
+            active_offset = int(layer_idx) - lower + 1
+            if active_offset > 0 and active_offset % dense_anchor_stride == 0:
+                return False
         override = getattr(self, "_sca_sparse_layer_override", None)
         if override is None:
             return True
@@ -3245,6 +3256,7 @@ class NeuroplasticLlama(nn.Module):
         config["sca_config"] = self.sca_config.to_dict()
         config["sca_bottom_buffer_layers"] = int(getattr(self, "bottom_buffer_layers", 0))
         config["sca_decode_guard_layers"] = int(self.decode_guard_layers)
+        config["sca_dense_anchor_stride"] = int(getattr(self, "sca_dense_anchor_stride", 0))
         config["strict_decode_repetition_penalty"] = float(self.strict_decode_repetition_penalty)
         config["strict_decode_penalty_window"] = int(self.strict_decode_penalty_window)
         config["strict_decode_enable_repetition_penalty"] = bool(self.strict_decode_enable_repetition_penalty)
@@ -3323,6 +3335,7 @@ class NeuroplasticLlama(nn.Module):
             sca_cfg = config.get("sca_config", {})
             sca_bottom_buffer_layers = int(config.get("sca_bottom_buffer_layers", 2))
             sca_decode_guard_layers = int(config.get("sca_decode_guard_layers", 12))
+            sca_dense_anchor_stride = int(config.get("sca_dense_anchor_stride", 0))
             strict_decode_repetition_penalty = float(config.get("strict_decode_repetition_penalty", 1.35))
             strict_decode_penalty_window = int(config.get("strict_decode_penalty_window", 64))
             strict_decode_enable_repetition_penalty = bool(config.get("strict_decode_enable_repetition_penalty", False))
@@ -3341,6 +3354,7 @@ class NeuroplasticLlama(nn.Module):
             sca_cfg = {}
             sca_bottom_buffer_layers = 2
             sca_decode_guard_layers = 12
+            sca_dense_anchor_stride = 0
             strict_decode_repetition_penalty = 1.35
             strict_decode_penalty_window = 64
             strict_decode_enable_repetition_penalty = False
@@ -3389,6 +3403,7 @@ class NeuroplasticLlama(nn.Module):
             sca_grouped_row_allow_4bit_dequant=bool(sca_cfg.get("grouped_row_allow_4bit_dequant", False)),
             sca_stability_dense_fallback_threshold=float(sca_cfg.get("stability_dense_fallback_threshold", 0.0)),
             sca_bottom_buffer_layers=int(kwargs.pop("sca_bottom_buffer_layers", sca_bottom_buffer_layers)),
+            sca_dense_anchor_stride=int(kwargs.pop("sca_dense_anchor_stride", sca_dense_anchor_stride)),
             sca_basis_rank_by_layer=kwargs.pop("sca_basis_rank_by_layer", sca_cfg.get("basis_rank_by_layer", {})),
             sca_basis_top_k_by_layer=kwargs.pop("sca_basis_top_k_by_layer", sca_cfg.get("basis_top_k_by_layer", {})),
             sca_top_k_by_layer=kwargs.pop("sca_top_k_by_layer", sca_cfg.get("top_k_by_layer", {})),

@@ -16,6 +16,14 @@ results/
 experiments/
 tests/
 example_configs/
+!llama3_neuroplastic/experiments/
+llama3_neuroplastic/experiments/*
+!llama3_neuroplastic/experiments/init_learned_basis_from_dense_mlp.py
+!llama3_neuroplastic/experiments/run_hybrid_gqa_mamba_inference.py
+!llama3_neuroplastic/experiments/run_sca_recalibration_from_hybrid_baseline.py
+!llama3_neuroplastic/experiments/run_streaming_inference.py
+!llama3_neuroplastic/experiments/run_taylor_ssd_inference.py
+!llama3_neuroplastic/experiments/streaming_llama_runtime.py
 
 # Local temp and scratch files
 _tmp*
