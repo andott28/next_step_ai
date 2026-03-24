@@ -58,10 +58,29 @@ What is working:
   - Fixed a generation bug where `use_cache` was not being correctly forwarded by `transformers` to the Taylor wrapper layers.
   - The local window (default $W=64$) preserves 100% on-manifold signals for the critical local context, while the Performer tail provides infinite-context retrieval.
 
-Practical implication:
-
-- Mid-band sparse operation (layers 3–7) is the recommended sparse path.
+- Practical implication: The 8B model is the stable proving ground, but the architecture is now fully verified for **405B Out-of-Core Deployment**.
 - Taylor attention with **Hybrid Performer** feature map (`feature_map="hybrid_performer"`, the new default) is the recommended attention backend. This uses an exact local window (sliding buffer) to preserve manifold alignment and a Performer-style recurrent tail for long-range context.
+
+## 405B Out-of-Core Deployment
+
+The project now supports running **Llama 3.1 405B (Instruct)** on consumer hardware (8GB VRAM) using a layer-by-layer SSD streaming harness.
+
+### How it works:
+- **Layer Streaming:** Only one 405B layer (~1.6 GB in 4-bit) is present in VRAM at any time. Weights are streamed directly from NVMe SSD to GPU.
+- **CPU Offloading:** The massive `embed_tokens` and `lm_head` (4.2 GB each) are kept on System RAM to stay within the 8GB GPU limit.
+- **GPU Dequantization:** 4-bit weights are dequantized on-the-fly on the GPU to eliminate CPU bottlenecks.
+- **Zero-Shot PCA:** Use `init_learned_basis_from_dense_mlp.py` with the `--use-streaming-harness` flag to initialize the sparse routing geometry analytically without ever loading the full model into system RAM.
+
+### 405B Inference Command:
+```powershell
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
+.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
+  --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
+  --prompt "The capital of Norway is" `
+  --max-new-tokens 20 `
+  --taylor-layers "0-125" `
+  --taylor-feature-map hybrid_performer
+```
 
 ### Safe operating ranges (March 2026)
 
@@ -80,11 +99,13 @@ Practical implication:
 - `llama3_neuroplastic/sca_sparse_mlp.py`: sparse MLP wrapper, semantic routing, curriculum/banking hooks
 - `llama3_neuroplastic/sca_sparse_config.py`: sparse config, runtime compatibility validation, and per-layer override canonicalization
 - `llama3_neuroplastic/experiments/run_sca_recalibration_from_hybrid_baseline.py`: recalibration runner
-- `llama3_neuroplastic/experiments/init_learned_basis_from_dense_mlp.py`: dense-informed basis init
+- `llama3_neuroplastic/experiments/run_streaming_inference.py`: high-bandwidth SSD streaming inference entrypoint
+- `llama3_neuroplastic/experiments/streaming_llama_runtime.py`: layer-by-layer out-of-core runtime (FP16/4-bit)
+- `llama3_neuroplastic/experiments/init_learned_basis_from_dense_mlp.py`: dense-informed basis init (supports streaming harness)
 - `llama3_neuroplastic/experiments/run_hybrid_gqa_mamba_inference.py`: runtime decode sanity checks
 - `llama3_neuroplastic/experiments/compile_block_bank_spatial_router.py`: block-bank + router-state compiler
 - `llama3_neuroplastic/experiments/run_taylor_ssd_inference.py`: Taylor-SSD inference + strict-metric runner
-- `llama3_neuroplastic/experiments/run_taylor_fluency_ablation.py`: stepwise dense→Taylor→sparse ablation with per-variant worker isolation
+- `llama3_neuroplastic/experiments/run_taylor_fluency_ablation.py`: stepwise dense→Taylor→sparse ablation
 - `llama3_neuroplastic/experiments/strict_decode_metrics.py`: strict decode metric utilities
 
 ## Repository layout
