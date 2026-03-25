@@ -52,6 +52,7 @@ What is working:
   - Taylor recurrent cache is now surfaced correctly as `present` in `gqa_taylor_ssd.py`
   - ablation runner isolates each variant in a fresh subprocess to avoid sequential 4-bit model-load VRAM churn/device-map failures
   - Taylor order-2 feature map now includes the linear term in symmetric mode and uses corrected quadratic scaling coefficients
+  - Windows 405B streaming now re-opens safetensor shards on demand instead of pinning many shard handles open for the whole run; this avoids the later-shard access-violation crash seen around the mid-model layers
 
 - Hybrid Softmax-Linear Attention landing (March 23, 2026):
   - Fixed severe repetition collapse (`Write Write ...`) by implementing an exact causal local softmax window plus a Performer-style compressed recurrent tail.
@@ -81,6 +82,55 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
   --taylor-layers "0-125" `
   --taylor-feature-map hybrid_performer
 ```
+
+### 405B Learned-Basis Init Notes
+
+When `init_learned_basis_from_dense_mlp.py` is run with `--use-streaming-harness`, the logging is nested:
+
+- `[collect] token X/Y` means the current dataset sample has `Y` valid tokens and the harness is about to process token `X`
+- `[layer A/126]` is the per-token layer-streaming progress for that one token
+- one full `0..125` layer sweep equals one token, not one whole sample
+
+Save cadence for the streaming harness:
+
+- `[pass done] ... resume saved` happens after one full dataset sample finishes, not after each token
+- `.resume.pt` is overwritten at each pass and is intended for resuming collection
+- the final runnable learned-basis checkpoint is written only when the script reaches the final `torch.save(payload, output_path)` path
+
+Practical implication:
+
+- if a sample shows `token 1/12` through `token 12/12`, expect one resume save after that sample completes
+- stopping immediately after `[pass done]` loses no work from that sample
+- stopping mid-sample loses only the current unsaved sample since the last `[pass done]`
+
+Partial artifacts:
+
+- a `.resume.pt` before the first `[checkpoint]` is only a raw collection cache (`layer_x` / `layer_y`) and is not a meaningful runnable learned-basis checkpoint
+- after the first `[checkpoint]`, `.resume.pt` contains fitted `layer_states` and can be treated as a partial learned-basis artifact, but it still lacks the final packaging metadata of the finished `.pt`
+
+Collection depth:
+
+- the default `--max-rows-per-layer 4096` implies an early-fit threshold of `max(64, 4096 / 8) = 512` rows per selected layer
+- because one token contributes roughly one row to every still-pending selected layer, the runtime cost is mostly determined by total valid tokens processed, not by `83 x tokens` separate forward passes
+- lowering `--max-rows-per-layer` is the main lever for faster smoke runs
+
+Fast smoke-run example that produces a real output checkpoint rather than only a resume file:
+
+```powershell
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
+.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\init_learned_basis_from_dense_mlp.py `
+  --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
+  --output-path ".\results\learned_basis_init_405b_smoke.pt" `
+  --use-streaming-harness `
+  --batch-size 1 `
+  --basis-rank 96 `
+  --sca-block-size 32 `
+  --sca-dense-anchor-stride 4 `
+  --max-samples 2 `
+  --no-local-files-only
+```
+
+This smoke command intentionally ends after a tiny bounded dataset slice so the script finalizes whatever rows were collected and writes a real checkpoint suitable for plumbing tests.
 
 ### Safe operating ranges (March 2026)
 
