@@ -63,6 +63,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--taylor-feature-dim", type=int, default=64)
     p.add_argument("--taylor-state-decay", type=float, default=1.0)
     p.add_argument("--dump-json", type=str, default="")
+    p.add_argument(
+        "--no-ram-cache",
+        action="store_true",
+        default=False,
+        help="Disable the RAM weight cache (re-reads from SSD every token). Use only when RAM is severely constrained.",
+    )
+    p.add_argument(
+        "--sparse-basis-path",
+        type=str,
+        default="",
+        help="Path to learned-basis checkpoint (.pt) from init_learned_basis_from_dense_mlp.py. "
+             "Enables sparse MLP execution (~2%% of neurons active per layer).",
+    )
+    p.add_argument(
+        "--sparse-top-k",
+        type=int,
+        default=None,
+        help="Override number of active MLP blocks per token (default: 2%% of blocks from checkpoint config).",
+    )
     return p
 
 
@@ -70,7 +89,6 @@ def main() -> None:
     args = _build_arg_parser().parse_args()
     prompts = list(args.prompt) if args.prompt else list(SMOKE_PROMPTS)
     taylor_layers = _parse_layer_selection(args.taylor_layers)
-
     runtime = StreamingLlamaRuntime(
         model_name_or_path=str(args.model_name),
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -81,6 +99,9 @@ def main() -> None:
         taylor_feature_dim=int(args.taylor_feature_dim),
         taylor_state_decay=float(args.taylor_state_decay),
         local_files_only=bool(args.local_files_only),
+        ram_cache=not bool(args.no_ram_cache),
+        sparse_basis_path=str(args.sparse_basis_path) if args.sparse_basis_path else None,
+        sparse_top_k=int(args.sparse_top_k) if args.sparse_top_k is not None else None,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_name), use_fast=True, local_files_only=bool(args.local_files_only))

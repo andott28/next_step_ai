@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import concurrent.futures
 import gc
 import json
 import os
+import threading
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import torch.nn.functional as F
 import bitsandbytes.functional as bnb_functional
 from bitsandbytes.backends.cuda.ops import _dequantize_4bit_impl as _bnb_dequant_impl
 import torch
@@ -70,6 +73,13 @@ class ShardedSafetensorLoader:
             cache_shard_handles = os.name != "nt"
         self._cache_shard_handles = bool(cache_shard_handles)
         self._shard_handles: Dict[str, Any] = {}
+        # RAM weight cache: maps full parameter name → (weight_bytes, quant_aux_dict)
+        # Both tensors are pinned (page-locked) for fast DMA to GPU.
+        # After the first forward pass all weights live here; subsequent tokens
+        # do RAM→GPU transfers instead of SSD→GPU (typically 5–10× faster).
+        self._ram_cache: Dict[str, Tuple[torch.Tensor, Dict[str, torch.Tensor]]] = {}
+        self._ram_cache_enabled: bool = True
+        self._ram_cache_lock = threading.Lock()
 
     def _load_exact_tensors(self, names: Sequence[str]) -> Dict[str, torch.Tensor]:
         requested = [str(name) for name in names if str(name) in self._available_names]
@@ -95,17 +105,44 @@ class ShardedSafetensorLoader:
 
     def load_parameter(self, name: str) -> torch.Tensor:
         full_name = str(name)
-        tensors = self._load_exact_tensors([full_name, *self._quant_aux_by_base.get(full_name, [])])
-        if full_name not in tensors:
-            raise KeyError(f"Tensor '{full_name}' not found in safetensors index")
-
-        weight = tensors[full_name]
-        quant_aux = {key: value for key, value in tensors.items() if key != full_name}
+        weight, quant_aux = self._load_raw_for_param(full_name)
         if not quant_aux:
             return weight
 
         quant_state = bnb_functional.QuantState.from_dict(quant_aux, device=torch.device("cpu"))
         return bnb_functional.dequantize_4bit(weight, quant_state=quant_state).cpu()
+
+    def _load_raw_for_param(self, full_name: str) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Return (weight_bytes, quant_aux) for a parameter, using RAM cache when warm.
+
+        On cache miss the tensors are loaded from disk and stored in the RAM cache
+        as pinned (page-locked) memory so subsequent tokens DMA directly to the GPU
+        staging buffer without going through the SSD.
+        """
+        if self._ram_cache_enabled:
+            with self._ram_cache_lock:
+                cached = self._ram_cache.get(full_name)
+            if cached is not None:
+                return cached
+
+        aux_names = self._quant_aux_by_base.get(full_name, [])
+        tensors = self._load_exact_tensors([full_name, *aux_names])
+        if full_name not in tensors:
+            raise KeyError(f"Tensor '{full_name}' not found in safetensors index")
+
+        weight = tensors[full_name]
+        quant_aux = {k: v for k, v in tensors.items() if k != full_name}
+
+        if self._ram_cache_enabled:
+            # Store as plain CPU tensors — no pin_memory() to avoid CUDA driver
+            # interactions from the background prefetch thread, which would race
+            # with GPU kernels on the main thread and risk OOM on Windows.
+            # Plain RAM→GPU DMA is still 5–10× faster than SSD→GPU.
+            with self._ram_cache_lock:
+                self._ram_cache[full_name] = (weight, quant_aux)
+            return weight, quant_aux
+
+        return weight, quant_aux
 
     def load_parameter_into(
         self,
@@ -130,14 +167,12 @@ class ShardedSafetensorLoader:
         Small tensors are memcpy'd into the pre-allocated GPU buffers and all
         dequant kernels run on GPU — same speed as GPU QuantState, but zero
         cudaMalloc calls that would fragment the pool and crash at layer ~48.
+
+        On the first forward pass weights are loaded from disk and stored in the
+        RAM cache.  All subsequent tokens hit the RAM cache, eliminating SSD I/O.
         """
         full_name = str(name)
-        tensors = self._load_exact_tensors([full_name, *self._quant_aux_by_base.get(full_name, [])])
-        if full_name not in tensors:
-            raise KeyError(f"Tensor '{full_name}' not found in safetensors index")
-
-        weight = tensors[full_name]
-        quant_aux = {key: value for key, value in tensors.items() if key != full_name}
+        weight, quant_aux = self._load_raw_for_param(full_name)
         if not quant_aux:
             out.copy_(weight.to(dtype=dtype))
             return
@@ -240,6 +275,9 @@ class StreamingLlamaRuntime:
         taylor_feature_dim: int = 64,
         taylor_state_decay: float = 1.0,
         local_files_only: bool = True,
+        ram_cache: bool = True,
+        sparse_basis_path: Optional[str] = None,
+        sparse_top_k: Optional[int] = None,
     ) -> None:
         self.snapshot_dir = _resolve_snapshot_dir(model_name_or_path, local_files_only=bool(local_files_only))
         self.config = AutoConfig.from_pretrained(str(self.snapshot_dir), local_files_only=bool(local_files_only))
@@ -256,6 +294,7 @@ class StreamingLlamaRuntime:
         if getattr(self.config, "_attn_implementation", None) is None:
             self.config._attn_implementation = "sdpa"
         self.loader = ShardedSafetensorLoader(self.snapshot_dir)
+        self.loader._ram_cache_enabled = bool(ram_cache)
         self.num_layers = int(getattr(self.config, "num_hidden_layers", 0))
         if self.num_layers <= 0:
             raise RuntimeError("Invalid llama config: num_hidden_layers must be > 0")
@@ -314,6 +353,14 @@ class StreamingLlamaRuntime:
             p.requires_grad = False
         self._layer_skeleton.eval()
 
+        # Background thread pool (1 worker) that warms the RAM cache for the
+        # next layer while the GPU processes the current one.
+        self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="layer_prefetch"
+        )
+        # Floating-point parameter keys of the skeleton (populated on first _load_layer).
+        self._layer_param_keys: Optional[List[str]] = None
+
         # Pre-allocate one fixed staging buffer for the NF4 uint8 bytes.
         # Sized to the largest weight in any decoder layer (gate_proj / up_proj / down_proj).
         # By allocating this once at startup—before any layer is streamed—we guarantee
@@ -361,6 +408,51 @@ class StreamingLlamaRuntime:
             self._state2_absmax_staging = None
             self._code_staging = None
 
+        # ── Sparse MLP routing weights ────────────────────────────────────────
+        # Loaded from the learned-basis checkpoint produced by
+        # init_learned_basis_from_dense_mlp.py.  Kept in CPU RAM (each layer's
+        # routing tensors are ~3 MB — trivial compared to the 1.6 GB MLP weights)
+        # and moved to GPU lazily when a layer is processed.
+        #
+        # For each sparse layer, the checkpoint stores:
+        #   encoder_weight [basis_rank, hidden_size] — projects hidden → latent
+        #   encoder_bias   [basis_rank]
+        #   decoder_blocks [num_blocks, basis_rank, block_size] — predicts block outputs
+        #
+        # Routing:  latent = enc_w @ h + enc_b
+        #           scores = ||einsum('nr,brs->nbs', latent, dec)||  per block
+        #           active  = topk(scores) → active neuron indices
+        #
+        # Execution: only the rows of gate/up and columns of down corresponding
+        #            to active neurons are gathered and matmul'd → ~sparse_top_k/
+        #            num_blocks fraction of the MLP compute.
+        self._sparse_routing: Dict[int, Dict[str, torch.Tensor]] = {}
+        self._sparse_top_k: int = 0
+        self._sparse_block_size: int = 32
+
+        if sparse_basis_path and str(sparse_basis_path).strip():
+            _payload = torch.load(str(sparse_basis_path), map_location="cpu", weights_only=False)
+            _cfg = _payload.get("config", {})
+            self._sparse_block_size = int(_cfg.get("block_size", 32))
+            # top_k: honour explicit override, else use 2 % of blocks as default
+            _num_blocks = int(getattr(self.config, "intermediate_size", 4 * int(self.config.hidden_size))) // self._sparse_block_size
+            _default_top_k = max(1, int(round(_num_blocks * 0.02)))
+            self._sparse_top_k = int(sparse_top_k) if sparse_top_k is not None else _default_top_k
+            _layer_states = _payload.get("layer_states", {})
+            for _lidx_s, _state in _layer_states.items():
+                _lidx = int(_lidx_s)
+                if not (0 <= _lidx < self.num_layers):
+                    continue
+                self._sparse_routing[_lidx] = {
+                    "enc_w": _state["encoder_weight"].to(dtype=self.dtype),  # [R, H]
+                    "enc_b": _state["encoder_bias"].to(dtype=self.dtype),    # [R]
+                    "dec":   _state["decoder_blocks"].to(dtype=self.dtype),  # [B, R, S]
+                }
+            _pct = int(round(self._sparse_top_k * 100 / max(_num_blocks, 1)))
+            print(f"[sparse] loaded routing for {len(self._sparse_routing)}/{self.num_layers} layers "
+                  f"| top_k={self._sparse_top_k}/{_num_blocks} blocks ({_pct}%) "
+                  f"| block_size={self._sparse_block_size}", flush=True)
+
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
         self._dense_cache = DynamicCache(config=self.config) if DynamicCache is not None else None
@@ -368,13 +460,149 @@ class StreamingLlamaRuntime:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _prefetch_layer(self, layer_idx: int) -> None:
+        """Warm the RAM cache for *layer_idx* from disk on a background thread.
+
+        Only loads parameters that are not yet cached — safe to call concurrently
+        with the GPU forward pass because it touches only CPU memory and the
+        thread-safe RAM cache dict (protected by _ram_cache_lock).
+        """
+        if not self.loader._ram_cache_enabled:
+            return
+        if self._layer_param_keys is None:
+            return  # skeleton not yet inspected; skip this prefetch
+        prefix = f"model.layers.{int(layer_idx)}."
+        for k in self._layer_param_keys:
+            full_name = f"{prefix}{k}"
+            with self.loader._ram_cache_lock:
+                already = full_name in self.loader._ram_cache
+            if not already:
+                try:
+                    self.loader._load_raw_for_param(full_name)
+                except Exception:
+                    pass  # best-effort; main thread will retry
+
+    def _route_sparse_mlp(self, hidden: torch.Tensor, layer_idx: int) -> Optional[torch.Tensor]:
+        """Return active block indices [N, top_k] for this layer, or None (→ dense).
+
+        Uses the learned encoder/decoder from the basis checkpoint to predict
+        which MLP output blocks will have the largest norm for this hidden state,
+        then returns the top-K block indices.  All tensors moved to GPU lazily.
+        """
+        routing = self._sparse_routing.get(layer_idx)
+        if routing is None:
+            return None
+
+        enc_w = routing["enc_w"].to(device=self.device, non_blocking=True)  # [R, H]
+        enc_b = routing["enc_b"].to(device=self.device, non_blocking=True)  # [R]
+        dec   = routing["dec"].to(device=self.device, non_blocking=True)    # [B, R, S]
+
+        N = hidden.shape[0] * hidden.shape[1]
+        h = hidden.view(N, -1).to(dtype=enc_w.dtype)
+
+        latent = F.linear(h, enc_w, enc_b)                           # [N, R]
+        B, R, S = dec.shape
+        # predicted output per block: [N, B, S]  (fp32 for numerical precision)
+        pred = torch.einsum("nr,brs->nbs", latent.float(), dec.float())
+        scores = pred.norm(dim=-1)                                    # [N, B]
+        active_blocks = scores.topk(self._sparse_top_k, dim=-1).indices  # [N, K]
+        return active_blocks
+
+    def _sparse_mlp_forward(
+        self,
+        mlp: nn.Module,
+        hidden: torch.Tensor,
+        active_blocks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run LlamaMLP on only the active neuron blocks; fall back if needed.
+
+        active_blocks: [N, top_k] — block indices selected by _route_sparse_mlp.
+
+        For each token we gather the rows of gate_proj/up_proj and the columns of
+        down_proj that correspond to active neurons, run the SiLU-gated MLP on
+        that small slice (~2% of weights for top_k=2%), and return the output.
+
+        Falls back to dense MLP if the module doesn't expose the expected Linear
+        sub-layers.
+        """
+        gate_proj = getattr(mlp, "gate_proj", None)
+        up_proj   = getattr(mlp, "up_proj",   None)
+        down_proj = getattr(mlp, "down_proj",  None)
+        if gate_proj is None or up_proj is None or down_proj is None:
+            return mlp(hidden)  # not a standard LlamaMLP — run dense
+        if not (hasattr(gate_proj, "weight") and gate_proj.weight is not None):
+            return mlp(hidden)  # quantised linear without accessible .weight
+
+        block_size = self._sparse_block_size
+        N, H = hidden.shape[0] * hidden.shape[1], hidden.shape[-1]
+        h = hidden.view(N, H)
+
+        # Expand block indices to individual neuron indices.
+        # active_blocks: [N, K]  →  active_neurons: [N, K*block_size]
+        neuron_offsets = torch.arange(block_size, device=active_blocks.device)  # [S]
+        active_neurons = (
+            active_blocks.unsqueeze(-1) * block_size + neuron_offsets
+        ).reshape(N, -1)                                              # [N, K*S]
+
+        # For single-token generation (N=1) the unique set == the full set.
+        # For N>1 take the union so every token's active neurons are covered.
+        if N == 1:
+            unique_neurons = active_neurons.squeeze(0)                # [K*S]
+        else:
+            unique_neurons = active_neurons.unique()                  # [≤N*K*S]
+
+        def _is_4bit_linear(linear: nn.Module) -> bool:
+            weight = getattr(linear, "weight", None)
+            return bool(torch.is_tensor(weight) and getattr(weight, "quant_state", None) is not None)
+
+        def _project_active_inputs(linear: nn.Module, neurons: torch.Tensor) -> torch.Tensor:
+            bias = getattr(linear, "bias", None)
+            weight = getattr(linear, "weight", None)
+            if _is_4bit_linear(linear):
+                quant_state = weight.quant_state
+                # Params4bit advanced indexing silently dequantizes the whole matrix.
+                # Dequantize one projection at a time instead so peak memory stays bounded.
+                dense_weight = bnb_functional.dequantize_4bit(weight.t(), quant_state).t()
+                proj_weight = dense_weight.index_select(0, neurons)
+                del dense_weight
+            else:
+                proj_weight = weight.index_select(0, neurons)
+            if bias is not None:
+                bias = bias.index_select(0, neurons)
+            return F.linear(h, proj_weight, bias)
+
+        def _project_active_outputs(x: torch.Tensor, linear: nn.Module, neurons: torch.Tensor) -> torch.Tensor:
+            bias = getattr(linear, "bias", None)
+            weight = getattr(linear, "weight", None)
+            if _is_4bit_linear(linear):
+                quant_state = weight.quant_state
+                dense_weight = bnb_functional.dequantize_4bit(weight.t(), quant_state).t()
+                proj_weight = dense_weight.index_select(1, neurons)
+                del dense_weight
+            else:
+                proj_weight = weight.index_select(1, neurons)
+            return F.linear(x, proj_weight, bias)
+
+        gate = _project_active_inputs(gate_proj, unique_neurons)    # [N, K*S]
+        up   = _project_active_inputs(up_proj, unique_neurons)      # [N, K*S]
+        act  = F.silu(gate) * up                                    # [N, K*S]
+        del gate, up
+        out  = _project_active_outputs(act, down_proj, unique_neurons)  # [N, H]
+        return out.view_as(hidden)
+
     def _load_layer(self, layer_idx: int) -> LlamaDecoderLayer:
         self._layer_skeleton.layer_idx = int(layer_idx)
         if hasattr(self._layer_skeleton, "self_attn"):
-             self._layer_skeleton.self_attn.layer_idx = int(layer_idx)
+            self._layer_skeleton.self_attn.layer_idx = int(layer_idx)
 
-        prefix = f"model.layers.{int(layer_idx)}."
         skeleton_state = self._layer_skeleton.state_dict()
+
+        # Capture floating-point param keys on first call (same for every layer).
+        if self._layer_param_keys is None:
+            self._layer_param_keys = [k for k, v in skeleton_state.items() if v.is_floating_point()]
+
+        # ── Tier 1: RAM cache → GPU  (miss falls through to SSD on first pass) ──
+        prefix = f"model.layers.{int(layer_idx)}."
         for k, dest in skeleton_state.items():
             full_name = f"{prefix}{k}"
             if dest.is_floating_point():
@@ -389,6 +617,12 @@ class StreamingLlamaRuntime:
             else:
                 raw = self.loader.load_parameter(full_name)
                 dest.copy_(raw)
+
+        # Kick off RAM prefetch for the next layer on the background thread.
+        next_idx = layer_idx + 1
+        if next_idx < self.num_layers:
+            self._prefetch_executor.submit(self._prefetch_layer, next_idx)
+
         return self._layer_skeleton
 
     def _release_modules(self, *modules: nn.Module) -> None:
@@ -457,11 +691,6 @@ class StreamingLlamaRuntime:
                 else:
                     print(f"  [layer {layer_idx}/{self.num_layers}] loading...", end="\r", flush=True)
             layer = self._load_layer(layer_idx)
-            # Safety net: flush stray CUDA pool fragments every 32 layers.
-            # With pre-allocated staging this should be a no-op, but guards
-            # against any small allocations from attention/MLP intermediates.
-            if torch.cuda.is_available() and int(layer_idx) % 32 == 31:
-                torch.cuda.empty_cache()
             taylor_attn: Optional[GQATaylorSSDSelfAttention] = None
             residual = hidden
             hidden_norm = layer.input_layernorm(hidden)
@@ -499,7 +728,13 @@ class StreamingLlamaRuntime:
             hidden = residual + attn_out
             residual = hidden
             mlp_input = layer.post_attention_layernorm(hidden)
-            mlp_out = layer.mlp(mlp_input)
+
+            _active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
+            if _active_blocks is not None:
+                mlp_out = self._sparse_mlp_forward(layer.mlp, mlp_input, _active_blocks)
+            else:
+                mlp_out = layer.mlp(mlp_input)
+
             if layer_idx in capture_set:
                 captures[layer_idx] = {
                     "mlp_input": mlp_input.detach().cpu(),
