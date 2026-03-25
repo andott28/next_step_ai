@@ -362,7 +362,17 @@ def main() -> None:
         for _k in layer_states:
             if int(_k) in layer_rows:
                 layer_rows[int(_k)] = max_rows
-        print(f"[resume] loaded {len(layer_states)}/{len(selected_layers)} fitted layers from {_resume_path}")
+        # Restore any partially-collected activation rows from the previous run
+        for _k, _xs in _resume_data.get("layer_x", {}).items():
+            if int(_k) in layer_x and int(_k) not in [int(s) for s in layer_states]:
+                layer_x[int(_k)] = _xs
+                layer_rows[int(_k)] = sum(t.shape[0] for t in _xs)
+        for _k, _ys in _resume_data.get("layer_y", {}).items():
+            if int(_k) in layer_y and int(_k) not in [int(s) for s in layer_states]:
+                layer_y[int(_k)] = _ys
+        print(f"[resume] loaded {len(layer_states)}/{len(selected_layers)} fitted layers, "
+              f"{sum(1 for idx in selected_layers if layer_rows[idx] > 0 and str(idx) not in layer_states)} "
+              f"partially collected, from {_resume_path}")
 
     for batch in dataloader:
         if runtime is not None:
@@ -375,6 +385,20 @@ def main() -> None:
                 layer_rows=layer_rows,
                 max_rows=max_rows,
             )
+            # Save raw activation buffers after every completed pass so a crash mid-pass
+            # only loses that one pass, not all previously collected rows.
+            torch.save(
+                {
+                    "layer_states": layer_states,
+                    "stats": stats,
+                    "layer_x": {idx: layer_x[idx] for idx in selected_layers if layer_x[idx]},
+                    "layer_y": {idx: layer_y[idx] for idx in selected_layers if layer_y[idx]},
+                },
+                _resume_path,
+            )
+            _rows_done = sum(1 for idx in selected_layers if str(idx) in layer_states)
+            _rows_partial = sum(1 for idx in selected_layers if layer_rows[idx] > 0 and str(idx) not in layer_states)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting — resume saved", flush=True)
         else:
             assert model is not None
             input_ids = batch["input_ids"].to(model.device, non_blocking=True)
@@ -430,10 +454,12 @@ def main() -> None:
                     )
                     if all(v >= max_rows for v in layer_rows.values()):
                         break
-        # Fit and free any layer that has now reached max_rows to avoid accumulating all
-        # layers' activations in RAM simultaneously before the final fitting pass.
+        # Fit and free any layer that has collected enough rows. Using 1/8 of max_rows
+        # as the threshold so layers are saved early and the resume file is written
+        # after just a few batches rather than waiting for all layers to be fully saturated.
+        _fit_threshold = max(64, max_rows // 8)
         for layer_idx in selected_layers:
-            if str(layer_idx) in layer_states or layer_rows[layer_idx] < max_rows:
+            if str(layer_idx) in layer_states or layer_rows[layer_idx] < _fit_threshold:
                 continue
             _xs = layer_x[layer_idx]
             _ys = layer_y[layer_idx]
@@ -454,6 +480,9 @@ def main() -> None:
                 "rank_effective": float(_fitted["rank_effective"]),
                 "explained_variance_ratio": float(_fitted["explained_variance_ratio"]),
             }
+            # Once a layer is fitted, stop collecting more token rows for it in
+            # the current run. Resume loading already treats fitted layers this way.
+            layer_rows[layer_idx] = max_rows
             layer_x[layer_idx].clear()
             layer_y[layer_idx].clear()
             torch.save({"layer_states": layer_states, "stats": stats}, _resume_path)

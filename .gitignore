@@ -14,8 +14,9 @@ dist/
 # Large/generated experiment artifacts
 results/
 experiments/
-tests/
+tests/*
 example_configs/
+!tests/test_streaming_llama_runtime.py
 !llama3_neuroplastic/experiments/
 llama3_neuroplastic/experiments/*
 !llama3_neuroplastic/experiments/init_learned_basis_from_dense_mlp.py
@@ -37,3 +38,5 @@ Thumbs.db
 # Written documentation
 written_documentation/
 legacy_files/
+
+.claude/

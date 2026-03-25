@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import bitsandbytes.functional as bnb_functional
+from bitsandbytes.backends.cuda.ops import _dequantize_4bit_impl as _bnb_dequant_impl
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
@@ -25,7 +27,6 @@ try:
 except ImportError:  # pragma: no cover
     from gqa_taylor_ssd import GQATaylorSSDSelfAttention, TaylorSSDLayerCache
 
-
 def _resolve_snapshot_dir(model_name_or_path: str, *, local_files_only: bool) -> Path:
     candidate = Path(model_name_or_path)
     if candidate.exists():
@@ -39,7 +40,7 @@ def _resolve_snapshot_dir(model_name_or_path: str, *, local_files_only: bool) ->
 
 
 class ShardedSafetensorLoader:
-    def __init__(self, snapshot_dir: Path) -> None:
+    def __init__(self, snapshot_dir: Path, *, cache_shard_handles: Optional[bool] = None) -> None:
         self.snapshot_dir = Path(snapshot_dir)
         index_path = self.snapshot_dir / "model.safetensors.index.json"
         self.weight_map: Dict[str, str] = {}
@@ -62,6 +63,12 @@ class ShardedSafetensorLoader:
                 continue
             base = name.split(".weight.", 1)[0] + ".weight"
             self._quant_aux_by_base[base].append(name)
+        # Windows + many concurrent safe_open mappings for 405B shards reliably
+        # hard-crash once the stream crosses into later shards. Re-open on demand
+        # there; keep the old cached-handle fast path elsewhere.
+        if cache_shard_handles is None:
+            cache_shard_handles = os.name != "nt"
+        self._cache_shard_handles = bool(cache_shard_handles)
         self._shard_handles: Dict[str, Any] = {}
 
     def _load_exact_tensors(self, names: Sequence[str]) -> Dict[str, torch.Tensor]:
@@ -72,12 +79,18 @@ class ShardedSafetensorLoader:
 
         out: Dict[str, torch.Tensor] = {}
         for shard_name, shard_keys in by_shard.items():
-            if shard_name not in self._shard_handles:
-                shard_path = self.snapshot_dir / shard_name
-                self._shard_handles[shard_name] = safe_open(str(shard_path), framework="pt", device="cpu")
-            handle = self._shard_handles[shard_name]
-            for key in shard_keys:
-                out[key] = handle.get_tensor(key)
+            shard_path = self.snapshot_dir / shard_name
+            if self._cache_shard_handles:
+                if shard_name not in self._shard_handles:
+                    self._shard_handles[shard_name] = safe_open(str(shard_path), framework="pt", device="cpu")
+                handle = self._shard_handles[shard_name]
+                for key in shard_keys:
+                    out[key] = handle.get_tensor(key)
+                continue
+
+            with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
+                for key in shard_keys:
+                    out[key] = handle.get_tensor(key)
         return out
 
     def load_parameter(self, name: str) -> torch.Tensor:
@@ -92,7 +105,110 @@ class ShardedSafetensorLoader:
             return weight
 
         quant_state = bnb_functional.QuantState.from_dict(quant_aux, device=torch.device("cpu"))
-        return bnb_functional.dequantize_4bit(weight, quant_state=quant_state)
+        return bnb_functional.dequantize_4bit(weight, quant_state=quant_state).cpu()
+
+    def load_parameter_into(
+        self,
+        name: str,
+        out: torch.Tensor,
+        dtype: torch.dtype,
+        staging: Optional[torch.Tensor] = None,
+        absmax_staging: Optional[torch.Tensor] = None,
+        nested_absmax_staging: Optional[torch.Tensor] = None,
+        state2_absmax_staging: Optional[torch.Tensor] = None,
+        code_staging: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Dequantize NF4 weight directly into a pre-allocated GPU skeleton buffer.
+
+        All GPU tensors are pre-allocated: `staging` (uint8, NF4 bytes),
+        `absmax_staging` (fp32, dequantized absmax output),
+        `nested_absmax_staging` (uint8, doubly-quantized absmax input),
+        `state2_absmax_staging` (fp32, secondary quant scales),
+        `code_staging` (fp32, dequant codebook).
+
+        QuantState is created on CPU (fast dict parsing, zero GPU allocs).
+        Small tensors are memcpy'd into the pre-allocated GPU buffers and all
+        dequant kernels run on GPU — same speed as GPU QuantState, but zero
+        cudaMalloc calls that would fragment the pool and crash at layer ~48.
+        """
+        full_name = str(name)
+        tensors = self._load_exact_tensors([full_name, *self._quant_aux_by_base.get(full_name, [])])
+        if full_name not in tensors:
+            raise KeyError(f"Tensor '{full_name}' not found in safetensors index")
+
+        weight = tensors[full_name]
+        quant_aux = {key: value for key, value in tensors.items() if key != full_name}
+        if not quant_aux:
+            out.copy_(weight.to(dtype=dtype))
+            return
+
+        # DMA NF4 bytes into the pre-allocated staging buffer — no cudaMalloc.
+        n = weight.numel()
+        if staging is not None:
+            weight_gpu = staging[:n]
+            weight_gpu.copy_(weight.reshape(-1))
+        else:
+            weight_gpu = weight.to(device=out.device)
+
+        # Create QuantState on CPU — fast dict parsing, no GPU memory allocated.
+        # The small internal tensors (absmax, state2, code) stay on CPU and are
+        # selectively copied into pre-allocated GPU buffers below.
+        quant_state = bnb_functional.QuantState.from_dict(quant_aux, device=torch.device("cpu"))
+
+        if quant_state.nested:
+            if absmax_staging is not None and nested_absmax_staging is not None and state2_absmax_staging is not None and code_staging is not None:
+                # --- Zero-alloc GPU path for nested (doubly-quantized) absmax ---
+                # 1. Copy the nested absmax uint8 bytes to pre-allocated GPU buffer
+                n_nested = quant_state.absmax.numel()
+                nested_gpu = nested_absmax_staging[:n_nested]
+                nested_gpu.copy_(quant_state.absmax)
+
+                # 2. Copy state2 scales to pre-allocated GPU buffer
+                n_s2 = quant_state.state2.absmax.numel()
+                s2_gpu = state2_absmax_staging[:n_s2]
+                s2_gpu.copy_(quant_state.state2.absmax)
+
+                # 3. Copy dequant codebook to pre-allocated GPU buffer
+                code_staging[:quant_state.state2.code.numel()].copy_(quant_state.state2.code)
+                code_gpu = code_staging[:quant_state.state2.code.numel()]
+
+                # 4. Dequantize nested absmax ON GPU → output to absmax_staging
+                absmax = absmax_staging[:n_nested]
+                bnb_functional.dequantize_blockwise(
+                    nested_gpu,
+                    absmax=s2_gpu,
+                    code=code_gpu,
+                    out=absmax,
+                    blocksize=quant_state.state2.blocksize,
+                )
+                absmax.add_(quant_state.offset)
+            else:
+                # Fallback: no staging → let bitsandbytes allocate (slower path)
+                quant_state_gpu = bnb_functional.QuantState.from_dict(quant_aux, device=out.device)
+                absmax = bnb_functional.dequantize_blockwise(quant_state_gpu.absmax, quant_state_gpu.state2)
+                absmax += quant_state_gpu.offset
+                del quant_state_gpu
+            if absmax.dtype != torch.float32:
+                absmax = absmax.float()
+        else:
+            # Non-nested: absmax is already float32, just copy to GPU staging
+            if absmax_staging is not None:
+                n_abs = quant_state.absmax.numel()
+                absmax = absmax_staging[:n_abs]
+                absmax.copy_(quant_state.absmax)
+            else:
+                absmax = quant_state.absmax.to(device=out.device)
+            if absmax.dtype != torch.float32:
+                absmax = absmax.float()
+
+        if n * 2 != out.numel():
+            raise RuntimeError(
+                f"Shape mismatch for '{full_name}': {n} NF4 bytes → {n * 2} elements "
+                f"but out has {out.numel()} elements (shape {out.shape})"
+            )
+
+        _bnb_dequant_impl(weight_gpu, absmax, quant_state.blocksize, quant_state.quant_type, quant_state.dtype, out=out)
+        del absmax, quant_state
 
     def load_module_state(
         self,
@@ -132,6 +248,13 @@ class StreamingLlamaRuntime:
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
+        # AutoConfig.from_pretrained does not set _attn_implementation (that happens inside
+        # PreTrainedModel.from_pretrained).  Leaving it as None causes a KeyError in
+        # ALL_ATTENTION_FUNCTIONS when layer.self_attn is called directly (e.g. in the
+        # no-cache data-collection path).  'sdpa' is available on any PyTorch 2.x + CUDA
+        # setup and is faster than 'eager' for the single-token forward we do here.
+        if getattr(self.config, "_attn_implementation", None) is None:
+            self.config._attn_implementation = "sdpa"
         self.loader = ShardedSafetensorLoader(self.snapshot_dir)
         self.num_layers = int(getattr(self.config, "num_hidden_layers", 0))
         if self.num_layers <= 0:
@@ -147,13 +270,14 @@ class StreamingLlamaRuntime:
         self.taylor_feature_dim = int(taylor_feature_dim)
         self.taylor_state_decay = float(taylor_state_decay)
 
+        # Keep embed_tokens on CPU — it's ~3.9 GiB for 405B and only one row is needed per token.
         self.embed_tokens = nn.Embedding(
             int(self.config.vocab_size),
             int(self.config.hidden_size),
             padding_idx=getattr(self.config, "pad_token_id", None),
-        ).to(device=self.device, dtype=self.dtype)
+        ).to(device=torch.device("cpu"), dtype=self.dtype)
         self.embed_tokens.weight.data.copy_(
-            self.loader.load_parameter("model.embed_tokens.weight").to(device=self.device, dtype=self.dtype)
+            self.loader.load_parameter("model.embed_tokens.weight").to(dtype=self.dtype)
         )
         self.embed_tokens.requires_grad_(False)
 
@@ -166,6 +290,7 @@ class StreamingLlamaRuntime:
         )
         self.norm.requires_grad_(False)
 
+        # Keep lm_head on CPU alongside embed_tokens — projection is done on CPU at end of forward.
         self.lm_head = nn.Linear(int(self.config.hidden_size), int(self.config.vocab_size), bias=False)
         lm_head_weight_name = (
             "lm_head.weight"
@@ -173,12 +298,11 @@ class StreamingLlamaRuntime:
             else "model.embed_tokens.weight"
         )
         if lm_head_weight_name == "model.embed_tokens.weight":
-            # Tied embeddings: share the already-resident embed_tokens weight, no extra VRAM
             self.lm_head.weight = self.embed_tokens.weight
         else:
-            self.lm_head.to(device=self.device, dtype=self.dtype)
+            self.lm_head.to(device=torch.device("cpu"), dtype=self.dtype)
             self.lm_head.weight.data.copy_(
-                self.loader.load_parameter(lm_head_weight_name).to(device=self.device, dtype=self.dtype)
+                self.loader.load_parameter(lm_head_weight_name).to(dtype=self.dtype)
             )
         self.lm_head.requires_grad_(False)
 
@@ -190,24 +314,81 @@ class StreamingLlamaRuntime:
             p.requires_grad = False
         self._layer_skeleton.eval()
 
+        # Pre-allocate one fixed staging buffer for the NF4 uint8 bytes.
+        # Sized to the largest weight in any decoder layer (gate_proj / up_proj / down_proj).
+        # By allocating this once at startup—before any layer is streamed—we guarantee
+        # a single contiguous CUDA allocation and avoid the pool fragmentation that
+        # accumulates over ~48 layers and causes STATUS_ACCESS_VIOLATION when a later
+        # weight.to(device=...) forces a new cudaMalloc near the 8 GB VRAM ceiling.
+        _h = int(self.config.hidden_size)
+        _ffn = int(getattr(self.config, "intermediate_size", _h * 4))
+        _max_nf4_bytes = max(_h * _h, _ffn * _h) // 2  # NF4 = 2 values per byte
+        # absmax has one fp32 value per block of 64 weight elements.
+        # num_blocks = max_weight_numel / 64 = (_max_nf4_bytes * 2) / 64 = _max_nf4_bytes / 32
+        _max_absmax_numel = _max_nf4_bytes // 32
+        if torch.cuda.is_available():
+            self._nf4_staging: Optional[torch.Tensor] = torch.empty(
+                _max_nf4_bytes, dtype=torch.uint8, device=self.device
+            )
+            # Pre-allocated fp32 output buffer for dequantize_blockwise(absmax).
+            # Without this, each large weight allocates ~54 MB from the pool for the
+            # dequantized absmax. Repeated alloc/free fragments the 80 MB free pool
+            # until no contiguous block remains and cudaMalloc crashes.
+            self._absmax_staging: Optional[torch.Tensor] = torch.empty(
+                _max_absmax_numel, dtype=torch.float32, device=self.device
+            )
+            # --- Zero-alloc QuantState staging ---
+            # QuantState.from_dict(device=GPU) allocates ~15 MB of small GPU tensors
+            # per weight (nested absmax uint8 + state2 float32 + code).  Over 7 weights
+            # × 48 layers these fragment the CUDA pool → STATUS_ACCESS_VIOLATION.
+            # Pre-allocating them here lets us create QuantState on CPU (fast dict
+            # parsing, no GPU allocs) then memcpy the small tensors into these fixed
+            # buffers before calling the GPU dequant kernels.
+            self._nested_absmax_staging: Optional[torch.Tensor] = torch.empty(
+                _max_absmax_numel, dtype=torch.uint8, device=self.device
+            )  # ~13 MB for 405B — holds the doubly-quantized absmax bytes
+            _max_s2_absmax = max(_max_absmax_numel // 64, 1024)
+            self._state2_absmax_staging: Optional[torch.Tensor] = torch.empty(
+                _max_s2_absmax, dtype=torch.float32, device=self.device
+            )  # ~830 KB — holds secondary quantization scales
+            self._code_staging: Optional[torch.Tensor] = torch.empty(
+                256, dtype=torch.float32, device=self.device
+            )  # 1 KB — dequantization codebook (same for all NF4 weights)
+        else:
+            self._nf4_staging = None
+            self._absmax_staging = None
+            self._nested_absmax_staging = None
+            self._state2_absmax_staging = None
+            self._code_staging = None
+
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
         self._dense_cache = DynamicCache(config=self.config) if DynamicCache is not None else None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _load_layer(self, layer_idx: int) -> LlamaDecoderLayer:
         self._layer_skeleton.layer_idx = int(layer_idx)
         if hasattr(self._layer_skeleton, "self_attn"):
              self._layer_skeleton.self_attn.layer_idx = int(layer_idx)
-        
-        expected_keys = list(self._layer_skeleton.state_dict().keys())
-        state = self.loader.load_module_state(
-            prefix=f"model.layers.{int(layer_idx)}.",
-            expected_keys=expected_keys,
-            dtype=self.dtype,
-        )
-        # Load onto GPU directly where possible or move after
-        state_gpu = {k: v.to(device=self.device, non_blocking=True) for k, v in state.items()}
-        self._layer_skeleton.load_state_dict(state_gpu, strict=True)
+
+        prefix = f"model.layers.{int(layer_idx)}."
+        skeleton_state = self._layer_skeleton.state_dict()
+        for k, dest in skeleton_state.items():
+            full_name = f"{prefix}{k}"
+            if dest.is_floating_point():
+                self.loader.load_parameter_into(
+                    full_name, dest, dtype=self.dtype,
+                    staging=self._nf4_staging,
+                    absmax_staging=self._absmax_staging,
+                    nested_absmax_staging=self._nested_absmax_staging,
+                    state2_absmax_staging=self._state2_absmax_staging,
+                    code_staging=self._code_staging,
+                )
+            else:
+                raw = self.loader.load_parameter(full_name)
+                dest.copy_(raw)
         return self._layer_skeleton
 
     def _release_modules(self, *modules: nn.Module) -> None:
@@ -253,25 +434,39 @@ class StreamingLlamaRuntime:
         *,
         position_index: int,
         capture_layers: Optional[Sequence[int]] = None,
+        use_attention_cache: bool = True,
     ) -> tuple[torch.Tensor, Dict[int, Dict[str, torch.Tensor]]]:
         if token_ids.ndim != 2 or int(token_ids.shape[0]) != 1 or int(token_ids.shape[1]) != 1:
             raise RuntimeError("StreamingLlamaRuntime.forward_token currently supports batch_size=1 and seq_len=1 only")
 
         capture_set = {int(idx) for idx in capture_layers or []}
         captures: Dict[int, Dict[str, torch.Tensor]] = {}
-        hidden = self.embed_tokens(token_ids.to(device=self.device))
+        printed_progress = False
+        # Index on CPU (avoids 3.9 GiB GPU allocation), move the resulting 32 KB vector to GPU.
+        hidden = self.embed_tokens(token_ids.cpu()).to(device=self.device, dtype=self.dtype)
         position_ids = torch.tensor([[int(position_index)]], device=self.device, dtype=torch.long)
         rope = self.rotary_emb(hidden, position_ids)
 
         for layer_idx in range(self.num_layers):
             if int(layer_idx) % 8 == 0 or int(layer_idx) == self.num_layers - 1:
-                print(f"  [layer {layer_idx}/{self.num_layers}] loading...", end="\r", flush=True)
+                printed_progress = True
+                if torch.cuda.is_available():
+                    alloc_gb = torch.cuda.memory_allocated() / 1e9
+                    reserv_gb = torch.cuda.memory_reserved() / 1e9
+                    print(f"  [layer {layer_idx}/{self.num_layers}] VRAM {alloc_gb:.2f}/{reserv_gb:.2f} GB (alloc/reserv)", end="\r", flush=True)
+                else:
+                    print(f"  [layer {layer_idx}/{self.num_layers}] loading...", end="\r", flush=True)
             layer = self._load_layer(layer_idx)
+            # Safety net: flush stray CUDA pool fragments every 32 layers.
+            # With pre-allocated staging this should be a no-op, but guards
+            # against any small allocations from attention/MLP intermediates.
+            if torch.cuda.is_available() and int(layer_idx) % 32 == 31:
+                torch.cuda.empty_cache()
             taylor_attn: Optional[GQATaylorSSDSelfAttention] = None
             residual = hidden
             hidden_norm = layer.input_layernorm(hidden)
 
-            if layer_idx in self.taylor_layer_set:
+            if layer_idx in self.taylor_layer_set and use_attention_cache:
                 taylor_attn = GQATaylorSSDSelfAttention.from_llama_attention(
                     source_attn=layer.self_attn,
                     layer_idx=layer_idx,
@@ -290,11 +485,14 @@ class StreamingLlamaRuntime:
                 )
                 self._taylor_caches[layer_idx] = present
             else:
+                # No-cache path: used by collect_dense_mlp_rows (use_attention_cache=False)
+                # to avoid accumulating ~4 MB Taylor-SSD state per layer × 126 layers
+                # which would exhaust the 200 MB pool headroom by layer ~48 and crash.
                 attn_out, _attn_weights = layer.self_attn(
                     hidden_states=hidden_norm,
                     position_embeddings=rope,
                     attention_mask=None,
-                    past_key_values=self._dense_cache,
+                    past_key_values=self._dense_cache if use_attention_cache else None,
                     cache_position=position_ids.view(-1),
                 )
 
@@ -310,8 +508,11 @@ class StreamingLlamaRuntime:
             hidden = residual + mlp_out
             self._release_modules(layer, *( [taylor_attn] if taylor_attn is not None else [] ))
 
+        if printed_progress:
+            print("", flush=True)
         hidden = self.norm(hidden)
-        logits = self.lm_head(hidden.to(dtype=self.lm_head.weight.dtype)).float()
+        # Move the 32 KB hidden vector to CPU for lm_head projection (weight stays on CPU).
+        logits = self.lm_head(hidden.cpu().to(dtype=self.lm_head.weight.dtype)).float()
         return logits, captures
 
     def generate(
@@ -378,10 +579,17 @@ class StreamingLlamaRuntime:
                 pending_layers = [idx for idx in selected_layers if int(layer_rows[int(idx)]) < int(max_rows)]
                 if not pending_layers:
                     break
+                rows_done = sum(1 for idx in selected_layers if int(layer_rows[int(idx)]) >= int(max_rows))
+                print(
+                    f"[collect] token {pos+1}/{valid_len} "
+                    f"({rows_done}/{len(selected_layers)} layers saturated, {len(pending_layers)} still collecting)",
+                    flush=True,
+                )
                 _logits, captures = self.forward_token(
                     input_ids[:, pos : pos + 1],
                     position_index=pos,
                     capture_layers=pending_layers,
+                    use_attention_cache=False,
                 )
                 for layer_idx in pending_layers:
                     capture = captures.get(int(layer_idx))
