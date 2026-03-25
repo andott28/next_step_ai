@@ -1,0 +1,78 @@
+{
+  "prompt": "Describe a sparse MLP routing system.",
+  "records": [
+    {
+      "step": 0,
+      "prefix": "Describe a sparse MLP routing system.",
+      "dense_next": " The",
+      "current_next": "richt",
+      "oracle_next": "omik",
+      "oracle_matches_dense": false,
+      "current_matches_dense": false,
+      "current_vs_oracle_mean_abs_logit_diff": 2.0955452919006348,
+      "dense_vs_oracle_mean_abs_logit_diff": 3.097750186920166,
+      "dense_vs_current_mean_abs_logit_diff": 2.7415647506713867
+    },
+    {
+      "step": 1,
+      "prefix": "Describe a sparse MLP routing system.omik",
+      "dense_next": "ron",
+      "current_next": "richt",
+      "oracle_next": "omik",
+      "oracle_matches_dense": false,
+      "current_matches_dense": false,
+      "current_vs_oracle_mean_abs_logit_diff": 2.106189489364624,
+      "dense_vs_oracle_mean_abs_logit_diff": 3.426002025604248,
+      "dense_vs_current_mean_abs_logit_diff": 2.977536678314209
+    },
+    {
+      "step": 2,
+      "prefix": "Describe a sparse MLP routing system.omikomik",
+      "dense_next": "\n",
+      "current_next": "gettext",
+      "oracle_next": "omik",
+      "oracle_matches_dense": false,
+      "current_matches_dense": false,
+      "current_vs_oracle_mean_abs_logit_diff": 2.087564706802368,
+      "dense_vs_oracle_mean_abs_logit_diff": 2.8822481632232666,
+      "dense_vs_current_mean_abs_logit_diff": 2.547856330871582
+    },
+    {
+      "step": 3,
+      "prefix": "Describe a sparse MLP routing system.omikomikomik",
+      "dense_next": "omik",
+      "current_next": "gettext",
+      "oracle_next": "omik",
+      "oracle_matches_dense": true,
+      "current_matches_dense": false,
+      "current_vs_oracle_mean_abs_logit_diff": 2.073275327682495,
+      "dense_vs_oracle_mean_abs_logit_diff": 2.6249840259552,
+      "dense_vs_current_mean_abs_logit_diff": 2.365022897720337
+    },
+    {
+      "step": 4,
+      "prefix": "Describe a sparse MLP routing system.omikomikomikomik",
+      "dense_next": "omik",
+      "current_next": "gettext",
+      "oracle_next": "omik",
+      "oracle_matches_dense": true,
+      "current_matches_dense": false,
+      "current_vs_oracle_mean_abs_logit_diff": 2.0621144771575928,
+      "dense_vs_oracle_mean_abs_logit_diff": 2.5673110485076904,
+      "dense_vs_current_mean_abs_logit_diff": 2.3239023685455322
+    },
+    {
+      "step": 5,
+      "prefix": "Describe a sparse MLP routing system.omikomikomikomikomik",
+      "dense_next": "omik",
+      "current_next": "gettext",
+      "oracle_next": "omik",
+      "oracle_matches_dense": true,
+      "current_matches_dense": false,
+      "current_vs_oracle_mean_abs_logit_diff": 2.056396245956421,
+      "dense_vs_oracle_mean_abs_logit_diff": 2.5652873516082764,
+      "dense_vs_current_mean_abs_logit_diff": 2.3258581161499023
+    }
+  ],
+  "oracle_text": "Describe a sparse MLP routing system.omikomikomikomikomikomik"
+}

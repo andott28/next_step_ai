@@ -1,0 +1,60 @@
+{
+  "run_name": "grouped_row_gemm_bench_20260310_213333",
+  "checkpoint_dir": "experiments\\llama_sca_objective_v1\\model_step_0001000",
+  "seed": 42,
+  "shape": {
+    "rows": 128,
+    "in_features": 4096,
+    "out_features": 14336,
+    "top_k": 3,
+    "block_size": 32
+  },
+  "dataset": {
+    "name": "wikitext",
+    "config": "wikitext-2-raw-v1",
+    "split": "validation",
+    "max_samples": 256,
+    "max_eval_batches": 32,
+    "warmup_batches": 4
+  },
+  "results": [
+    {
+      "mode": "baseline_cuda_spmm",
+      "tokens_per_second": 65.79255874939948,
+      "avg_step_ms": 933.12767142405,
+      "avg_lm_loss": 13.957187139070951,
+      "perplexity": 1152203.9437459998,
+      "peak_vram_gb": 5.89541482925415,
+      "timed_batches": 28,
+      "timed_tokens": 1719,
+      "timed_seconds": 26.1275747998734,
+      "evaluated_batches": 32,
+      "evaluated_tokens": 1989
+    },
+    {
+      "mode": "grouped_row_gemm_dense",
+      "tokens_per_second": 0.0,
+      "avg_step_ms": 0.0,
+      "avg_lm_loss": NaN,
+      "perplexity": NaN,
+      "peak_vram_gb": 0.0,
+      "timed_batches": 0,
+      "timed_tokens": 0,
+      "timed_seconds": 0.0,
+      "error": "grouped_row_gemm requires dense weights or grouped_row_allow_4bit_dequant=true"
+    },
+    {
+      "mode": "grouped_row_gemm_4bit_dequant",
+      "tokens_per_second": 145.3697047121139,
+      "avg_step_ms": 422.32222500855903,
+      "avg_lm_loss": 13.955448300230737,
+      "perplexity": 1150202.187646762,
+      "peak_vram_gb": 6.104891777038574,
+      "timed_batches": 28,
+      "timed_tokens": 1719,
+      "timed_seconds": 11.825022300239652,
+      "evaluated_batches": 32,
+      "evaluated_tokens": 1989
+    }
+  ]
+}

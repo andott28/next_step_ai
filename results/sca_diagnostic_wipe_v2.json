@@ -1,0 +1,122 @@
+{
+  "best_setting": {
+    "top_k": 3,
+    "basis_top_k": 12,
+    "score": 0.3252669315338135
+  },
+  "issues": [
+    "dense_sparse_logit_drift_high"
+  ],
+  "setting_results": [
+    {
+      "top_k": 3,
+      "basis_top_k": 12,
+      "score": 0.3252669315338135,
+      "quality": {
+        "distinct1_mean": 0.9583333333333334,
+        "max_run_mean": 1.0,
+        "rep_frac_mean": 0.0,
+        "char_repeat4_frac_mean": 0.0,
+        "degenerate_frac": 0.0
+      },
+      "drift": {
+        "mean_kl": 6.263346576690674,
+        "max_kl": 9.88232135772705,
+        "mean_sparse_entropy": 9.056069374084473,
+        "mean_top1_margin": 0.023937652818858624,
+        "token_mismatch_rate": 0.4
+      },
+      "diagnostics": {
+        "mean_dense_fallback_rate": 0.0,
+        "mean_touched_weight_fraction": 0.01318359375,
+        "mean_latent_support_overlap": 0.7191785756084654,
+        "mean_latent_support_unique_fraction": 0.9640522875816993
+      }
+    },
+    {
+      "top_k": 3,
+      "basis_top_k": 16,
+      "score": 1.7716339917182922,
+      "quality": {
+        "distinct1_mean": 0.8888888888888888,
+        "max_run_mean": 2.0,
+        "rep_frac_mean": 0.125,
+        "char_repeat4_frac_mean": 0.0,
+        "degenerate_frac": 0.3333333333333333
+      },
+      "drift": {
+        "mean_kl": 6.0816995859146115,
+        "max_kl": 9.332908630371094,
+        "mean_sparse_entropy": 9.04640703201294,
+        "mean_top1_margin": 0.020313657261431216,
+        "token_mismatch_rate": 0.4
+      },
+      "diagnostics": {
+        "mean_dense_fallback_rate": 0.0,
+        "mean_touched_weight_fraction": 0.01318359375,
+        "mean_latent_support_overlap": 0.7252499312162399,
+        "mean_latent_support_unique_fraction": 0.9901960784313726
+      }
+    },
+    {
+      "top_k": 4,
+      "basis_top_k": 12,
+      "score": 0.4661274276839362,
+      "quality": {
+        "distinct1_mean": 0.9523809523809524,
+        "max_run_mean": 1.3333333333333333,
+        "rep_frac_mean": 0.05555555555555555,
+        "char_repeat4_frac_mean": 0.0,
+        "degenerate_frac": 0.0
+      },
+      "drift": {
+        "mean_kl": 4.417482495307922,
+        "max_kl": 9.09919261932373,
+        "mean_sparse_entropy": 8.97601842880249,
+        "mean_top1_margin": 0.06204912401735783,
+        "token_mismatch_rate": 0.2
+      },
+      "diagnostics": {
+        "mean_dense_fallback_rate": 0.0,
+        "mean_touched_weight_fraction": 0.017578125,
+        "mean_latent_support_overlap": 0.6968474222554101,
+        "mean_latent_support_unique_fraction": 0.9901960784313726
+      }
+    },
+    {
+      "top_k": 4,
+      "basis_top_k": 16,
+      "score": 2.1401759836408827,
+      "quality": {
+        "distinct1_mean": 0.8205128205128206,
+        "max_run_mean": 3.3333333333333335,
+        "rep_frac_mean": 0.19444444444444445,
+        "char_repeat4_frac_mean": 0.0,
+        "degenerate_frac": 0.3333333333333333
+      },
+      "drift": {
+        "mean_kl": 4.231021404266357,
+        "max_kl": 9.093705177307129,
+        "mean_sparse_entropy": 8.868851280212402,
+        "mean_top1_margin": 0.0805695328861475,
+        "token_mismatch_rate": 0.2
+      },
+      "diagnostics": {
+        "mean_dense_fallback_rate": 0.0,
+        "mean_touched_weight_fraction": 0.017578125,
+        "mean_latent_support_overlap": 0.7125625014305115,
+        "mean_latent_support_unique_fraction": 1.0
+      }
+    }
+  ],
+  "recommended_runtime": {
+    "strict_fully_sparse": true,
+    "sca_sparse_placement": "learned_basis",
+    "sca_top_k": 3,
+    "sca_basis_top_k": 12,
+    "sca_adaptive_top_k": false,
+    "strict_decode_enable_repetition_penalty": false,
+    "disable_task_bias_injection": true,
+    "sca_fallback_threshold": 0.0
+  }
+}

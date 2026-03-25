@@ -1,0 +1,702 @@
+{
+  "results": [
+    {
+      "prompt": "Describe a sparse MLP routing system.",
+      "kl_last_token": -6.064237823011354e-08,
+      "dense_top_ids": [
+        578,
+        220,
+        3639,
+        2650,
+        320,
+        763,
+        362,
+        1102,
+        1115,
+        358
+      ],
+      "dense_top_probs": [
+        0.09564360231161118,
+        0.06522326916456223,
+        0.0562259703874588,
+        0.0434480644762516,
+        0.040498051792383194,
+        0.038342785090208054,
+        0.036873891949653625,
+        0.034102778881788254,
+        0.028272194787859917,
+        0.02307509444653988
+      ],
+      "sparse_top_ids": [
+        578,
+        220,
+        3639,
+        2650,
+        320,
+        763,
+        362,
+        1102,
+        1115,
+        358
+      ],
+      "sparse_top_probs": [
+        0.09564360231161118,
+        0.06522326916456223,
+        0.0562259703874588,
+        0.0434480644762516,
+        0.040498051792383194,
+        0.038342785090208054,
+        0.036873891949653625,
+        0.034102778881788254,
+        0.028272194787859917,
+        0.02307509444653988
+      ],
+      "layer_metrics": [
+        {
+          "layer_or_embed": -1,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 0,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 1,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 2,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 3,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 4,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 5,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 6,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 7,
+          "mse": 0.0,
+          "cosine": 1.000000238418579
+        },
+        {
+          "layer_or_embed": 8,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 9,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 10,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 11,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 12,
+          "mse": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        {
+          "layer_or_embed": 13,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 14,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 15,
+          "mse": 0.0,
+          "cosine": 1.000000238418579
+        },
+        {
+          "layer_or_embed": 16,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 17,
+          "mse": 0.0,
+          "cosine": 0.9999997615814209
+        },
+        {
+          "layer_or_embed": 18,
+          "mse": 0.0,
+          "cosine": 1.000000238418579
+        },
+        {
+          "layer_or_embed": 19,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 20,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 21,
+          "mse": 0.0,
+          "cosine": 0.9999997615814209
+        },
+        {
+          "layer_or_embed": 22,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 23,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 24,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 25,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 26,
+          "mse": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        {
+          "layer_or_embed": 27,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 28,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 29,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 30,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 31,
+          "mse": 0.0,
+          "cosine": 1.0
+        }
+      ],
+      "route_summary": [
+        {
+          "layer_idx": 0,
+          "captured": false
+        },
+        {
+          "layer_idx": 1,
+          "captured": false
+        },
+        {
+          "layer_idx": 2,
+          "captured": false
+        },
+        {
+          "layer_idx": 3,
+          "captured": false
+        },
+        {
+          "layer_idx": 4,
+          "captured": false
+        },
+        {
+          "layer_idx": 5,
+          "captured": false
+        },
+        {
+          "layer_idx": 6,
+          "captured": false
+        },
+        {
+          "layer_idx": 7,
+          "captured": false
+        },
+        {
+          "layer_idx": 8,
+          "captured": false
+        },
+        {
+          "layer_idx": 9,
+          "captured": false
+        },
+        {
+          "layer_idx": 10,
+          "captured": false
+        },
+        {
+          "layer_idx": 11,
+          "captured": false
+        },
+        {
+          "layer_idx": 12,
+          "captured": false
+        },
+        {
+          "layer_idx": 13,
+          "captured": false
+        },
+        {
+          "layer_idx": 14,
+          "captured": false
+        },
+        {
+          "layer_idx": 15,
+          "captured": false
+        },
+        {
+          "layer_idx": 16,
+          "captured": false
+        },
+        {
+          "layer_idx": 17,
+          "captured": false
+        },
+        {
+          "layer_idx": 18,
+          "captured": false
+        },
+        {
+          "layer_idx": 19,
+          "captured": false
+        },
+        {
+          "layer_idx": 20,
+          "captured": false
+        },
+        {
+          "layer_idx": 21,
+          "captured": false
+        },
+        {
+          "layer_idx": 22,
+          "captured": false
+        },
+        {
+          "layer_idx": 23,
+          "captured": false
+        },
+        {
+          "layer_idx": 24,
+          "captured": false
+        },
+        {
+          "layer_idx": 25,
+          "captured": false
+        },
+        {
+          "layer_idx": 26,
+          "captured": false
+        },
+        {
+          "layer_idx": 27,
+          "captured": false
+        },
+        {
+          "layer_idx": 28,
+          "captured": false
+        },
+        {
+          "layer_idx": 29,
+          "captured": false
+        },
+        {
+          "layer_idx": 30,
+          "captured": false
+        },
+        {
+          "layer_idx": 31,
+          "captured": false
+        }
+      ]
+    },
+    {
+      "prompt": "Write one sentence about Norway.",
+      "kl_last_token": -1.671082827670034e-08,
+      "dense_top_ids": [
+        9842,
+        32603,
+        320,
+        220,
+        358,
+        5560,
+        3639,
+        5112,
+        1472,
+        1102
+      ],
+      "dense_top_probs": [
+        0.09904352575540543,
+        0.05822468176484108,
+        0.05178610980510712,
+        0.04826996102929115,
+        0.04678485170006752,
+        0.03759268298745155,
+        0.034767549484968185,
+        0.03190449997782707,
+        0.030443482100963593,
+        0.025436481460928917
+      ],
+      "sparse_top_ids": [
+        9842,
+        32603,
+        320,
+        220,
+        358,
+        5560,
+        3639,
+        5112,
+        1472,
+        1102
+      ],
+      "sparse_top_probs": [
+        0.09904352575540543,
+        0.05822468176484108,
+        0.05178610980510712,
+        0.04826996102929115,
+        0.04678485170006752,
+        0.03759268298745155,
+        0.034767549484968185,
+        0.03190449997782707,
+        0.030443482100963593,
+        0.025436481460928917
+      ],
+      "layer_metrics": [
+        {
+          "layer_or_embed": -1,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 0,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 1,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 2,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 3,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 4,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 5,
+          "mse": 0.0,
+          "cosine": 1.000000238418579
+        },
+        {
+          "layer_or_embed": 6,
+          "mse": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        {
+          "layer_or_embed": 7,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 8,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 9,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 10,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 11,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 12,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 13,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 14,
+          "mse": 0.0,
+          "cosine": 0.9999997615814209
+        },
+        {
+          "layer_or_embed": 15,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 16,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 17,
+          "mse": 0.0,
+          "cosine": 0.9999997615814209
+        },
+        {
+          "layer_or_embed": 18,
+          "mse": 0.0,
+          "cosine": 1.0000001192092896
+        },
+        {
+          "layer_or_embed": 19,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 20,
+          "mse": 0.0,
+          "cosine": 1.000000238418579
+        },
+        {
+          "layer_or_embed": 21,
+          "mse": 0.0,
+          "cosine": 0.9999997615814209
+        },
+        {
+          "layer_or_embed": 22,
+          "mse": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        {
+          "layer_or_embed": 23,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 24,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 25,
+          "mse": 0.0,
+          "cosine": 0.9999997615814209
+        },
+        {
+          "layer_or_embed": 26,
+          "mse": 0.0,
+          "cosine": 0.9999999403953552
+        },
+        {
+          "layer_or_embed": 27,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 28,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 29,
+          "mse": 0.0,
+          "cosine": 0.9999998807907104
+        },
+        {
+          "layer_or_embed": 30,
+          "mse": 0.0,
+          "cosine": 1.0
+        },
+        {
+          "layer_or_embed": 31,
+          "mse": 0.0,
+          "cosine": 1.0
+        }
+      ],
+      "route_summary": [
+        {
+          "layer_idx": 0,
+          "captured": false
+        },
+        {
+          "layer_idx": 1,
+          "captured": false
+        },
+        {
+          "layer_idx": 2,
+          "captured": false
+        },
+        {
+          "layer_idx": 3,
+          "captured": false
+        },
+        {
+          "layer_idx": 4,
+          "captured": false
+        },
+        {
+          "layer_idx": 5,
+          "captured": false
+        },
+        {
+          "layer_idx": 6,
+          "captured": false
+        },
+        {
+          "layer_idx": 7,
+          "captured": false
+        },
+        {
+          "layer_idx": 8,
+          "captured": false
+        },
+        {
+          "layer_idx": 9,
+          "captured": false
+        },
+        {
+          "layer_idx": 10,
+          "captured": false
+        },
+        {
+          "layer_idx": 11,
+          "captured": false
+        },
+        {
+          "layer_idx": 12,
+          "captured": false
+        },
+        {
+          "layer_idx": 13,
+          "captured": false
+        },
+        {
+          "layer_idx": 14,
+          "captured": false
+        },
+        {
+          "layer_idx": 15,
+          "captured": false
+        },
+        {
+          "layer_idx": 16,
+          "captured": false
+        },
+        {
+          "layer_idx": 17,
+          "captured": false
+        },
+        {
+          "layer_idx": 18,
+          "captured": false
+        },
+        {
+          "layer_idx": 19,
+          "captured": false
+        },
+        {
+          "layer_idx": 20,
+          "captured": false
+        },
+        {
+          "layer_idx": 21,
+          "captured": false
+        },
+        {
+          "layer_idx": 22,
+          "captured": false
+        },
+        {
+          "layer_idx": 23,
+          "captured": false
+        },
+        {
+          "layer_idx": 24,
+          "captured": false
+        },
+        {
+          "layer_idx": 25,
+          "captured": false
+        },
+        {
+          "layer_idx": 26,
+          "captured": false
+        },
+        {
+          "layer_idx": 27,
+          "captured": false
+        },
+        {
+          "layer_idx": 28,
+          "captured": false
+        },
+        {
+          "layer_idx": 29,
+          "captured": false
+        },
+        {
+          "layer_idx": 30,
+          "captured": false
+        },
+        {
+          "layer_idx": 31,
+          "captured": false
+        }
+      ]
+    }
+  ]
+}

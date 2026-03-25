@@ -1,0 +1,25 @@
+{
+  "mode": "sparse_attention_strict",
+  "quality": {
+    "distinct1_mean": 0.45760233918128657,
+    "max_run_mean": 9.0,
+    "rep_frac_mean": 0.5457516339869282
+  },
+  "rows": [
+    {
+      "text": "Write one sentence about Norway. Carlson Carlson Carlson Carlson Carlson Carlson Carlson Carlson Carlson Carlson Carlson Carlson",
+      "distinct1": 0.3888888888888889,
+      "max_run": 12,
+      "rep_frac": 0.6470588235294118
+    },
+    {
+      "text": "Describe a sparse MLP routing system. Carlson Ferd isolated isolated isolated isolated Carlson Carlson Carlson Carlson Carlson Carlson",
+      "distinct1": 0.5263157894736842,
+      "max_run": 6,
+      "rep_frac": 0.4444444444444444
+    }
+  ],
+  "sparse_mlp_max_fallback_rate": 0.0,
+  "sparse_attention_mean_pages_step": 0.0,
+  "sparse_attention_mean_cpu2gpu_bytes_step": 0.0
+}

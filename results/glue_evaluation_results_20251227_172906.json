@@ -1,0 +1,856 @@
+{
+  "timestamp": "20251227_172906",
+  "num_runs": 3,
+  "random_seed": 42,
+  "models": {
+    "Pure-Llama-3.1-8B": {
+      "model_name": "Pure-Llama-3.1-8B",
+      "base_model": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+      "glue_results": {
+        "cola_run_0": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "matthews_correlation": 0.05101980274180159
+          },
+          "primary_score": 0.05101980274180159,
+          "num_samples": 1043,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "mrpc_run_0": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.42892156862745096,
+            "f1": 0.43031784841075793
+          },
+          "primary_score": 0.42892156862745096,
+          "num_samples": 408,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "qqp_run_0": {
+          "task": "qqp",
+          "metric": "accuracy",
+          "description": "Question similarity",
+          "results": {
+            "accuracy": 0.5053178332921098,
+            "f1": 0.37737376253035304
+          },
+          "primary_score": 0.5053178332921098,
+          "num_samples": 40430,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "sst2_run_0": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.5068807339449541
+          },
+          "primary_score": 0.5068807339449541,
+          "num_samples": 872,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "stsb_run_0": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.03788689151406288,
+            "spearmanr": 0.038891232488386974
+          },
+          "primary_score": 0.03788689151406288,
+          "num_samples": 1500,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "wnli_run_0": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.5492957746478874
+          },
+          "primary_score": 0.5492957746478874,
+          "num_samples": 71,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "rte_run_0": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.5415162454873647
+          },
+          "primary_score": 0.5415162454873647,
+          "num_samples": 277,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "qnli_run_0": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.4805052169137836
+          },
+          "primary_score": 0.4805052169137836,
+          "num_samples": 5463,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 0
+        },
+        "cola_run_1": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "matthews_correlation": 0.04450333505401146
+          },
+          "primary_score": 0.04450333505401146,
+          "num_samples": 1043,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "mrpc_run_1": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.41421568627450983,
+            "f1": 0.3979848866498741
+          },
+          "primary_score": 0.41421568627450983,
+          "num_samples": 408,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "qqp_run_1": {
+          "task": "qqp",
+          "metric": "accuracy",
+          "description": "Question similarity",
+          "results": {
+            "accuracy": 0.502696017808558,
+            "f1": 0.37659680019843733
+          },
+          "primary_score": 0.502696017808558,
+          "num_samples": 40430,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "sst2_run_1": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.5126146788990825
+          },
+          "primary_score": 0.5126146788990825,
+          "num_samples": 872,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "stsb_run_1": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.037665143609046936,
+            "spearmanr": 0.038555557894533944
+          },
+          "primary_score": 0.037665143609046936,
+          "num_samples": 1500,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "wnli_run_1": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.5492957746478874
+          },
+          "primary_score": 0.5492957746478874,
+          "num_samples": 71,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "rte_run_1": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.5703971119133574
+          },
+          "primary_score": 0.5703971119133574,
+          "num_samples": 277,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "qnli_run_1": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.48013911770089696
+          },
+          "primary_score": 0.48013911770089696,
+          "num_samples": 5463,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 1
+        },
+        "cola_run_2": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "matthews_correlation": 0.04641773967477395
+          },
+          "primary_score": 0.04641773967477395,
+          "num_samples": 1043,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "mrpc_run_2": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.4411764705882353,
+            "f1": 0.4411764705882353
+          },
+          "primary_score": 0.4411764705882353,
+          "num_samples": 408,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "qqp_run_2": {
+          "task": "qqp",
+          "metric": "accuracy",
+          "description": "Question similarity",
+          "results": {
+            "accuracy": 0.5058125154588177,
+            "f1": 0.3794645630163364
+          },
+          "primary_score": 0.5058125154588177,
+          "num_samples": 40430,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "sst2_run_2": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.5126146788990825
+          },
+          "primary_score": 0.5126146788990825,
+          "num_samples": 872,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "stsb_run_2": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.038310375064611435,
+            "spearmanr": 0.03980875027667128
+          },
+          "primary_score": 0.038310375064611435,
+          "num_samples": 1500,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "wnli_run_2": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.5211267605633803
+          },
+          "primary_score": 0.5211267605633803,
+          "num_samples": 71,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "rte_run_2": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.5126353790613718
+          },
+          "primary_score": 0.5126353790613718,
+          "num_samples": 277,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        },
+        "qnli_run_2": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.4697052901336262
+          },
+          "primary_score": 0.4697052901336262,
+          "num_samples": 5463,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "Pure-Llama-3.1-8B",
+          "run_id": 2
+        }
+      },
+      "overall_score": 0.385861255938361,
+      "successful_evaluations": 24,
+      "total_evaluations": 24,
+      "run_scores": [
+        0.3876680083961769,
+        0.3889408582384188,
+        0.3809749011804874
+      ],
+      "statistics": {
+        "mean": 0.38586125593836096,
+        "std": 0.004279297114605334,
+        "ci_95": 0.01063036334204375,
+        "min": 0.3809749011804874,
+        "max": 0.3889408582384188,
+        "median": 0.3876680083961769,
+        "n_runs": 3
+      }
+    },
+    "NeuroplasticLlama-3.1-8B": {
+      "model_name": "NeuroplasticLlama-3.1-8B",
+      "base_model": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+      "glue_results": {
+        "cola_run_0": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "matthews_correlation": 0.013658673148025186
+          },
+          "primary_score": 0.013658673148025186,
+          "num_samples": 1043,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "mrpc_run_0": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.4362745098039216,
+            "f1": 0.4306930693069307
+          },
+          "primary_score": 0.4362745098039216,
+          "num_samples": 408,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "qqp_run_0": {
+          "task": "qqp",
+          "metric": "accuracy",
+          "description": "Question similarity",
+          "results": {
+            "accuracy": 0.5605738313133811,
+            "f1": 0.3420487371305829
+          },
+          "primary_score": 0.5605738313133811,
+          "num_samples": 40430,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "sst2_run_0": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.5149082568807339
+          },
+          "primary_score": 0.5149082568807339,
+          "num_samples": 872,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "stsb_run_0": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": -0.019694402813911438,
+            "spearmanr": -0.02029323791010544
+          },
+          "primary_score": -0.019694402813911438,
+          "num_samples": 1500,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "wnli_run_0": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.6197183098591549
+          },
+          "primary_score": 0.6197183098591549,
+          "num_samples": 71,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "rte_run_0": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.5342960288808665
+          },
+          "primary_score": 0.5342960288808665,
+          "num_samples": 277,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "qnli_run_0": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5099762035511624
+          },
+          "primary_score": 0.5099762035511624,
+          "num_samples": 5463,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 0
+        },
+        "cola_run_1": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "matthews_correlation": 0.04829939313195289
+          },
+          "primary_score": 0.04829939313195289,
+          "num_samples": 1043,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "mrpc_run_1": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.38235294117647056,
+            "f1": 0.32978723404255317
+          },
+          "primary_score": 0.38235294117647056,
+          "num_samples": 408,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "qqp_run_1": {
+          "task": "qqp",
+          "metric": "accuracy",
+          "description": "Question similarity",
+          "results": {
+            "accuracy": 0.5633935196636162,
+            "f1": 0.35373800981181813
+          },
+          "primary_score": 0.5633935196636162,
+          "num_samples": 40430,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "sst2_run_1": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.47591743119266056
+          },
+          "primary_score": 0.47591743119266056,
+          "num_samples": 872,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "stsb_run_1": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": -0.013333702459931374,
+            "spearmanr": -0.012029128692495767
+          },
+          "primary_score": -0.013333702459931374,
+          "num_samples": 1500,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "wnli_run_1": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.38028169014084506
+          },
+          "primary_score": 0.38028169014084506,
+          "num_samples": 71,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "rte_run_1": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.5270758122743683
+          },
+          "primary_score": 0.5270758122743683,
+          "num_samples": 277,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "qnli_run_1": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5043016657514187
+          },
+          "primary_score": 0.5043016657514187,
+          "num_samples": 5463,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 1
+        },
+        "cola_run_2": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "matthews_correlation": 0.028339346896283785
+          },
+          "primary_score": 0.028339346896283785,
+          "num_samples": 1043,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "mrpc_run_2": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.38480392156862747,
+            "f1": 0.34464751958224543
+          },
+          "primary_score": 0.38480392156862747,
+          "num_samples": 408,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "qqp_run_2": {
+          "task": "qqp",
+          "metric": "accuracy",
+          "description": "Question similarity",
+          "results": {
+            "accuracy": 0.5610190452634183,
+            "f1": 0.3475
+          },
+          "primary_score": 0.5610190452634183,
+          "num_samples": 40430,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "sst2_run_2": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.48394495412844035
+          },
+          "primary_score": 0.48394495412844035,
+          "num_samples": 872,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "stsb_run_2": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": -0.0477391742169857,
+            "spearmanr": -0.03970152605376112
+          },
+          "primary_score": -0.0477391742169857,
+          "num_samples": 1500,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "wnli_run_2": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.5070422535211268
+          },
+          "primary_score": 0.5070422535211268,
+          "num_samples": 71,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "rte_run_2": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.49458483754512633
+          },
+          "primary_score": 0.49458483754512633,
+          "num_samples": 277,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        },
+        "qnli_run_2": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.4925864909390445
+          },
+          "primary_score": 0.4925864909390445,
+          "num_samples": 5463,
+          "num_errors": 0,
+          "processing_errors": [],
+          "model_name": "NeuroplasticLlama-3.1-8B",
+          "run_id": 2
+        }
+      },
+      "overall_score": 0.3726075765474923,
+      "successful_evaluations": 24,
+      "total_evaluations": 24,
+      "run_scores": [
+        0.39621392632791674,
+        0.3585360938589251,
+        0.36307270945563525
+      ],
+      "statistics": {
+        "mean": 0.3726075765474923,
+        "std": 0.020569152455433965,
+        "ci_95": 0.051096607312652205,
+        "min": 0.3585360938589251,
+        "max": 0.39621392632791674,
+        "median": 0.36307270945563525,
+        "n_runs": 3
+      }
+    }
+  },
+  "summary": {
+    "total_models": 2,
+    "successful_models": 2,
+    "failed_models": 0,
+    "best_model": "Pure-Llama-3.1-8B",
+    "best_score": 0.385861255938361,
+    "rankings": [
+      {
+        "rank": 1,
+        "model_name": "Pure-Llama-3.1-8B",
+        "score": 0.385861255938361,
+        "success_rate": 1.0,
+        "statistics": {
+          "mean": 0.38586125593836096,
+          "std": 0.004279297114605334,
+          "ci_95": 0.01063036334204375,
+          "min": 0.3809749011804874,
+          "max": 0.3889408582384188,
+          "median": 0.3876680083961769,
+          "n_runs": 3
+        }
+      },
+      {
+        "rank": 2,
+        "model_name": "NeuroplasticLlama-3.1-8B",
+        "score": 0.3726075765474923,
+        "success_rate": 1.0,
+        "statistics": {
+          "mean": 0.3726075765474923,
+          "std": 0.020569152455433965,
+          "ci_95": 0.051096607312652205,
+          "min": 0.3585360938589251,
+          "max": 0.39621392632791674,
+          "median": 0.36307270945563525,
+          "n_runs": 3
+        }
+      }
+    ],
+    "average_scores": {
+      "Pure-Llama-3.1-8B": 0.385861255938361,
+      "NeuroplasticLlama-3.1-8B": 0.3726075765474923
+    },
+    "success_rates": {
+      "Pure-Llama-3.1-8B": 1.0,
+      "NeuroplasticLlama-3.1-8B": 1.0
+    },
+    "statistical_summary": {
+      "Pure-Llama-3.1-8B": {
+        "mean": 0.38586125593836096,
+        "std": 0.004279297114605334,
+        "ci_95": 0.01063036334204375,
+        "min": 0.3809749011804874,
+        "max": 0.3889408582384188,
+        "median": 0.3876680083961769,
+        "n_runs": 3
+      },
+      "NeuroplasticLlama-3.1-8B": {
+        "mean": 0.3726075765474923,
+        "std": 0.020569152455433965,
+        "ci_95": 0.051096607312652205,
+        "min": 0.3585360938589251,
+        "max": 0.39621392632791674,
+        "median": 0.36307270945563525,
+        "n_runs": 3
+      }
+    },
+    "statistical_insights": {
+      "significant_differences": 0,
+      "total_comparisons": 0,
+      "best_improvement": 0
+    }
+  },
+  "statistical_analysis": {
+    "model_comparisons": {
+      "Pure-Llama-3.1-8B_vs_NeuroplasticLlama-3.1-8B": {
+        "model1": "Pure-Llama-3.1-8B",
+        "model2": "NeuroplasticLlama-3.1-8B",
+        "model1_stats": {
+          "mean": 0.38586125593836096,
+          "std": 0.004279297114605334,
+          "ci_95": 0.01063036334204375,
+          "min": 0.3809749011804874,
+          "max": 0.3889408582384188,
+          "median": 0.3876680083961769,
+          "n_runs": 3
+        },
+        "model2_stats": {
+          "mean": 0.3726075765474923,
+          "std": 0.020569152455433965,
+          "ci_95": 0.051096607312652205,
+          "min": 0.3585360938589251,
+          "max": 0.39621392632791674,
+          "median": 0.36307270945563525,
+          "n_runs": 3
+        }
+      }
+    },
+    "statistical_significance": {
+      "Pure-Llama-3.1-8B_vs_NeuroplasticLlama-3.1-8B": {
+        "t_statistic": 1.092646640663219,
+        "p_value": 0.3359431319790747,
+        "significant": false
+      }
+    },
+    "performance_gaps": {
+      "Pure-Llama-3.1-8B_vs_NeuroplasticLlama-3.1-8B": {
+        "model1_mean": 0.38586125593836096,
+        "model2_mean": 0.3726075765474923,
+        "improvement_percent": -3.4348303144967294,
+        "absolute_difference": -0.013253679390868633
+      }
+    }
+  }
+}

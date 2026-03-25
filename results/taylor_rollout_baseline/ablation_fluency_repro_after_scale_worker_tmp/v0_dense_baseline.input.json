@@ -1,0 +1,38 @@
+{
+  "variant": {
+    "name": "v0_dense_baseline",
+    "description": "Dense baseline (no Taylor, no sparse MLP)",
+    "model_kwargs": {
+      "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+      "attention_hybrid_enabled": false,
+      "attention_gqa_mamba_enabled": false,
+      "sca_block_size": 32,
+      "sca_top_k": 3,
+      "sca_sparse_placement": "input_mask",
+      "sca_routing_mode": "spatial_grid",
+      "sca_spmm_impl": "dense",
+      "sca_bottom_buffer_layers": 2,
+      "sca_decode_guard_layers": 12,
+      "attention_taylor_order": 2,
+      "attention_taylor_symmetric_quadratic": true,
+      "attention_taylor_eps": 1e-06,
+      "attention_taylor_force_disable_optimized_cache": true,
+      "neuroplasticity_enabled": false,
+      "attention_taylor_ssd_enabled": false
+    },
+    "sparse_layer_override": null,
+    "sparse_manifest": "",
+    "router_checkpoint": ""
+  },
+  "prompts": [
+    "Explain gravity briefly."
+  ],
+  "run_args": {
+    "max_new_tokens": 1,
+    "allow_cache": true,
+    "temperature": 1.0,
+    "top_k": 50,
+    "top_p": 1.0,
+    "sca_top_buffer_layers": 2
+  }
+}

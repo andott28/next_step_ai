@@ -1,0 +1,25 @@
+load model.layers.0.mlp.up_proj.weight
+EXCEPTION START
+Traceback (most recent call last):
+  File "<stdin>", line 69, in <module>
+  File "<stdin>", line 56, in load_public
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\torch\_ops.py", line 841, in __call__
+    return self._op(*args, **kwargs)
+           ~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\torch\_compile.py", line 53, in inner
+    return disable_fn(*args, **kwargs)
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\torch\_dynamo\eval_frame.py", line 1044, in _fn
+    return fn(*args, **kwargs)
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\torch\library.py", line 732, in func_no_dynamo
+    return func(*args, **kwargs)
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\bitsandbytes\backends\cuda\ops.py", line 375, in _
+    torch._check(out.shape == shape, lambda: f"Expected out.shape == {shape}, got {out.shape}")
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\torch\__init__.py", line 1695, in _check
+    _check_with(RuntimeError, cond, message)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\andre\Desktop\Overføre\next_step_ai\verification_env\Lib\site-packages\torch\__init__.py", line 1677, in _check_with
+    raise error_type(message_evaluated)
+RuntimeError: Expected out.shape == [53248, 16384], got torch.Size([53248, 16384])
+
+EXCEPTION END

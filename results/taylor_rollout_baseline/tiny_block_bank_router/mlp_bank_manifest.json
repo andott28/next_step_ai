@@ -1,0 +1,82 @@
+{
+  "model_name": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+  "sca_config": {
+    "hidden_size": 16,
+    "block_size": 8,
+    "block_rank": 4,
+    "basis_rank": 32,
+    "basis_top_k": 8,
+    "top_k": 2,
+    "adaptive_top_k": false,
+    "adaptive_top_k_min": 2,
+    "adaptive_top_k_max": 2,
+    "adaptive_top_k_min_score_ratio": 0.15,
+    "sigma": 1.0,
+    "refractory_steps": 100,
+    "inhibition_lambda": 0.0,
+    "inhibition_radius": 1.5,
+    "use_cuda": false,
+    "grid_size": 16,
+    "spmm_impl": "dense",
+    "sparse_placement": "input_mask",
+    "routing_mode": "spatial_grid",
+    "semantic_block_score_normalized": false,
+    "output_compensation_bias_enabled": false,
+    "basis_rank_by_layer": {},
+    "basis_top_k_by_layer": {},
+    "top_k_by_layer": {},
+    "soft_mask": true,
+    "grouped_row_gemm": false,
+    "grouped_row_min_bucket": 2,
+    "grouped_row_allow_4bit_dequant": false,
+    "stability_dense_fallback_threshold": 0.0
+  },
+  "export_dtype": "float16",
+  "layer_selection": null,
+  "layers": [
+    {
+      "layer_idx": 0,
+      "file": "layer_000_mlp_blocks.pt",
+      "num_blocks": 2,
+      "block_size": 8,
+      "intermediate_size": 64,
+      "gate_blocks_shape": [
+        2,
+        64,
+        8
+      ],
+      "up_blocks_shape": [
+        2,
+        64,
+        8
+      ],
+      "down_blocks_shape": [
+        2,
+        8,
+        64
+      ]
+    },
+    {
+      "layer_idx": 1,
+      "file": "layer_001_mlp_blocks.pt",
+      "num_blocks": 2,
+      "block_size": 8,
+      "intermediate_size": 64,
+      "gate_blocks_shape": [
+        2,
+        64,
+        8
+      ],
+      "up_blocks_shape": [
+        2,
+        64,
+        8
+      ],
+      "down_blocks_shape": [
+        2,
+        8,
+        64
+      ]
+    }
+  ]
+}

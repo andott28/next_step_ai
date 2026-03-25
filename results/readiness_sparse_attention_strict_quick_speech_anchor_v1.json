@@ -1,0 +1,27 @@
+{
+  "mode": "speech_anchor_sparse_attention_strict_quick",
+  "elapsed_s": 79.32492060000368,
+  "quality": {
+    "distinct1_mean": 1.0,
+    "max_run_mean": 1.0,
+    "rep_frac_mean": 0.0
+  },
+  "rows": [
+    {
+      "prompt": "Write one sentence about Norway.",
+      "text": "Write one sentence about Norway.angeangeangeangeangeangeangeangeangeangeangeange",
+      "distinct1": 1.0,
+      "max_run": 1.0,
+      "rep_frac": 0.0
+    },
+    {
+      "prompt": "Describe a sparse MLP routing system.",
+      "text": "Describe a sparse MLP routing system.emeemeemeemeemeemeemeemeemeemeemeeme",
+      "distinct1": 1.0,
+      "max_run": 1.0,
+      "rep_frac": 0.0
+    }
+  ],
+  "sparse_attention_mean_pages_step": 0.0,
+  "sparse_attention_mean_cpu2gpu_bytes_step": 0.0
+}

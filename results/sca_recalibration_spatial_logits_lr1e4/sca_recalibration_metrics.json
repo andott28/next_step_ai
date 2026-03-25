@@ -1,0 +1,71 @@
+{
+  "mode": "local_mlp_geometry_plus_logits",
+  "steps": 20,
+  "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+  "hybrid_checkpoint": "results/hybrid_8b_small_local/hybrid_attention_state.pt",
+  "layer_selection": [
+    14,
+    15,
+    16,
+    17
+  ],
+  "trainable_params": 12291,
+  "initial_loss": 63.174835205078125,
+  "final_loss": 5.485152244567871,
+  "min_loss": 5.485152244567871,
+  "per_layer_loss": {
+    "14": 0.005030487664043903,
+    "15": 0.005332359112799168,
+    "16": 0.0046934704296290874,
+    "17": 0.005972997285425663
+  },
+  "per_layer_norm": {
+    "14": 0.4108707904815674,
+    "15": 0.4354735314846039,
+    "16": 0.3832727372646332,
+    "17": 0.4877140522003174
+  },
+  "mean_touched_weight_fraction": 0.02197265625,
+  "estimated_bytes_fetched_per_token": 61931520.0,
+  "fallback_rate_by_layer": {
+    "14": 0.0,
+    "15": 0.0,
+    "16": 0.0,
+    "17": 0.0
+  },
+  "fallback_warning_layers_over_50pct": [],
+  "elapsed_seconds": 113.99132059999829,
+  "config": {
+    "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+    "hybrid_checkpoint": "results/hybrid_8b_small_local/hybrid_attention_state.pt",
+    "output_dir": "results/sca_recalibration_spatial_logits_lr1e4",
+    "layers": "14-17",
+    "max_samples": 24,
+    "max_seq_length": 64,
+    "batch_size": 1,
+    "steps": 20,
+    "lr": 0.0001,
+    "weight_decay": 0.0,
+    "grad_clip": 0.5,
+    "task_id": 0,
+    "include_task_embedding": false,
+    "include_spatial_proj": true,
+    "loss_mode": "mse_plus_norm",
+    "top_k": 3,
+    "block_size": 32,
+    "soft_mask": true,
+    "grouped_row_gemm": false,
+    "disable_fast_fallback": true,
+    "save_every": 0,
+    "verbose": false,
+    "recalibration_mode": "local_mlp_geometry_plus_logits",
+    "dataset_name": "wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "dataset_split": "train",
+    "text_column": "text",
+    "logits_kl_weight": 0.1,
+    "logits_warmup_steps": 0,
+    "seed": 42
+  },
+  "state_path": "results\\sca_recalibration_spatial_logits_lr1e4\\sca_recalibrated_state.pt"
+}

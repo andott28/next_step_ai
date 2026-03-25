@@ -1,0 +1,377 @@
+{
+  "summary": {
+    "primary_causes": [
+      "01_final_hidden_geometry_mismatch",
+      "07_logit_alignment_shape",
+      "13_token_family_attractor_diagnostics"
+    ],
+    "contributing_causes": [
+      "02_learned_basis_local_calibration_quality",
+      "03_latent_budget_correctness",
+      "04_block_routing_compatibility",
+      "05_layer_output_scale_dynamics",
+      "06_objective_horizon_mismatch",
+      "12_per_layer_blame_localization",
+      "14_basis_init_quality_by_layer"
+    ],
+    "unlikely_causes": [
+      "08_decode_policy_sensitivity",
+      "09_runtime_parity_gaps",
+      "10_attention_interaction_effect",
+      "11_quantization_sensitivity_proxy"
+    ],
+    "inconclusive": [
+      "15_support_concentration_vs_semantics"
+    ]
+  },
+  "checks": {
+    "01_final_hidden_geometry_mismatch": {
+      "status": "primary",
+      "metrics": {
+        "final_hidden_cosine_mean": 0.009479145053774118,
+        "final_hidden_mse_mean": 9.81599473953247
+      }
+    },
+    "02_learned_basis_local_calibration_quality": {
+      "status": "contributing",
+      "metrics": {
+        "local_loss": 0.3841802477836609,
+        "loss_mse": 0.018411139026284218,
+        "loss_norm": 36.5769157409668
+      }
+    },
+    "03_latent_budget_correctness": {
+      "status": "contributing",
+      "metrics": {
+        "setting_results": [
+          {
+            "top_k": 3,
+            "basis_top_k": 12,
+            "quality": {
+              "distinct1_mean": 0.9285714285714286,
+              "max_run_mean": 1.5,
+              "rep_frac_mean": 0.08333333333333333,
+              "degenerate_frac": 0.0
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.01318359375,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          },
+          {
+            "top_k": 3,
+            "basis_top_k": 16,
+            "quality": {
+              "distinct1_mean": 0.8333333333333333,
+              "max_run_mean": 2.5,
+              "rep_frac_mean": 0.1875,
+              "degenerate_frac": 0.5
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.01318359375,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          },
+          {
+            "top_k": 4,
+            "basis_top_k": 12,
+            "quality": {
+              "distinct1_mean": 1.0,
+              "max_run_mean": 1.0,
+              "rep_frac_mean": 0.0,
+              "degenerate_frac": 0.0
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.017578125,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          },
+          {
+            "top_k": 4,
+            "basis_top_k": 16,
+            "quality": {
+              "distinct1_mean": 0.7727272727272727,
+              "max_run_mean": 3.5,
+              "rep_frac_mean": 0.25,
+              "degenerate_frac": 0.5
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.017578125,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          }
+        ]
+      }
+    },
+    "04_block_routing_compatibility": {
+      "status": "contributing",
+      "metrics": {
+        "dense_energy_covered_by_routed_blocks_mean": 0.017756979214027524
+      }
+    },
+    "05_layer_output_scale_dynamics": {
+      "status": "contributing",
+      "metrics": {
+        "decode_scale_mean": 0.75,
+        "scale_quality": {
+          "0.4": {
+            "distinct1_mean": 0.46153846153846156,
+            "max_run_mean": 8.0,
+            "rep_frac_mean": 0.5833333333333334,
+            "degenerate_frac": 1.0
+          },
+          "0.55": {
+            "distinct1_mean": 0.46153846153846156,
+            "max_run_mean": 8.0,
+            "rep_frac_mean": 0.5833333333333334,
+            "degenerate_frac": 1.0
+          },
+          "0.75": {
+            "distinct1_mean": 0.6666666666666666,
+            "max_run_mean": 4.0,
+            "rep_frac_mean": 0.375,
+            "degenerate_frac": 1.0
+          }
+        }
+      }
+    },
+    "06_objective_horizon_mismatch": {
+      "status": "contributing",
+      "metrics": {
+        "short": {
+          "mean_kl": 8.780966758728027,
+          "max_kl": 9.46654224395752,
+          "mean_sparse_entropy": 8.993278980255127,
+          "mean_top1_margin": 0.0745261013507843,
+          "token_mismatch_rate": 1.0,
+          "top1_token_max_run": 2.0
+        },
+        "long": {
+          "mean_kl": 4.566896724700928,
+          "max_kl": 9.46654224395752,
+          "mean_sparse_entropy": 9.024725914001465,
+          "mean_top1_margin": 0.05757889300584793,
+          "token_mismatch_rate": 0.2,
+          "top1_token_max_run": 10.0
+        }
+      }
+    },
+    "07_logit_alignment_shape": {
+      "status": "primary",
+      "metrics": {
+        "dense_top1_rank_in_sparse_mean": 23805.5,
+        "dense_top1_rank_in_sparse": [
+          18638,
+          28973
+        ]
+      }
+    },
+    "08_decode_policy_sensitivity": {
+      "status": "unlikely",
+      "metrics": {
+        "greedy": {
+          "distinct1_mean": 0.8333333333333333,
+          "max_run_mean": 2.5,
+          "rep_frac_mean": 0.1875,
+          "degenerate_frac": 0.5
+        },
+        "sample": {
+          "distinct1_mean": 0.95,
+          "max_run_mean": 1.5,
+          "rep_frac_mean": 0.05555555555555555,
+          "degenerate_frac": 0.0
+        }
+      }
+    },
+    "09_runtime_parity_gaps": {
+      "status": "unlikely",
+      "metrics": {
+        "disable_task_bias_injection": true,
+        "strict_decode_enable_repetition_penalty": false,
+        "fallback_threshold": 0.0,
+        "sparse_placement": "learned_basis"
+      }
+    },
+    "10_attention_interaction_effect": {
+      "status": "unlikely",
+      "metrics": {
+        "attention_on": {
+          "distinct1_mean": 0.8333333333333333,
+          "max_run_mean": 2.5,
+          "rep_frac_mean": 0.1875,
+          "degenerate_frac": 0.5
+        },
+        "attention_off": {
+          "distinct1_mean": 0.8333333333333333,
+          "max_run_mean": 2.5,
+          "rep_frac_mean": 0.1875,
+          "degenerate_frac": 0.5
+        }
+      }
+    },
+    "11_quantization_sensitivity_proxy": {
+      "status": "unlikely",
+      "metrics": {
+        "sparse_path": {
+          "distinct1_mean": 0.8333333333333333,
+          "max_run_mean": 2.5,
+          "rep_frac_mean": 0.1875,
+          "degenerate_frac": 0.5
+        },
+        "dense_teacher_same_quantized_model": {
+          "distinct1_mean": 0.5297619047619048,
+          "max_run_mean": 1.0,
+          "rep_frac_mean": 0.0,
+          "degenerate_frac": 0.0
+        }
+      }
+    },
+    "12_per_layer_blame_localization": {
+      "status": "contributing",
+      "metrics": {
+        "decode_guard_sweep": {
+          "0": {
+            "distinct1_mean": 1.0,
+            "max_run_mean": 1.0,
+            "rep_frac_mean": 0.0,
+            "degenerate_frac": 0.0
+          },
+          "6": {
+            "distinct1_mean": 1.0,
+            "max_run_mean": 1.0,
+            "rep_frac_mean": 0.0,
+            "degenerate_frac": 0.0
+          },
+          "12": {
+            "distinct1_mean": 1.0,
+            "max_run_mean": 1.0,
+            "rep_frac_mean": 0.0,
+            "degenerate_frac": 0.0
+          },
+          "18": {
+            "distinct1_mean": 1.0,
+            "max_run_mean": 1.0,
+            "rep_frac_mean": 0.0,
+            "degenerate_frac": 0.0
+          }
+        }
+      }
+    },
+    "13_token_family_attractor_diagnostics": {
+      "status": "primary",
+      "metrics": {
+        "mean_kl": 4.566896724700928,
+        "max_kl": 9.46654224395752,
+        "mean_sparse_entropy": 9.024725914001465,
+        "mean_top1_margin": 0.05757889300584793,
+        "token_mismatch_rate": 0.2,
+        "top1_token_max_run": 10.0
+      }
+    },
+    "14_basis_init_quality_by_layer": {
+      "status": "contributing",
+      "metrics": {
+        "explained_variance_min": 0.2628503143787384,
+        "explained_variance_mean": 0.3619825757212109,
+        "layers_below_0_35": [
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17"
+        ]
+      }
+    },
+    "15_support_concentration_vs_semantics": {
+      "status": "inconclusive",
+      "metrics": {
+        "corr_support_overlap_vs_rep_frac": 0.0,
+        "setting_results": [
+          {
+            "top_k": 3,
+            "basis_top_k": 12,
+            "quality": {
+              "distinct1_mean": 0.9285714285714286,
+              "max_run_mean": 1.5,
+              "rep_frac_mean": 0.08333333333333333,
+              "degenerate_frac": 0.0
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.01318359375,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          },
+          {
+            "top_k": 3,
+            "basis_top_k": 16,
+            "quality": {
+              "distinct1_mean": 0.8333333333333333,
+              "max_run_mean": 2.5,
+              "rep_frac_mean": 0.1875,
+              "degenerate_frac": 0.5
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.01318359375,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          },
+          {
+            "top_k": 4,
+            "basis_top_k": 12,
+            "quality": {
+              "distinct1_mean": 1.0,
+              "max_run_mean": 1.0,
+              "rep_frac_mean": 0.0,
+              "degenerate_frac": 0.0
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.017578125,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          },
+          {
+            "top_k": 4,
+            "basis_top_k": 16,
+            "quality": {
+              "distinct1_mean": 0.7727272727272727,
+              "max_run_mean": 3.5,
+              "rep_frac_mean": 0.25,
+              "degenerate_frac": 0.5
+            },
+            "diagnostics": {
+              "mean_dense_fallback_rate": 0.0,
+              "mean_touched_weight_fraction": 0.017578125,
+              "mean_latent_support_overlap": 1.0,
+              "mean_latent_support_unique_fraction": 0.0
+            }
+          }
+        ]
+      }
+    }
+  }
+}

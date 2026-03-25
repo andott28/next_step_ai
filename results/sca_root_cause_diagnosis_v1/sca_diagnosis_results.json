@@ -1,0 +1,451 @@
+{
+  "dense_baseline_np_off": {
+    "condition": "dense_baseline_np_off",
+    "spmm_impl": "dense",
+    "layer_indices": null,
+    "neuroplasticity_enabled": false,
+    "elapsed_s": 16.459565099998144,
+    "quality": {
+      "distinct1_mean": 0.5698529411764706,
+      "max_run_mean": 1.0,
+      "rep_frac_mean": 0.0
+    },
+    "rows": [
+      {
+        "prompt": "Write one sentence about Norway.",
+        "text": "Write one sentence about Norway. Write one sentence about Norway.\nWrite one sentence about",
+        "distinct1": 0.375,
+        "max_run": 1.0,
+        "rep_frac": 0.0
+      },
+      {
+        "prompt": "Describe a sparse MLP routing system.",
+        "text": "Describe a sparse MLP routing system. The system has a single input and a single output",
+        "distinct1": 0.7647058823529411,
+        "max_run": 1.0,
+        "rep_frac": 0.0
+      }
+    ],
+    "max_fallback_triggered": 0.0,
+    "mean_touched_weight_fraction": 0.0
+  },
+  "sca_dense_all_layers": {
+    "condition": "sca_dense_all_layers",
+    "spmm_impl": "dense",
+    "layer_indices": null,
+    "neuroplasticity_enabled": true,
+    "elapsed_s": 15.505012399997213,
+    "quality": {
+      "distinct1_mean": 0.7857142857142857,
+      "max_run_mean": 4.0,
+      "rep_frac_mean": 0.23076923076923078
+    },
+    "rows": [
+      {
+        "prompt": "Write one sentence about Norway.",
+        "text": "Write one sentence about Norway.\u062b\u0627\u0644 metabol metabol metabol metabol metabol metabol metabol",
+        "distinct1": 0.5714285714285714,
+        "max_run": 7.0,
+        "rep_frac": 0.46153846153846156
+      },
+      {
+        "prompt": "Describe a sparse MLP routing system.",
+        "text": "Describe a sparse MLP routing system.\u062b\u0627\u0644\u062b\u0627\u0644oppeloppeloppeloppeloppeloppel",
+        "distinct1": 1.0,
+        "max_run": 1.0,
+        "rep_frac": 0.0
+      }
+    ],
+    "max_fallback_triggered": 0.0,
+    "mean_touched_weight_fraction": 0.021972657996229827
+  },
+  "sca_cuda_all_layers": {
+    "condition": "sca_cuda_all_layers",
+    "spmm_impl": "cuda_spmm",
+    "layer_indices": null,
+    "neuroplasticity_enabled": true,
+    "elapsed_s": 16.66236200000276,
+    "quality": {
+      "distinct1_mean": 0.75,
+      "max_run_mean": 4.5,
+      "rep_frac_mean": 0.2692307692307692
+    },
+    "rows": [
+      {
+        "prompt": "Write one sentence about Norway.",
+        "text": "Write one sentence about Norway. metabol metabol metabol metabol metabol metabol metabol metabol",
+        "distinct1": 0.5,
+        "max_run": 8.0,
+        "rep_frac": 0.5384615384615384
+      },
+      {
+        "prompt": "Describe a sparse MLP routing system.",
+        "text": "Describe a sparse MLP routing system.\u062b\u0627\u0644\u062b\u0627\u0644oppeloppeloppeloppeloppeloppel",
+        "distinct1": 1.0,
+        "max_run": 1.0,
+        "rep_frac": 0.0
+      }
+    ],
+    "max_fallback_triggered": 0.0,
+    "mean_touched_weight_fraction": 0.021972657996229827
+  },
+  "sca_cuda_mid_8_23": {
+    "condition": "sca_cuda_mid_8_23",
+    "spmm_impl": "cuda_spmm",
+    "layer_indices": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "neuroplasticity_enabled": true,
+    "elapsed_s": 14.716557399995509,
+    "quality": {
+      "distinct1_mean": 0.6857142857142857,
+      "max_run_mean": 5.0,
+      "rep_frac_mean": 0.3418803418803419
+    },
+    "rows": [
+      {
+        "prompt": "Write one sentence about Norway.",
+        "text": "Write one sentence about Norway.\u200b\u200b\u200b\u200b\u200b\u200b\u200bbjerg",
+        "distinct1": 0.5714285714285714,
+        "max_run": 7.0,
+        "rep_frac": 0.46153846153846156
+      },
+      {
+        "prompt": "Describe a sparse MLP routing system.",
+        "text": "Describe a sparse MLP routing system.   \ufffd \ufffd   \ufffd ",
+        "distinct1": 0.8,
+        "max_run": 3.0,
+        "rep_frac": 0.2222222222222222
+      }
+    ],
+    "max_fallback_triggered": 0.0,
+    "mean_touched_weight_fraction": 0.011718750931322575
+  },
+  "sca_cuda_late_24_29": {
+    "condition": "sca_cuda_late_24_29",
+    "spmm_impl": "cuda_spmm",
+    "layer_indices": [
+      24,
+      25,
+      26,
+      27,
+      28,
+      29
+    ],
+    "neuroplasticity_enabled": true,
+    "elapsed_s": 12.639978199993493,
+    "quality": {
+      "distinct1_mean": 0.7692307692307693,
+      "max_run_mean": 2.5,
+      "rep_frac_mean": 0.16666666666666666
+    },
+    "rows": [
+      {
+        "prompt": "Write one sentence about Norway.",
+        "text": "Write one sentence about Norway. Norway is a countryandin the continent of",
+        "distinct1": 0.9230769230769231,
+        "max_run": 1.0,
+        "rep_frac": 0.0
+      },
+      {
+        "prompt": "Describe a sparse MLP routing system.",
+        "text": "Describe a sparse MLP routing system. routing routing routing routing Sharar Sharar",
+        "distinct1": 0.6153846153846154,
+        "max_run": 4.0,
+        "rep_frac": 0.3333333333333333
+      }
+    ],
+    "max_fallback_triggered": 0.0,
+    "mean_touched_weight_fraction": 0.0043945315992459655
+  },
+  "drift_probe": {
+    "prompt": "Write one sentence about Norway.",
+    "steps": [
+      {
+        "step": 0,
+        "mean_layer_cosine": 0.05617076220611731,
+        "final_layer_cosine": 0.03250030055642128,
+        "logits_kl_dense_to_sparse": 8.601842880249023,
+        "route_overlap": {
+          "14": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "15": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "16": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "17": {
+            "active_blocks": [
+              103,
+              111,
+              95
+            ],
+            "jaccard_prev": 1.0
+          }
+        },
+        "next_token_id": 28168
+      },
+      {
+        "step": 1,
+        "mean_layer_cosine": 0.044842931837069264,
+        "final_layer_cosine": -0.01456634234637022,
+        "logits_kl_dense_to_sparse": 7.870506763458252,
+        "route_overlap": {
+          "14": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "15": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "16": {
+            "active_blocks": [
+              111,
+              103,
+              119
+            ],
+            "jaccard_prev": 1.0
+          },
+          "17": {
+            "active_blocks": [
+              103,
+              95,
+              111
+            ],
+            "jaccard_prev": 1.0
+          }
+        },
+        "next_token_id": 28168
+      },
+      {
+        "step": 2,
+        "mean_layer_cosine": 0.04660465969054988,
+        "final_layer_cosine": -0.007348224520683289,
+        "logits_kl_dense_to_sparse": 5.279090881347656,
+        "route_overlap": {
+          "14": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "15": {
+            "active_blocks": [
+              111,
+              119,
+              103
+            ],
+            "jaccard_prev": 1.0
+          },
+          "16": {
+            "active_blocks": [
+              111,
+              103,
+              119
+            ],
+            "jaccard_prev": 1.0
+          },
+          "17": {
+            "active_blocks": [
+              103,
+              95,
+              111
+            ],
+            "jaccard_prev": 1.0
+          }
+        },
+        "next_token_id": 28168
+      },
+      {
+        "step": 3,
+        "mean_layer_cosine": 0.0678794402346918,
+        "final_layer_cosine": 0.0306249987334013,
+        "logits_kl_dense_to_sparse": 5.859752655029297,
+        "route_overlap": {
+          "14": {
+            "active_blocks": [
+              111,
+              103,
+              110
+            ],
+            "jaccard_prev": 0.5
+          },
+          "15": {
+            "active_blocks": [
+              111,
+              103,
+              119
+            ],
+            "jaccard_prev": 1.0
+          },
+          "16": {
+            "active_blocks": [
+              103,
+              111,
+              95
+            ],
+            "jaccard_prev": 0.5
+          },
+          "17": {
+            "active_blocks": [
+              95,
+              103,
+              87
+            ],
+            "jaccard_prev": 0.5
+          }
+        },
+        "next_token_id": 28168
+      },
+      {
+        "step": 4,
+        "mean_layer_cosine": 0.06796433796372378,
+        "final_layer_cosine": 0.03587872534990311,
+        "logits_kl_dense_to_sparse": 6.341164588928223,
+        "route_overlap": {
+          "14": {
+            "active_blocks": [
+              103,
+              111,
+              102
+            ],
+            "jaccard_prev": 0.5
+          },
+          "15": {
+            "active_blocks": [
+              111,
+              103,
+              119
+            ],
+            "jaccard_prev": 1.0
+          },
+          "16": {
+            "active_blocks": [
+              103,
+              111,
+              95
+            ],
+            "jaccard_prev": 1.0
+          },
+          "17": {
+            "active_blocks": [
+              95,
+              87,
+              103
+            ],
+            "jaccard_prev": 1.0
+          }
+        },
+        "next_token_id": 28168
+      },
+      {
+        "step": 5,
+        "mean_layer_cosine": 0.06622931558751699,
+        "final_layer_cosine": 0.0379190556704998,
+        "logits_kl_dense_to_sparse": 6.675127029418945,
+        "route_overlap": {
+          "14": {
+            "active_blocks": [
+              103,
+              111,
+              102
+            ],
+            "jaccard_prev": 1.0
+          },
+          "15": {
+            "active_blocks": [
+              103,
+              111,
+              95
+            ],
+            "jaccard_prev": 0.5
+          },
+          "16": {
+            "active_blocks": [
+              103,
+              95,
+              111
+            ],
+            "jaccard_prev": 1.0
+          },
+          "17": {
+            "active_blocks": [
+              95,
+              87,
+              103
+            ],
+            "jaccard_prev": 1.0
+          }
+        },
+        "next_token_id": 28168
+      }
+    ],
+    "mean_cosine_trend": [
+      0.05617076220611731,
+      0.044842931837069264,
+      0.04660465969054988,
+      0.0678794402346918,
+      0.06796433796372378,
+      0.06622931558751699
+    ],
+    "final_cosine_trend": [
+      0.03250030055642128,
+      -0.01456634234637022,
+      -0.007348224520683289,
+      0.0306249987334013,
+      0.03587872534990311,
+      0.0379190556704998
+    ],
+    "kl_trend": [
+      8.601842880249023,
+      7.870506763458252,
+      5.279090881347656,
+      5.859752655029297,
+      6.341164588928223,
+      6.675127029418945
+    ]
+  }
+}

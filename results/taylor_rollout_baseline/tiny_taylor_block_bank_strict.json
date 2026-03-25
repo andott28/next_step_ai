@@ -1,0 +1,138 @@
+{
+  "model_name": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+  "taylor_layers": [
+    0
+  ],
+  "runtime_flags": {
+    "kv_optimized_generation": false,
+    "bounded_context_enabled": false,
+    "sparse_attention_enabled": false,
+    "strict_sparse_decode": false,
+    "hybrid_forces_no_cache": false,
+    "gqa_mamba_disables_cache": false,
+    "taylor_attention_enabled": true
+  },
+  "rows": [
+    {
+      "prompt_idx": 0,
+      "latency_s": 0.30850430007558316,
+      "tok_s": 19.44867542698759,
+      "text": "Write one sentence about Oslo. r\u00e9s eingberryhrte thrust \u00b7"
+    },
+    {
+      "prompt_idx": 1,
+      "latency_s": 0.10023519990500063,
+      "tok_s": 59.859211192141956,
+      "text": "Explain recurrent attention in one line. r\u00e9s eingberryhrte thrust \u00b7"
+    },
+    {
+      "prompt_idx": 2,
+      "latency_s": 0.08360780007205904,
+      "tok_s": 71.76363921582414,
+      "text": "List two fruits. r\u00e9s eingberryhrte thrust Wissenschaft"
+    }
+  ],
+  "strict_metrics": {
+    "rows": [
+      {
+        "text": "Write one sentence about Oslo. r\u00e9s eingberryhrte",
+        "quality": {
+          "distinct1": 1.0,
+          "max_run": 1.0,
+          "rep_frac": 0.0,
+          "char_repeat4_frac": 0.0,
+          "degenerate": 0.0
+        },
+        "rollout_kl": 0.0009511878597550094,
+        "final_hidden_cosine": 0.7651326060295105
+      },
+      {
+        "text": "Explain recurrent attention in one line. r\u00e9s eingberryhrte",
+        "quality": {
+          "distinct1": 1.0,
+          "max_run": 1.0,
+          "rep_frac": 0.0,
+          "char_repeat4_frac": 0.0,
+          "degenerate": 0.0
+        },
+        "rollout_kl": 0.0008359661442227662,
+        "final_hidden_cosine": 0.7473024129867554
+      },
+      {
+        "text": "List two fruits. r\u00e9s eingberryhrte",
+        "quality": {
+          "distinct1": 1.0,
+          "max_run": 1.0,
+          "rep_frac": 0.0,
+          "char_repeat4_frac": 0.0,
+          "degenerate": 0.0
+        },
+        "rollout_kl": 0.0009404419106431305,
+        "final_hidden_cosine": 0.7616295218467712
+      }
+    ],
+    "quality": {
+      "distinct1_mean": 1.0,
+      "max_run_mean": 1.0,
+      "rep_frac_mean": 0.0,
+      "char_repeat4_frac_mean": 0.0,
+      "degenerate_frac": 0.0
+    },
+    "dense_top1_rank_median": 4.0,
+    "dense_top1_rank_p95": 137.19992065429688,
+    "dense_top1_rank_mean": 25.060606002807617,
+    "rollout_kl_mean": 0.0009091986382069687,
+    "final_hidden_cosine_mean": 0.7580215136210123,
+    "balance": {
+      "max_latent_importance_fraction": 0.0,
+      "max_latent_load_fraction": 0.0,
+      "max_block_importance_fraction": 0.0,
+      "max_block_load_fraction": 0.0,
+      "latent_importance_by_layer": {},
+      "latent_load_by_layer": {},
+      "block_importance_by_layer": {},
+      "block_load_by_layer": {}
+    }
+  },
+  "sparse_mlp_diagnostics": {
+    "layers": [
+      {
+        "layer_idx": 0,
+        "rows": 10,
+        "mean_active_blocks": 0.0,
+        "unique_active_blocks": 0,
+        "touched_weight_fraction": 0.0,
+        "estimated_bytes_fetched_per_token": 0.0,
+        "total_steps": 36.0,
+        "triggered_steps": 0.0,
+        "dense_fallback_rate": 0.0,
+        "last_fallback_triggered": 0.0
+      },
+      {
+        "layer_idx": 1,
+        "rows": 10,
+        "mean_active_blocks": 0.0,
+        "unique_active_blocks": 0,
+        "touched_weight_fraction": 0.0,
+        "estimated_bytes_fetched_per_token": 0.0,
+        "total_steps": 36.0,
+        "triggered_steps": 0.0,
+        "dense_fallback_rate": 0.0,
+        "last_fallback_triggered": 0.0
+      }
+    ],
+    "mean_touched_weight_fraction": 0.0,
+    "estimated_bytes_fetched_per_token": 0.0,
+    "mean_dense_fallback_rate": 0.0,
+    "mean_latent_norm": 0.0,
+    "mean_active_latent_fraction": 0.0,
+    "mean_active_latent_coords_used": 0.0,
+    "mean_latent_usage_entropy": 0.0,
+    "mean_latent_support_overlap": 0.0,
+    "mean_latent_support_unique_fraction": 0.0,
+    "mean_max_latent_importance_fraction": 0.0,
+    "mean_max_latent_load_fraction": 0.0,
+    "mean_max_block_importance_fraction": 0.0,
+    "mean_max_block_load_fraction": 0.0
+  }
+}

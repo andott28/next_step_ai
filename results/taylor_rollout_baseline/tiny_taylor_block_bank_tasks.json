@@ -1,0 +1,89 @@
+{
+  "model_name": "hf-internal-testing/tiny-random-LlamaForCausalLM",
+  "taylor_layers": [
+    0
+  ],
+  "runtime_flags": {
+    "kv_optimized_generation": false,
+    "bounded_context_enabled": false,
+    "sparse_attention_enabled": false,
+    "strict_sparse_decode": false,
+    "hybrid_forces_no_cache": false,
+    "gqa_mamba_disables_cache": false,
+    "taylor_attention_enabled": true
+  },
+  "rows": [
+    {
+      "prompt_idx": 0,
+      "latency_s": 0.30691020004451275,
+      "tok_s": 19.54969238275492,
+      "text": "What is 2+2?WS choices r\u00e9s bootstrap Universit\u00e4t\u044a\u043d"
+    },
+    {
+      "prompt_idx": 1,
+      "latency_s": 0.09561429999303073,
+      "tok_s": 62.75211971888449,
+      "text": "Translate 'hello' to Spanish.yed wordtirahrte turnoresp"
+    },
+    {
+      "prompt_idx": 2,
+      "latency_s": 0.07960980001371354,
+      "tok_s": 75.36760548282301,
+      "text": "Name one color.yed wordtirahrte turnoresp"
+    },
+    {
+      "prompt_idx": 3,
+      "latency_s": 0.08716360002290457,
+      "tok_s": 68.83607375582628,
+      "text": "Write a short greeting.yed wordtirahrte turnoresp"
+    },
+    {
+      "prompt_idx": 4,
+      "latency_s": 0.08807939989492297,
+      "tok_s": 68.12035512455675,
+      "text": "Give one city in Norway.yed TCP jap\u7edf}_\\ thrust"
+    }
+  ],
+  "strict_metrics": {},
+  "sparse_mlp_diagnostics": {
+    "layers": [
+      {
+        "layer_idx": 0,
+        "rows": 12,
+        "mean_active_blocks": 0.0,
+        "unique_active_blocks": 0,
+        "touched_weight_fraction": 0.0,
+        "estimated_bytes_fetched_per_token": 0.0,
+        "total_steps": 30.0,
+        "triggered_steps": 0.0,
+        "dense_fallback_rate": 0.0,
+        "last_fallback_triggered": 0.0
+      },
+      {
+        "layer_idx": 1,
+        "rows": 12,
+        "mean_active_blocks": 0.0,
+        "unique_active_blocks": 0,
+        "touched_weight_fraction": 0.0,
+        "estimated_bytes_fetched_per_token": 0.0,
+        "total_steps": 30.0,
+        "triggered_steps": 0.0,
+        "dense_fallback_rate": 0.0,
+        "last_fallback_triggered": 0.0
+      }
+    ],
+    "mean_touched_weight_fraction": 0.0,
+    "estimated_bytes_fetched_per_token": 0.0,
+    "mean_dense_fallback_rate": 0.0,
+    "mean_latent_norm": 0.0,
+    "mean_active_latent_fraction": 0.0,
+    "mean_active_latent_coords_used": 0.0,
+    "mean_latent_usage_entropy": 0.0,
+    "mean_latent_support_overlap": 0.0,
+    "mean_latent_support_unique_fraction": 0.0,
+    "mean_max_latent_importance_fraction": 0.0,
+    "mean_max_latent_load_fraction": 0.0,
+    "mean_max_block_importance_fraction": 0.0,
+    "mean_max_block_load_fraction": 0.0
+  }
+}

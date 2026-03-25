@@ -1,0 +1,92 @@
+{
+  "mode": "local_mlp_geometry_plus_logits",
+  "steps": 1,
+  "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+  "hybrid_checkpoint": "results/hybrid_8b_small_local/hybrid_attention_state.pt",
+  "layer_selection": [
+    14,
+    15,
+    16,
+    17
+  ],
+  "trainable_params": 12291,
+  "initial_loss": 5.580371856689453,
+  "final_loss": 5.580371856689453,
+  "min_loss": 5.580371856689453,
+  "per_layer_loss": {
+    "14": 0.005084681324660778,
+    "15": 0.00537604745477438,
+    "16": 0.0046934406273067,
+    "17": 0.006017547566443682
+  },
+  "per_layer_norm": {
+    "14": 0.4153085947036743,
+    "15": 0.439152330160141,
+    "16": 0.38326188921928406,
+    "17": 0.4913676083087921
+  },
+  "mean_touched_weight_fraction": 0.02197265625,
+  "estimated_bytes_fetched_per_token": 61931520.0,
+  "runtime_sca_use_cuda": true,
+  "runtime_sca_spmm_impl": "cuda_spmm",
+  "fallback_rate_by_layer": {
+    "14": 0.0,
+    "15": 0.0,
+    "16": 0.0,
+    "17": 0.0
+  },
+  "fallback_warning_layers_over_50pct": [],
+  "elapsed_seconds": 162.53530780000074,
+  "config": {
+    "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+    "hybrid_checkpoint": "results/hybrid_8b_small_local/hybrid_attention_state.pt",
+    "output_dir": "results/sca_recalibration_full_sparse_gate_vs2022",
+    "layers": "14-17",
+    "max_samples": 8,
+    "max_seq_length": 64,
+    "batch_size": 1,
+    "steps": 1,
+    "lr": 1e-05,
+    "weight_decay": 0.0,
+    "grad_clip": 0.5,
+    "task_id": 0,
+    "include_task_embedding": false,
+    "include_spatial_proj": true,
+    "loss_mode": "mse_plus_norm",
+    "top_k": 3,
+    "block_size": 32,
+    "soft_mask": true,
+    "grouped_row_gemm": false,
+    "disable_fast_fallback": true,
+    "save_every": 0,
+    "verbose": false,
+    "recalibration_mode": "local_mlp_geometry_plus_logits",
+    "dataset_name": "wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "dataset_split": "train",
+    "text_column": "text",
+    "logits_kl_weight": 0.1,
+    "logits_warmup_steps": 0,
+    "seed": 42
+  },
+  "quality_baseline": {
+    "distinct1_mean": 0.8941176470588236,
+    "max_run_mean": 2.8,
+    "rep_frac_mean": 0.1125,
+    "punct_frac_mean": 0.13676470588235295
+  },
+  "quality_candidate": {
+    "distinct1_mean": 0.8941176470588236,
+    "max_run_mean": 2.8,
+    "rep_frac_mean": 0.1125,
+    "punct_frac_mean": 0.13676470588235295
+  },
+  "quality_delta": {
+    "distinct1_delta": 0.0,
+    "max_run_delta": 0.0,
+    "rep_frac_delta": 0.0,
+    "punct_frac_delta": 0.0
+  },
+  "quality_gate_passed": true,
+  "state_path": "results\\sca_recalibration_full_sparse_gate_vs2022\\sca_recalibrated_state.pt"
+}

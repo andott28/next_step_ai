@@ -1,0 +1,39 @@
+{
+  "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+  "checkpoint_dir": "experiments/llama_sca_objective_v1\\model_step_0001000",
+  "task_id": 0,
+  "seed": 42,
+  "dataset": {
+    "name": "wikitext",
+    "config": "wikitext-2-raw-v1",
+    "split": "validation",
+    "text_column": "text",
+    "max_samples": 64,
+    "max_seq_length": 128,
+    "batch_size": 1,
+    "max_eval_batches": 8,
+    "warmup_batches": 2
+  },
+  "rows_sorted": [
+    {
+      "name": "np_on|spmm=cuda_spmm|k=3|soft=1|inh=0.0000|ref=100|sig=1.0000",
+      "neuroplasticity_enabled": true,
+      "spmm_impl": "cuda_spmm",
+      "top_k": 3,
+      "soft_mask": true,
+      "inhibition_lambda": 0.0,
+      "refractory_steps": 100,
+      "sigma": 1.0,
+      "avg_lm_loss": 14.004137894903966,
+      "perplexity": 1207590.8441191614,
+      "tokens_per_second": 66.95913830970015,
+      "avg_step_ms": 945.8504833261637,
+      "peak_vram_gb": 5.89834451675415,
+      "evaluated_batches": 8,
+      "evaluated_tokens": 516,
+      "timed_batches": 6,
+      "timed_tokens": 380,
+      "timed_seconds": 5.675102899956983
+    }
+  ]
+}

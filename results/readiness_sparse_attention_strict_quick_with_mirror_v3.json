@@ -1,0 +1,51 @@
+{
+  "mode": "sparse_attention_strict_with_mirror_v3",
+  "elapsed_s": 15.103664499998558,
+  "quality": {
+    "distinct1_mean": 0.75,
+    "max_run_mean": 4.0,
+    "rep_frac_mean": 0.23333333333333334
+  },
+  "rows": [
+    {
+      "prompt": "Write one sentence about Norway.",
+      "text": "Write one sentence about Norway. metabol metabol metabol474474 metabol metabol metabol metabol metabol metabol metabol",
+      "distinct1": 0.5,
+      "max_run": 7.0,
+      "rep_frac": 0.4666666666666667
+    },
+    {
+      "prompt": "Describe a sparse MLP routing system.",
+      "text": "Describe a sparse MLP routing system.\u062b\u0627\u0644oppeloppeloppeloppeloppeloppeloppeloppeloppeloppeloppel",
+      "distinct1": 1.0,
+      "max_run": 1.0,
+      "rep_frac": 0.0
+    }
+  ],
+  "sparse_mlp_max_fallback_rate": 0.0,
+  "sparse_attention_mean_pages_step": 0.0,
+  "sparse_attention_mean_cpu2gpu_bytes_step": 0.0,
+  "decoder_mirror": {
+    "mean_active_blocks": 3.0,
+    "touched_weight_fraction": 0.0234375,
+    "delta_norm_ratio": 1.3662901920952208e-09,
+    "route_prior_nonzero_fraction": 0.0625,
+    "route_prior_missing": false,
+    "mean_route_prior_entropy": 1.979204535484314,
+    "source_layers_used": [
+      14,
+      15,
+      16,
+      17
+    ],
+    "residual_scale": 0.05340576171875,
+    "route_prior_scale": 0.50146484375,
+    "enabled": true,
+    "configured_source_layers": [
+      14,
+      15,
+      16,
+      17
+    ]
+  }
+}

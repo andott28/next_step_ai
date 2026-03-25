@@ -1,0 +1,300 @@
+{
+  "steps": [
+    {
+      "step": 0,
+      "prefix_text": "Describe a sparse MLP routing system.",
+      "dense_top_tokens": [
+        " The",
+        " What",
+        " How",
+        " ",
+        " In"
+      ],
+      "sparse_top_tokens": [
+        " The",
+        " What",
+        " How",
+        " ",
+        " In"
+      ],
+      "dense_top_probs": [
+        0.07792577147483826,
+        0.04800867289304733,
+        0.037098228931427,
+        0.035677019506692886,
+        0.033778320997953415
+      ],
+      "sparse_top_probs": [
+        0.07792577147483826,
+        0.04800867289304733,
+        0.037098228931427,
+        0.035677019506692886,
+        0.033778320997953415
+      ],
+      "kl": -5.7916167861549184e-08,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 1.0,
+      "sparse_next_token": " The",
+      "route_layers": []
+    },
+    {
+      "step": 1,
+      "prefix_text": "Describe a sparse MLP routing system. The",
+      "dense_top_tokens": [
+        " system",
+        " routing",
+        " sparse",
+        " MLP",
+        " input"
+      ],
+      "sparse_top_tokens": [
+        " system",
+        " routing",
+        " sparse",
+        " MLP",
+        " input"
+      ],
+      "dense_top_probs": [
+        0.09490668773651123,
+        0.08846276253461838,
+        0.0507998913526535,
+        0.04518235847353935,
+        0.02456522360444069
+      ],
+      "sparse_top_probs": [
+        0.09490668773651123,
+        0.08846276253461838,
+        0.0507998913526535,
+        0.04518235847353935,
+        0.02456522360444069
+      ],
+      "kl": 1.3268834031521237e-08,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 0.9999998211860657,
+      "sparse_next_token": " system",
+      "route_layers": []
+    },
+    {
+      "step": 2,
+      "prefix_text": "Describe a sparse MLP routing system. The system",
+      "dense_top_tokens": [
+        " has",
+        " consists",
+        " is",
+        " should",
+        " uses"
+      ],
+      "sparse_top_tokens": [
+        " has",
+        " consists",
+        " is",
+        " should",
+        " uses"
+      ],
+      "dense_top_probs": [
+        0.15114891529083252,
+        0.1419912725687027,
+        0.13548901677131653,
+        0.06974376738071442,
+        0.042967889457941055
+      ],
+      "sparse_top_probs": [
+        0.15114891529083252,
+        0.1419912725687027,
+        0.13548901677131653,
+        0.06974376738071442,
+        0.042967889457941055
+      ],
+      "kl": 7.051312422845513e-09,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 1.0,
+      "sparse_next_token": " has",
+      "route_layers": []
+    },
+    {
+      "step": 3,
+      "prefix_text": "Describe a sparse MLP routing system. The system has",
+      "dense_top_tokens": [
+        " a",
+        " ",
+        " two",
+        " one",
+        " N"
+      ],
+      "sparse_top_tokens": [
+        " a",
+        " ",
+        " two",
+        " one",
+        " N"
+      ],
+      "dense_top_probs": [
+        0.1740264743566513,
+        0.12340324372053146,
+        0.06922294944524765,
+        0.06605300307273865,
+        0.05605845898389816
+      ],
+      "sparse_top_probs": [
+        0.1740264743566513,
+        0.12340324372053146,
+        0.06922294944524765,
+        0.06605300307273865,
+        0.05605845898389816
+      ],
+      "kl": -9.476207196712494e-08,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 0.9999998211860657,
+      "sparse_next_token": " a",
+      "route_layers": []
+    },
+    {
+      "step": 4,
+      "prefix_text": "Describe a sparse MLP routing system. The system has a",
+      "dense_top_tokens": [
+        " single",
+        " routing",
+        " set",
+        " number",
+        " "
+      ],
+      "sparse_top_tokens": [
+        " single",
+        " routing",
+        " set",
+        " number",
+        " "
+      ],
+      "dense_top_probs": [
+        0.12325475364923477,
+        0.06344611197710037,
+        0.06295236945152283,
+        0.04789163917303085,
+        0.038182541728019714
+      ],
+      "sparse_top_probs": [
+        0.12325475364923477,
+        0.06344611197710037,
+        0.06295236945152283,
+        0.04789163917303085,
+        0.038182541728019714
+      ],
+      "kl": -7.450580596923828e-09,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 1.0000001192092896,
+      "sparse_next_token": " single",
+      "route_layers": []
+    },
+    {
+      "step": 5,
+      "prefix_text": "Describe a sparse MLP routing system. The system has a single",
+      "dense_top_tokens": [
+        " input",
+        " routing",
+        " MLP",
+        " output",
+        " processor"
+      ],
+      "sparse_top_tokens": [
+        " input",
+        " routing",
+        " MLP",
+        " output",
+        " processor"
+      ],
+      "dense_top_probs": [
+        0.21159394085407257,
+        0.05025796964764595,
+        0.03024577721953392,
+        0.02908707968890667,
+        0.02566925808787346
+      ],
+      "sparse_top_probs": [
+        0.21159394085407257,
+        0.05025796964764595,
+        0.03024577721953392,
+        0.02908707968890667,
+        0.02566925808787346
+      ],
+      "kl": -3.029885320415815e-08,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 1.0,
+      "sparse_next_token": " input",
+      "route_layers": []
+    },
+    {
+      "step": 6,
+      "prefix_text": "Describe a sparse MLP routing system. The system has a single input",
+      "dense_top_tokens": [
+        " and",
+        " layer",
+        ",",
+        " node",
+        " neuron"
+      ],
+      "sparse_top_tokens": [
+        " and",
+        " layer",
+        ",",
+        " node",
+        " neuron"
+      ],
+      "dense_top_probs": [
+        0.32185548543930054,
+        0.1341693252325058,
+        0.08074451982975006,
+        0.06799370050430298,
+        0.060004234313964844
+      ],
+      "sparse_top_probs": [
+        0.32185548543930054,
+        0.1341693252325058,
+        0.08074451982975006,
+        0.06799370050430298,
+        0.060004234313964844
+      ],
+      "kl": -1.3662071474129789e-09,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 1.0,
+      "sparse_next_token": " and",
+      "route_layers": []
+    },
+    {
+      "step": 7,
+      "prefix_text": "Describe a sparse MLP routing system. The system has a single input and",
+      "dense_top_tokens": [
+        " a",
+        " output",
+        " single",
+        " multiple",
+        " two"
+      ],
+      "sparse_top_tokens": [
+        " a",
+        " output",
+        " single",
+        " multiple",
+        " two"
+      ],
+      "dense_top_probs": [
+        0.46920037269592285,
+        0.183741495013237,
+        0.09834973514080048,
+        0.07308731973171234,
+        0.035619914531707764
+      ],
+      "sparse_top_probs": [
+        0.46920037269592285,
+        0.183741495013237,
+        0.09834973514080048,
+        0.07308731973171234,
+        0.035619914531707764
+      ],
+      "kl": 2.9802322387695312e-08,
+      "final_hidden_mse": 0.0,
+      "final_hidden_cos": 0.9999998807907104,
+      "sparse_next_token": " a",
+      "route_layers": []
+    }
+  ]
+}

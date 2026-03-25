@@ -1,0 +1,997 @@
+{
+  "timestamp": "20260109_160358",
+  "num_runs": 3,
+  "random_seed": 42,
+  "models": {
+    "gpt2-large": {
+      "model_name": "gpt2-large",
+      "glue_results": {
+        "cola_run_0": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "mcc": 0.3060805264734496
+          },
+          "primary_score": 0.3060805264734496,
+          "num_samples": 1043,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "sst2_run_0": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.8681192660550459
+          },
+          "primary_score": 0.8681192660550459,
+          "num_samples": 872,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "mrpc_run_0": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.7034313725490197,
+            "f1": 0.7880910683012259
+          },
+          "primary_score": 0.7034313725490197,
+          "num_samples": 408,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "qqp_run_0": {
+          "task": "qqp",
+          "error": "'dict_values' object is not subscriptable",
+          "primary_score": 0.0
+        },
+        "stsb_run_0": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.6510823685718482
+          },
+          "primary_score": 0.6510823685718482,
+          "num_samples": 1500,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "mnli_run_0": {
+          "task": "mnli",
+          "metric": "accuracy",
+          "description": "Natural language inference",
+          "results": {
+            "accuracy": 0.5393785022924096
+          },
+          "primary_score": 0.5393785022924096,
+          "num_samples": 9815,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "qnli_run_0": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5313930075050338
+          },
+          "primary_score": 0.5313930075050338,
+          "num_samples": 5463,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "rte_run_0": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.6028880866425993
+          },
+          "primary_score": 0.6028880866425993,
+          "num_samples": 277,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "wnli_run_0": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.11267605633802817
+          },
+          "primary_score": 0.11267605633802817,
+          "num_samples": 71,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "ax_run_0": {
+          "task": "ax",
+          "error": "'train'",
+          "primary_score": 0.0
+        },
+        "cola_run_1": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "mcc": 0.3060805264734496
+          },
+          "primary_score": 0.3060805264734496,
+          "num_samples": 1043,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "sst2_run_1": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.8681192660550459
+          },
+          "primary_score": 0.8681192660550459,
+          "num_samples": 872,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "mrpc_run_1": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.7034313725490197,
+            "f1": 0.7880910683012259
+          },
+          "primary_score": 0.7034313725490197,
+          "num_samples": 408,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "qqp_run_1": {
+          "task": "qqp",
+          "error": "'dict_values' object is not subscriptable",
+          "primary_score": 0.0
+        },
+        "stsb_run_1": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.6510823685718482
+          },
+          "primary_score": 0.6510823685718482,
+          "num_samples": 1500,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "mnli_run_1": {
+          "task": "mnli",
+          "metric": "accuracy",
+          "description": "Natural language inference",
+          "results": {
+            "accuracy": 0.5393785022924096
+          },
+          "primary_score": 0.5393785022924096,
+          "num_samples": 9815,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "qnli_run_1": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5313930075050338
+          },
+          "primary_score": 0.5313930075050338,
+          "num_samples": 5463,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "rte_run_1": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.6028880866425993
+          },
+          "primary_score": 0.6028880866425993,
+          "num_samples": 277,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "wnli_run_1": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.11267605633802817
+          },
+          "primary_score": 0.11267605633802817,
+          "num_samples": 71,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "ax_run_1": {
+          "task": "ax",
+          "error": "'train'",
+          "primary_score": 0.0
+        },
+        "cola_run_2": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "mcc": 0.3060805264734496
+          },
+          "primary_score": 0.3060805264734496,
+          "num_samples": 1043,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "sst2_run_2": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.8681192660550459
+          },
+          "primary_score": 0.8681192660550459,
+          "num_samples": 872,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "mrpc_run_2": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.7034313725490197,
+            "f1": 0.7880910683012259
+          },
+          "primary_score": 0.7034313725490197,
+          "num_samples": 408,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "qqp_run_2": {
+          "task": "qqp",
+          "error": "'dict_values' object is not subscriptable",
+          "primary_score": 0.0
+        },
+        "stsb_run_2": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.6510823685718482
+          },
+          "primary_score": 0.6510823685718482,
+          "num_samples": 1500,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "mnli_run_2": {
+          "task": "mnli",
+          "metric": "accuracy",
+          "description": "Natural language inference",
+          "results": {
+            "accuracy": 0.5393785022924096
+          },
+          "primary_score": 0.5393785022924096,
+          "num_samples": 9815,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "qnli_run_2": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5313930075050338
+          },
+          "primary_score": 0.5313930075050338,
+          "num_samples": 5463,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "rte_run_2": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.6028880866425993
+          },
+          "primary_score": 0.6028880866425993,
+          "num_samples": 277,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "wnli_run_2": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.11267605633802817
+          },
+          "primary_score": 0.11267605633802817,
+          "num_samples": 71,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "ax_run_2": {
+          "task": "ax",
+          "error": "'train'",
+          "primary_score": 0.0
+        }
+      },
+      "run_scores": [
+        0.5393811483034293,
+        0.5393811483034293,
+        0.5393811483034293
+      ],
+      "successful_evaluations": 24,
+      "total_evaluations": 30,
+      "overall_score": 0.5393811483034293,
+      "statistics": {
+        "mean": 0.5393811483034293,
+        "std": 0.0,
+        "ci_95": 0.0,
+        "min": 0.5393811483034293,
+        "max": 0.5393811483034293,
+        "median": 0.5393811483034293,
+        "n_runs": 3
+      },
+      "task_statistics": {
+        "cola": {
+          "statistics": {
+            "mean": 0.3060805264734496,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.3060805264734496,
+            "max": 0.3060805264734496,
+            "median": 0.3060805264734496,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "sst2": {
+          "statistics": {
+            "mean": 0.868119266055046,
+            "std": 1.3597399555105182e-16,
+            "ci_95": 3.3777813016155357e-16,
+            "min": 0.8681192660550459,
+            "max": 0.8681192660550459,
+            "median": 0.8681192660550459,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "mrpc": {
+          "statistics": {
+            "mean": 0.7034313725490197,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.7034313725490197,
+            "max": 0.7034313725490197,
+            "median": 0.7034313725490197,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "stsb": {
+          "statistics": {
+            "mean": 0.6510823685718482,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.6510823685718482,
+            "max": 0.6510823685718482,
+            "median": 0.6510823685718482,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "mnli": {
+          "statistics": {
+            "mean": 0.5393785022924096,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.5393785022924096,
+            "max": 0.5393785022924096,
+            "median": 0.5393785022924096,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "qnli": {
+          "statistics": {
+            "mean": 0.5313930075050338,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.5313930075050338,
+            "max": 0.5313930075050338,
+            "median": 0.5313930075050338,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "rte": {
+          "statistics": {
+            "mean": 0.6028880866425993,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.6028880866425993,
+            "max": 0.6028880866425993,
+            "median": 0.6028880866425993,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "wnli": {
+          "statistics": {
+            "mean": 0.11267605633802817,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.11267605633802817,
+            "max": 0.11267605633802817,
+            "median": 0.11267605633802817,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        }
+      }
+    },
+    "neuroplastic-transformer": {
+      "model_name": "neuroplastic-transformer",
+      "glue_results": {
+        "cola_run_0": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "mcc": 0.3060805264734496
+          },
+          "primary_score": 0.3060805264734496,
+          "num_samples": 1043,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "sst2_run_0": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.8681192660550459
+          },
+          "primary_score": 0.8681192660550459,
+          "num_samples": 872,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "mrpc_run_0": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.7034313725490197,
+            "f1": 0.7880910683012259
+          },
+          "primary_score": 0.7034313725490197,
+          "num_samples": 408,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "qqp_run_0": {
+          "task": "qqp",
+          "error": "'dict_values' object is not subscriptable",
+          "primary_score": 0.0
+        },
+        "stsb_run_0": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.6510823685718482
+          },
+          "primary_score": 0.6510823685718482,
+          "num_samples": 1500,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "mnli_run_0": {
+          "task": "mnli",
+          "metric": "accuracy",
+          "description": "Natural language inference",
+          "results": {
+            "accuracy": 0.5393785022924096
+          },
+          "primary_score": 0.5393785022924096,
+          "num_samples": 9815,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "qnli_run_0": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5313930075050338
+          },
+          "primary_score": 0.5313930075050338,
+          "num_samples": 5463,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "rte_run_0": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.6028880866425993
+          },
+          "primary_score": 0.6028880866425993,
+          "num_samples": 277,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "wnli_run_0": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.11267605633802817
+          },
+          "primary_score": 0.11267605633802817,
+          "num_samples": 71,
+          "error_rate": 0.0,
+          "run_seed": 42
+        },
+        "ax_run_0": {
+          "task": "ax",
+          "error": "'train'",
+          "primary_score": 0.0
+        },
+        "cola_run_1": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "mcc": 0.3060805264734496
+          },
+          "primary_score": 0.3060805264734496,
+          "num_samples": 1043,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "sst2_run_1": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.8681192660550459
+          },
+          "primary_score": 0.8681192660550459,
+          "num_samples": 872,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "mrpc_run_1": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.7034313725490197,
+            "f1": 0.7880910683012259
+          },
+          "primary_score": 0.7034313725490197,
+          "num_samples": 408,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "qqp_run_1": {
+          "task": "qqp",
+          "error": "'dict_values' object is not subscriptable",
+          "primary_score": 0.0
+        },
+        "stsb_run_1": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.6510823685718482
+          },
+          "primary_score": 0.6510823685718482,
+          "num_samples": 1500,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "mnli_run_1": {
+          "task": "mnli",
+          "metric": "accuracy",
+          "description": "Natural language inference",
+          "results": {
+            "accuracy": 0.5393785022924096
+          },
+          "primary_score": 0.5393785022924096,
+          "num_samples": 9815,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "qnli_run_1": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5313930075050338
+          },
+          "primary_score": 0.5313930075050338,
+          "num_samples": 5463,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "rte_run_1": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.6028880866425993
+          },
+          "primary_score": 0.6028880866425993,
+          "num_samples": 277,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "wnli_run_1": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.11267605633802817
+          },
+          "primary_score": 0.11267605633802817,
+          "num_samples": 71,
+          "error_rate": 0.0,
+          "run_seed": 43
+        },
+        "ax_run_1": {
+          "task": "ax",
+          "error": "'train'",
+          "primary_score": 0.0
+        },
+        "cola_run_2": {
+          "task": "cola",
+          "metric": "matthews_correlation",
+          "description": "Sentence acceptability",
+          "results": {
+            "mcc": 0.3060805264734496
+          },
+          "primary_score": 0.3060805264734496,
+          "num_samples": 1043,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "sst2_run_2": {
+          "task": "sst2",
+          "metric": "accuracy",
+          "description": "Sentiment analysis",
+          "results": {
+            "accuracy": 0.8681192660550459
+          },
+          "primary_score": 0.8681192660550459,
+          "num_samples": 872,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "mrpc_run_2": {
+          "task": "mrpc",
+          "metric": "f1",
+          "description": "Paraphrase detection",
+          "results": {
+            "accuracy": 0.7034313725490197,
+            "f1": 0.7880910683012259
+          },
+          "primary_score": 0.7034313725490197,
+          "num_samples": 408,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "qqp_run_2": {
+          "task": "qqp",
+          "error": "'dict_values' object is not subscriptable",
+          "primary_score": 0.0
+        },
+        "stsb_run_2": {
+          "task": "stsb",
+          "metric": "pearson",
+          "description": "Semantic similarity",
+          "results": {
+            "pearson": 0.6510823685718482
+          },
+          "primary_score": 0.6510823685718482,
+          "num_samples": 1500,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "mnli_run_2": {
+          "task": "mnli",
+          "metric": "accuracy",
+          "description": "Natural language inference",
+          "results": {
+            "accuracy": 0.5393785022924096
+          },
+          "primary_score": 0.5393785022924096,
+          "num_samples": 9815,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "qnli_run_2": {
+          "task": "qnli",
+          "metric": "accuracy",
+          "description": "Question-entailment",
+          "results": {
+            "accuracy": 0.5313930075050338
+          },
+          "primary_score": 0.5313930075050338,
+          "num_samples": 5463,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "rte_run_2": {
+          "task": "rte",
+          "metric": "accuracy",
+          "description": "Textual entailment",
+          "results": {
+            "accuracy": 0.6028880866425993
+          },
+          "primary_score": 0.6028880866425993,
+          "num_samples": 277,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "wnli_run_2": {
+          "task": "wnli",
+          "metric": "accuracy",
+          "description": "Word-level natural language inference",
+          "results": {
+            "accuracy": 0.11267605633802817
+          },
+          "primary_score": 0.11267605633802817,
+          "num_samples": 71,
+          "error_rate": 0.0,
+          "run_seed": 44
+        },
+        "ax_run_2": {
+          "task": "ax",
+          "error": "'train'",
+          "primary_score": 0.0
+        }
+      },
+      "run_scores": [
+        0.5393811483034293,
+        0.5393811483034293,
+        0.5393811483034293
+      ],
+      "successful_evaluations": 24,
+      "total_evaluations": 30,
+      "overall_score": 0.5393811483034293,
+      "statistics": {
+        "mean": 0.5393811483034293,
+        "std": 0.0,
+        "ci_95": 0.0,
+        "min": 0.5393811483034293,
+        "max": 0.5393811483034293,
+        "median": 0.5393811483034293,
+        "n_runs": 3
+      },
+      "task_statistics": {
+        "cola": {
+          "statistics": {
+            "mean": 0.3060805264734496,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.3060805264734496,
+            "max": 0.3060805264734496,
+            "median": 0.3060805264734496,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "sst2": {
+          "statistics": {
+            "mean": 0.868119266055046,
+            "std": 1.3597399555105182e-16,
+            "ci_95": 3.3777813016155357e-16,
+            "min": 0.8681192660550459,
+            "max": 0.8681192660550459,
+            "median": 0.8681192660550459,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "mrpc": {
+          "statistics": {
+            "mean": 0.7034313725490197,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.7034313725490197,
+            "max": 0.7034313725490197,
+            "median": 0.7034313725490197,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "stsb": {
+          "statistics": {
+            "mean": 0.6510823685718482,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.6510823685718482,
+            "max": 0.6510823685718482,
+            "median": 0.6510823685718482,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "mnli": {
+          "statistics": {
+            "mean": 0.5393785022924096,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.5393785022924096,
+            "max": 0.5393785022924096,
+            "median": 0.5393785022924096,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "qnli": {
+          "statistics": {
+            "mean": 0.5313930075050338,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.5313930075050338,
+            "max": 0.5313930075050338,
+            "median": 0.5313930075050338,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "rte": {
+          "statistics": {
+            "mean": 0.6028880866425993,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.6028880866425993,
+            "max": 0.6028880866425993,
+            "median": 0.6028880866425993,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        },
+        "wnli": {
+          "statistics": {
+            "mean": 0.11267605633802817,
+            "std": 0.0,
+            "ci_95": 0.0,
+            "min": 0.11267605633802817,
+            "max": 0.11267605633802817,
+            "median": 0.11267605633802817,
+            "n_runs": 3
+          },
+          "num_successful_runs": 3
+        }
+      }
+    }
+  },
+  "summary": {
+    "total_models": 2,
+    "successful_models": 2,
+    "failed_models": 0,
+    "best_model": "gpt2-large",
+    "best_score": 0.5393811483034293,
+    "rankings": [
+      {
+        "rank": 1,
+        "model_name": "gpt2-large",
+        "score": 0.5393811483034293,
+        "success_rate": 0.8,
+        "statistics": {
+          "mean": 0.5393811483034293,
+          "std": 0.0,
+          "ci_95": 0.0,
+          "min": 0.5393811483034293,
+          "max": 0.5393811483034293,
+          "median": 0.5393811483034293,
+          "n_runs": 3
+        }
+      },
+      {
+        "rank": 2,
+        "model_name": "neuroplastic-transformer",
+        "score": 0.5393811483034293,
+        "success_rate": 0.8,
+        "statistics": {
+          "mean": 0.5393811483034293,
+          "std": 0.0,
+          "ci_95": 0.0,
+          "min": 0.5393811483034293,
+          "max": 0.5393811483034293,
+          "median": 0.5393811483034293,
+          "n_runs": 3
+        }
+      }
+    ],
+    "average_scores": {
+      "gpt2-large": 0.5393811483034293,
+      "neuroplastic-transformer": 0.5393811483034293
+    },
+    "success_rates": {
+      "gpt2-large": 0.8,
+      "neuroplastic-transformer": 0.8
+    },
+    "statistical_summary": {
+      "gpt2-large": {
+        "mean": 0.5393811483034293,
+        "std": 0.0,
+        "ci_95": 0.0,
+        "min": 0.5393811483034293,
+        "max": 0.5393811483034293,
+        "median": 0.5393811483034293,
+        "n_runs": 3
+      },
+      "neuroplastic-transformer": {
+        "mean": 0.5393811483034293,
+        "std": 0.0,
+        "ci_95": 0.0,
+        "min": 0.5393811483034293,
+        "max": 0.5393811483034293,
+        "median": 0.5393811483034293,
+        "n_runs": 3
+      }
+    }
+  },
+  "statistical_analysis": {
+    "model_comparisons": {
+      "gpt2-large_vs_neuroplastic-transformer": {
+        "model1": "gpt2-large",
+        "model2": "neuroplastic-transformer",
+        "model1_stats": {
+          "mean": 0.5393811483034293,
+          "std": 0.0,
+          "ci_95": 0.0,
+          "min": 0.5393811483034293,
+          "max": 0.5393811483034293,
+          "median": 0.5393811483034293,
+          "n_runs": 3
+        },
+        "model2_stats": {
+          "mean": 0.5393811483034293,
+          "std": 0.0,
+          "ci_95": 0.0,
+          "min": 0.5393811483034293,
+          "max": 0.5393811483034293,
+          "median": 0.5393811483034293,
+          "n_runs": 3
+        }
+      }
+    },
+    "statistical_significance": {
+      "gpt2-large_vs_neuroplastic-transformer": {
+        "t_statistic": NaN,
+        "p_value": NaN,
+        "significant": 0
+      }
+    },
+    "performance_gaps": {
+      "gpt2-large_vs_neuroplastic-transformer": {
+        "model1_mean": 0.5393811483034293,
+        "model2_mean": 0.5393811483034293,
+        "improvement_percent": 0.0,
+        "absolute_difference": 0.0
+      }
+    }
+  }
+}

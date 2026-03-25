@@ -1,0 +1,662 @@
+{
+  "baseline_rows": [
+    {
+      "prompt": "Write one sentence about Norway.",
+      "distinct1": 0.6428571428571429,
+      "max_run": 6.0,
+      "rep_frac": 0.38461538461538464,
+      "char_repeat4_frac": 0.1111111111111111,
+      "looks_degenerate": true,
+      "text": "Write one sentence about Norway. ( ( ( ( ( (the)",
+      "returncode": 0
+    },
+    {
+      "prompt": "Describe a sparse MLP routing system.",
+      "distinct1": 1.0,
+      "max_run": 1.0,
+      "rep_frac": 0.0,
+      "char_repeat4_frac": 0.0,
+      "looks_degenerate": false,
+      "text": "Describe a sparse MLP routing system.",
+      "returncode": 0
+    }
+  ],
+  "strict_rows": [
+    {
+      "prompt": "Write one sentence about Norway.",
+      "distinct1": 0.3888888888888889,
+      "max_run": 12.0,
+      "rep_frac": 0.6470588235294118,
+      "char_repeat4_frac": 0.5324675324675324,
+      "looks_degenerate": true,
+      "text": "Write one sentence about Norway. aud aud aud aud aud aud aud aud aud aud aud aud",
+      "returncode": 0,
+      "diag": {
+        "sparse_attention": {
+          "enabled": true,
+          "steps": 12,
+          "total_bytes_cpu_to_gpu": 0,
+          "mean_bytes_cpu_to_gpu_per_step": 0.0,
+          "total_selected_pages": 0,
+          "mean_selected_pages_per_step": 0.0,
+          "last_step": {
+            "step_index": 11,
+            "selected_pages_by_layer": {},
+            "bytes_cpu_to_gpu": 0,
+            "archive_tokens": 4608,
+            "fallback_triggered": false
+          },
+          "config": {
+            "local_window_tokens": 128,
+            "sink_tokens": 8,
+            "page_size_tokens": 32,
+            "retrieval_top_k_pages": 4,
+            "retrieval_head_group_ids": [
+              0
+            ],
+            "retrieval_start_layer": 21,
+            "archive_cpu_dtype": "int4",
+            "strict_fully_sparse": true
+          }
+        },
+        "sparse_mlp": {
+          "layers": [
+            {
+              "layer_idx": 0,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 1,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 2,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 3,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 4,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 5,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 6,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 7,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 8,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 9,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 10,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 11,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 12,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 13,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 14,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 15,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 16,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 17,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 18,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 19,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 20,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 21,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 22,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 23,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 24,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 25,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 26,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 27,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 28,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 29,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 30,
+              "rows": 1,
+              "mean_active_blocks": 0.0,
+              "unique_active_blocks": 0,
+              "touched_weight_fraction": 0.0,
+              "estimated_bytes_fetched_per_token": 0.0
+            },
+            {
+              "layer_idx": 31,
+              "rows": 1,
+              "mean_active_blocks": 0.0,
+              "unique_active_blocks": 0,
+              "touched_weight_fraction": 0.0,
+              "estimated_bytes_fetched_per_token": 0.0
+            }
+          ],
+          "mean_touched_weight_fraction": 0.02197265625,
+          "estimated_bytes_fetched_per_token": 61931520.0
+        },
+        "decoder_mirror": {
+          "enabled": false,
+          "route_prior_missing": true,
+          "source_layers_used": [],
+          "configured_source_layers": []
+        }
+      }
+    },
+    {
+      "prompt": "Describe a sparse MLP routing system.",
+      "distinct1": 0.5,
+      "max_run": 10.0,
+      "rep_frac": 0.5294117647058824,
+      "char_repeat4_frac": 0.0,
+      "looks_degenerate": true,
+      "text": "Describe a sparse MLP routing system. PantsMech Pants Pants Pants Pants Pants Pants Pants Pants Pants Pants",
+      "returncode": 0,
+      "diag": {
+        "sparse_attention": {
+          "enabled": true,
+          "steps": 12,
+          "total_bytes_cpu_to_gpu": 0,
+          "mean_bytes_cpu_to_gpu_per_step": 0.0,
+          "total_selected_pages": 0,
+          "mean_selected_pages_per_step": 0.0,
+          "last_step": {
+            "step_index": 11,
+            "selected_pages_by_layer": {},
+            "bytes_cpu_to_gpu": 0,
+            "archive_tokens": 4864,
+            "fallback_triggered": false
+          },
+          "config": {
+            "local_window_tokens": 128,
+            "sink_tokens": 8,
+            "page_size_tokens": 32,
+            "retrieval_top_k_pages": 4,
+            "retrieval_head_group_ids": [
+              0
+            ],
+            "retrieval_start_layer": 21,
+            "archive_cpu_dtype": "int4",
+            "strict_fully_sparse": true
+          }
+        },
+        "sparse_mlp": {
+          "layers": [
+            {
+              "layer_idx": 0,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 1,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 2,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 3,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 4,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 5,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 6,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 7,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 8,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 9,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 10,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 11,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 12,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 13,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 14,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 15,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 16,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 17,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 18,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 19,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 20,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 21,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 22,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 23,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 24,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 25,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 26,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 27,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 28,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 29,
+              "rows": 1,
+              "mean_active_blocks": 3.0,
+              "unique_active_blocks": 3,
+              "touched_weight_fraction": 0.0234375,
+              "estimated_bytes_fetched_per_token": 2064384.0
+            },
+            {
+              "layer_idx": 30,
+              "rows": 1,
+              "mean_active_blocks": 0.0,
+              "unique_active_blocks": 0,
+              "touched_weight_fraction": 0.0,
+              "estimated_bytes_fetched_per_token": 0.0
+            },
+            {
+              "layer_idx": 31,
+              "rows": 1,
+              "mean_active_blocks": 0.0,
+              "unique_active_blocks": 0,
+              "touched_weight_fraction": 0.0,
+              "estimated_bytes_fetched_per_token": 0.0
+            }
+          ],
+          "mean_touched_weight_fraction": 0.02197265625,
+          "estimated_bytes_fetched_per_token": 61931520.0
+        },
+        "decoder_mirror": {
+          "enabled": false,
+          "route_prior_missing": true,
+          "source_layers_used": [],
+          "configured_source_layers": []
+        }
+      }
+    }
+  ],
+  "baseline_quality": {
+    "distinct1_mean": 0.8214285714285714,
+    "max_run_mean": 3.5,
+    "rep_frac_mean": 0.19230769230769232,
+    "char_repeat4_frac_mean": 0.05555555555555555,
+    "degenerate_frac": 0.5
+  },
+  "strict_quality": {
+    "distinct1_mean": 0.4444444444444444,
+    "max_run_mean": 11.0,
+    "rep_frac_mean": 0.5882352941176471,
+    "char_repeat4_frac_mean": 0.2662337662337662,
+    "degenerate_frac": 1.0
+  },
+  "long_context_diag": {},
+  "long_context_text": "",
+  "gates": {
+    "strict_sparse_attention_active": false,
+    "strict_sparse_mlp_no_fallback": true,
+    "strict_not_worse_than_sparse_baseline": false,
+    "long_context_probe_completed": false
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "lower_only": {
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ],
+    "tokens": [
+      "\u00f1a",
+      "\u00f1a",
+      "\u0144",
+      "\u0144"
+    ],
+    "text": "Describe a sparse MLP routing system.\u00f1a\u00f1a\u0144\u0144"
+  },
+  "upper_only": {
+    "layers": [
+      12,
+      13,
+      14,
+      15,
+      16,
+      17
+    ],
+    "tokens": [
+      "olate",
+      "olate",
+      "olate",
+      "olate"
+    ],
+    "text": "Describe a sparse MLP routing system.olateolateolateolate"
+  },
+  "all_active": {
+    "layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17
+    ],
+    "tokens": [
+      "hta",
+      "hta",
+      "\u0144",
+      "\u0144"
+    ],
+    "text": "Describe a sparse MLP routing system.htahta\u0144\u0144"
+  }
+}

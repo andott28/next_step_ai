@@ -1,0 +1,71 @@
+{
+  "mode": "local_mlp_geometry_plus_logits",
+  "steps": 12,
+  "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+  "hybrid_checkpoint": "results/hybrid_8b_small_local/hybrid_attention_state.pt",
+  "layer_selection": [
+    14,
+    15,
+    16,
+    17
+  ],
+  "trainable_params": 53251,
+  "initial_loss": 71.0310287475586,
+  "final_loss": 19.814960479736328,
+  "min_loss": 19.492643356323242,
+  "per_layer_loss": {
+    "14": 0.15742161870002747,
+    "15": 0.21851396560668945,
+    "16": 0.21525557339191437,
+    "17": 0.27430129051208496
+  },
+  "per_layer_norm": {
+    "14": 15.310585021972656,
+    "15": 21.262754440307617,
+    "16": 20.94695281982422,
+    "17": 26.738239288330078
+  },
+  "mean_touched_weight_fraction": 0.02197265625,
+  "estimated_bytes_fetched_per_token": 61931520.0,
+  "fallback_rate_by_layer": {
+    "14": 0.0,
+    "15": 0.0,
+    "16": 0.0,
+    "17": 0.0
+  },
+  "fallback_warning_layers_over_50pct": [],
+  "elapsed_seconds": 97.3184626000002,
+  "config": {
+    "model_name": "unsloth/Meta-Llama-3.1-8B-bnb-4bit",
+    "hybrid_checkpoint": "results/hybrid_8b_small_local/hybrid_attention_state.pt",
+    "output_dir": "results/sca_recalibration_task_safe",
+    "layers": "14-17",
+    "max_samples": 24,
+    "max_seq_length": 64,
+    "batch_size": 1,
+    "steps": 12,
+    "lr": 1e-07,
+    "weight_decay": 0.0,
+    "grad_clip": 0.1,
+    "task_id": 0,
+    "include_task_embedding": true,
+    "include_spatial_proj": true,
+    "loss_mode": "mse_plus_norm",
+    "top_k": 3,
+    "block_size": 32,
+    "soft_mask": true,
+    "grouped_row_gemm": false,
+    "disable_fast_fallback": true,
+    "save_every": 0,
+    "verbose": false,
+    "recalibration_mode": "local_mlp_geometry_plus_logits",
+    "dataset_name": "wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "dataset_split": "train",
+    "text_column": "text",
+    "logits_kl_weight": 0.1,
+    "logits_warmup_steps": 0,
+    "seed": 42
+  },
+  "state_path": "results\\sca_recalibration_task_safe\\sca_recalibrated_state.pt"
+}
