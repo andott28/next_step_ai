@@ -53,6 +53,12 @@ What is working:
   - ablation runner isolates each variant in a fresh subprocess to avoid sequential 4-bit model-load VRAM churn/device-map failures
   - Taylor order-2 feature map now includes the linear term in symmetric mode and uses corrected quadratic scaling coefficients
   - Windows 405B streaming now re-opens safetensor shards on demand instead of pinning many shard handles open for the whole run; this avoids the later-shard access-violation crash seen around the mid-model layers
+- 405B streaming sparse-runtime fixes (March 26, 2026):
+  - the layer skeleton now keeps the large MLP module off GPU so first-token VRAM headroom stays within 8 GB-class cards
+  - sparse MLP execution uses the repo's Triton 4-bit sparse kernels again instead of `Params4bit[...]` indexing
+  - dense fallback MLPs stream one projection at a time through a reusable GPU staging buffer
+  - Windows shard tensors are cloned into normal CPU RAM in the cache to avoid mmap-backed CUDA copy instability
+  - sparse execution has been verified with real 405B weights in lightweight streamed checks across multiple layers without changing model math
 
 - Hybrid Softmax-Linear Attention landing (March 23, 2026):
   - Fixed severe repetition collapse (`Write Write ...`) by implementing an exact causal local softmax window plus a Performer-style compressed recurrent tail.
@@ -69,8 +75,18 @@ The project now supports running **Llama 3.1 405B (Instruct)** on consumer hardw
 ### How it works:
 - **Layer Streaming:** Only one 405B layer (~1.6 GB in 4-bit) is present in VRAM at any time. Weights are streamed directly from NVMe SSD to GPU.
 - **CPU Offloading:** The massive `embed_tokens` and `lm_head` (4.2 GB each) are kept on System RAM to stay within the 8GB GPU limit.
-- **GPU Dequantization:** 4-bit weights are dequantized on-the-fly on the GPU to eliminate CPU bottlenecks.
+- **Sparse MLP Fast Path:** Learned-basis sparse layers use Triton 4-bit sparse kernels on GPU, driven from packed NF4 weights cached on CPU.
+- **Dense Fallback Path:** Non-sparse MLP layers stream one projection at a time through a reusable GPU buffer instead of keeping the full FFN resident.
+- **Windows Stability Tradeoff:** Full bitsandbytes CUDA dequant during layer-load is not currently reliable on the tested Windows 11 + 8 GB setup, so streamed layer materialization still uses the stable CPU dequant path there.
 - **Zero-Shot PCA:** Use `init_learned_basis_from_dense_mlp.py` with the `--use-streaming-harness` flag to initialize the sparse routing geometry analytically without ever loading the full model into system RAM.
+
+### 405B Streaming Status
+
+- Verified: streamed 405B forwards with real `unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit` weights and real learned-basis routing checkpoints complete through multiple sparse-enabled layers.
+- Verified sparse layers in lightweight checks: layers `2`, `3`, and `4` executed through the sparse Triton path without falling back to dense MLP execution.
+- Verified output shape in those checks: `logits_shape == (1, 1, 128256)`.
+- Current bottleneck is no longer the sparse neuron-selection path itself; the main remaining cost is per-layer weight materialization plus the still-dense layers that do not have routing coverage.
+- Recommended interpretation: sparse routing is working for the streaming runtime, but full end-to-end 405B decode on 8 GB VRAM remains a systems-optimization problem rather than a routing-correctness problem.
 
 ### 405B Inference Command:
 ```powershell
@@ -82,6 +98,12 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
   --taylor-layers "0-125" `
   --taylor-feature-map hybrid_performer
 ```
+
+Practical note:
+
+- The command above is the canonical full decode entrypoint, but it is not the right loop for low-latency debugging on 405B.
+- For runtime verification, prefer short streamed checks that cap `runtime.num_layers` in-process and confirm whether a target sparse layer reaches `sparse_mlp` successfully.
+- The current Windows-safe fast path preserves model math, but speed still depends heavily on how many layers remain outside sparse routing coverage.
 
 ### 405B Learned-Basis Init Notes
 

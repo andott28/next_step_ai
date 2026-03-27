@@ -82,6 +82,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override number of active MLP blocks per token (default: 2%% of blocks from checkpoint config).",
     )
+    p.add_argument(
+        "--attn-head-importance-path",
+        type=str,
+        default="",
+        help="Path to attention head importance checkpoint (.pt) from "
+             "init_learned_attn_head_importance.py. Enables sparse attention head loading "
+             "(only top-K heads' NF4 bytes transferred per token, reducing attention PCIe traffic).",
+    )
+    p.add_argument(
+        "--attn-active-heads",
+        type=int,
+        default=None,
+        help="Number of active attention heads per layer (default: 50%% of heads from checkpoint config). "
+             "Lower values trade quality for bandwidth: K=32 → ~0.75 t/s, K=16 → ~1.0 t/s on 2080.",
+    )
     return p
 
 
@@ -102,6 +117,8 @@ def main() -> None:
         ram_cache=not bool(args.no_ram_cache),
         sparse_basis_path=str(args.sparse_basis_path) if args.sparse_basis_path else None,
         sparse_top_k=int(args.sparse_top_k) if args.sparse_top_k is not None else None,
+        attn_head_importance_path=str(args.attn_head_importance_path) if args.attn_head_importance_path else None,
+        attn_active_heads=int(args.attn_active_heads) if args.attn_active_heads is not None else None,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.model_name), use_fast=True, local_files_only=bool(args.local_files_only))
