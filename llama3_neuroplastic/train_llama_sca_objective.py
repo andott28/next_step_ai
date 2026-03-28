@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
-from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 try:
@@ -19,6 +19,16 @@ try:
         compute_token_entropy,
     )
     from .objective_scheduler import AdaptiveObjectiveConfig, AdaptiveObjectiveScheduler
+    from .performance_utils import (
+        autocast_context,
+        backward_step,
+        build_grad_scaler,
+        build_optimizer as build_runtime_optimizer,
+        configure_runtime_environment,
+        maybe_compile_module,
+        maybe_enable_gradient_checkpointing,
+        resolve_amp_dtype,
+    )
 except ImportError:  # pragma: no cover
     from objective_losses import (
         compute_biological_loss,
@@ -29,6 +39,16 @@ except ImportError:  # pragma: no cover
         compute_token_entropy,
     )
     from objective_scheduler import AdaptiveObjectiveConfig, AdaptiveObjectiveScheduler
+    from performance_utils import (
+        autocast_context,
+        backward_step,
+        build_grad_scaler,
+        build_optimizer as build_runtime_optimizer,
+        configure_runtime_environment,
+        maybe_compile_module,
+        maybe_enable_gradient_checkpointing,
+        resolve_amp_dtype,
+    )
 
 
 @dataclass
@@ -43,6 +63,14 @@ class TrainObjectiveConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
     lr_warmup_steps: int = 0
+    optimizer_name: str = "auto"
+    amp_enabled: bool = True
+    amp_dtype: str = "float16"
+    torch_compile_enabled: bool = False
+    torch_compile_mode: str = "default"
+    torch_compile_fullgraph: bool = False
+    gradient_checkpointing: bool = False
+    cudnn_benchmark: bool = True
     static_mode: bool = False
     sca_use_cuda: bool = False
     biological_targets: Dict[str, Any] = field(
@@ -71,6 +99,14 @@ class TrainObjectiveConfig:
         self.weight_decay = float(self.weight_decay)
         self.max_grad_norm = float(self.max_grad_norm)
         self.lr_warmup_steps = max(int(self.lr_warmup_steps), 0)
+        self.optimizer_name = str(self.optimizer_name)
+        self.amp_enabled = bool(self.amp_enabled)
+        self.amp_dtype = str(self.amp_dtype)
+        self.torch_compile_enabled = bool(self.torch_compile_enabled)
+        self.torch_compile_mode = str(self.torch_compile_mode)
+        self.torch_compile_fullgraph = bool(self.torch_compile_fullgraph)
+        self.gradient_checkpointing = bool(self.gradient_checkpointing)
+        self.cudnn_benchmark = bool(self.cudnn_benchmark)
         self.sca_use_cuda = bool(self.sca_use_cuda)
         self.static_mode = bool(self.static_mode)
         self.objective.static_mode = bool(self.static_mode or self.objective.static_mode)
@@ -90,7 +126,13 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainObjectiveConfig) -> Tuple[
     params = [param for param in model.parameters() if param.requires_grad]
     if not params:
         raise RuntimeError("No trainable parameters found for objective optimization")
-    optimizer = AdamW(params, lr=float(cfg.lr), weight_decay=float(cfg.weight_decay))
+    optimizer, metadata = build_runtime_optimizer(
+        params,
+        optimizer_name=str(cfg.optimizer_name),
+        lr=float(cfg.lr),
+        weight_decay=float(cfg.weight_decay),
+    )
+    setattr(optimizer, "_performance_metadata", metadata)
     warmup = int(cfg.lr_warmup_steps)
 
     def _schedule(step: int) -> float:
@@ -129,11 +171,24 @@ def train_objective_loop(
     train_config: TrainObjectiveConfig,
     output_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    model.train()
+    configure_runtime_environment(cudnn_benchmark=bool(train_config.cudnn_benchmark))
     device = _infer_device(model)
+    maybe_enable_gradient_checkpointing(model, enabled=bool(train_config.gradient_checkpointing))
+    model = maybe_compile_module(
+        model,
+        enabled=bool(train_config.torch_compile_enabled),
+        mode=str(train_config.torch_compile_mode),
+        fullgraph=bool(train_config.torch_compile_fullgraph),
+    )
+    model.train()
+    amp_enabled, amp_dtype = resolve_amp_dtype(device=device, requested=str(train_config.amp_dtype))
+    scaler = build_grad_scaler(enabled=bool(train_config.amp_enabled and amp_enabled))
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
     history: List[Dict[str, Any]] = []
     data_iter = iter(dataloader)
     optimizer.zero_grad(set_to_none=True)
+    started_at = time.perf_counter()
+    total_tokens = 0
 
     for step in range(int(train_config.max_steps)):
         try:
@@ -144,21 +199,28 @@ def train_objective_loop(
         batch = _move_batch_to_device(batch, device)
         input_ids = batch["input_ids"]
         attention_mask = batch.get("attention_mask")
+        batch_tokens = int(attention_mask.sum().item()) if attention_mask is not None else int(input_ids.numel())
+        total_tokens += batch_tokens
 
-        outputs = model.forward_dual_stream(input_ids=input_ids, attention_mask=attention_mask)
-        adapted_logits = outputs["adapted_logits"]
-        base_logits = outputs["base_logits"]
-        bio_stats = dict(outputs.get("bio_stats", {}))
+        with autocast_context(
+            device=device,
+            enabled=bool(train_config.amp_enabled and amp_enabled),
+            amp_dtype=amp_dtype,
+        ):
+            outputs = model.forward_dual_stream(input_ids=input_ids, attention_mask=attention_mask)
+            adapted_logits = outputs["adapted_logits"]
+            base_logits = outputs["base_logits"]
+            bio_stats = dict(outputs.get("bio_stats", {}))
 
-        adapted_shift, labels_shift, mask_shift = _next_token_views(adapted_logits, input_ids, attention_mask)
-        base_shift, _, _ = _next_token_views(base_logits, input_ids, attention_mask)
+            adapted_shift, labels_shift, mask_shift = _next_token_views(adapted_logits, input_ids, attention_mask)
+            base_shift, _, _ = _next_token_views(base_logits, input_ids, attention_mask)
 
-        lm_loss = compute_lm_loss(adapted_shift, labels_shift)
-        kl_loss = compute_kl_loss(adapted_shift, base_shift, attention_mask=mask_shift)
-        entropy_loss = compute_entropy_loss(adapted_shift, attention_mask=mask_shift)
-        bio_loss = compute_biological_loss(bio_stats, train_config.biological_targets).to(device=adapted_shift.device)
-        ppl_drift = compute_ppl_drift(adapted_shift, base_shift, labels_shift)
-        token_entropy = compute_token_entropy(adapted_shift, attention_mask=mask_shift)
+            lm_loss = compute_lm_loss(adapted_shift, labels_shift)
+            kl_loss = compute_kl_loss(adapted_shift, base_shift, attention_mask=mask_shift)
+            entropy_loss = compute_entropy_loss(adapted_shift, attention_mask=mask_shift)
+            bio_loss = compute_biological_loss(bio_stats, train_config.biological_targets).to(device=adapted_shift.device)
+            ppl_drift = compute_ppl_drift(adapted_shift, base_shift, labels_shift)
+            token_entropy = compute_token_entropy(adapted_shift, attention_mask=mask_shift)
 
         coeffs = objective_scheduler.step(
             {
@@ -179,12 +241,17 @@ def train_objective_loop(
         if not torch.isfinite(total_loss):
             raise RuntimeError(f"Non-finite total loss at step {step + 1}")
 
-        total_loss.backward()
-        if float(train_config.max_grad_norm) > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(train_config.max_grad_norm))
-        optimizer.step()
+        backward_step(
+            total_loss,
+            optimizer=optimizer,
+            scaler=scaler,
+            params=trainable_params,
+            max_grad_norm=float(train_config.max_grad_norm),
+        )
         lr_scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        elapsed = max(time.perf_counter() - started_at, 1e-6)
+        tokens_per_second = float(total_tokens / elapsed)
 
         history.append(
             {
@@ -196,6 +263,7 @@ def train_objective_loop(
                 "bio_loss": float(bio_loss.detach().cpu().item()),
                 "ppl_drift": float(ppl_drift.detach().cpu().item()),
                 "token_entropy": float(token_entropy.detach().cpu().item()),
+                "tokens_per_second": tokens_per_second,
                 **{k: float(v) for k, v in coeffs.items()},
             }
         )
@@ -212,7 +280,15 @@ def train_objective_loop(
                 history_tail=history[-min(len(history), 16) :],
             )
 
-    return {"steps_completed": int(train_config.max_steps), "history": history}
+    return {
+        "steps_completed": int(train_config.max_steps),
+        "history": history,
+        "tokens_processed": int(total_tokens),
+        "tokens_per_second": float(total_tokens / max(time.perf_counter() - started_at, 1e-6)),
+        "optimizer": dict(getattr(optimizer, "_performance_metadata", {})),
+        "amp_enabled": bool(getattr(scaler, "is_enabled", lambda: False)()),
+        "amp_dtype": str(amp_dtype).replace("torch.", ""),
+    }
 
 
 def save_objective_checkpoint(

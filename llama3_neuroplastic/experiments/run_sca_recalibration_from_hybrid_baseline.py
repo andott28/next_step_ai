@@ -11,7 +11,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -21,9 +20,31 @@ except ImportError:  # pragma: no cover
     load_dataset = None
 
 try:
+    from ..performance_utils import (
+        autocast_context,
+        backward_step,
+        build_grad_scaler,
+        build_optimizer as build_runtime_optimizer,
+        configure_runtime_environment,
+        maybe_compile_module,
+        maybe_enable_gradient_checkpointing,
+        resolve_amp_dtype,
+        resolve_dataloader_kwargs,
+    )
     from .neuroplastic_llama_gqa_mamba import NeuroplasticLlama
     from .strict_decode_metrics import evaluate_decode_prefixes, final_hidden_cosine
 except ImportError:  # pragma: no cover
+    from llama3_neuroplastic.performance_utils import (
+        autocast_context,
+        backward_step,
+        build_grad_scaler,
+        build_optimizer as build_runtime_optimizer,
+        configure_runtime_environment,
+        maybe_compile_module,
+        maybe_enable_gradient_checkpointing,
+        resolve_amp_dtype,
+        resolve_dataloader_kwargs,
+    )
     from neuroplastic_llama_gqa_mamba import NeuroplasticLlama
     from strict_decode_metrics import evaluate_decode_prefixes, final_hidden_cosine
 
@@ -42,6 +63,17 @@ class SCALocalRecalibrationConfig:
     lr: float = 1e-5
     weight_decay: float = 0.0
     grad_clip: float = 1.0
+    optimizer_name: str = "auto"
+    amp_enabled: bool = True
+    amp_dtype: str = "float16"
+    gradient_checkpointing: bool = False
+    torch_compile_enabled: bool = False
+    torch_compile_mode: str = "default"
+    torch_compile_fullgraph: bool = False
+    cudnn_benchmark: bool = True
+    dataloader_num_workers: int = -1
+    dataloader_prefetch_factor: int = 2
+    dataloader_persistent_workers: bool = True
     task_id: int = 0
     include_task_embedding: bool = False
     include_spatial_proj: bool = True
@@ -159,6 +191,27 @@ def _parse_args() -> SCALocalRecalibrationConfig:
     p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument(
+        "--optimizer-name",
+        type=str,
+        default="auto",
+        choices=["auto", "adamw", "adam8bit", "adamw8bit", "paged_adamw8bit"],
+    )
+    p.add_argument("--amp-enabled", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--amp-dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"])
+    p.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--torch-compile-enabled", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument(
+        "--torch-compile-mode",
+        type=str,
+        default="default",
+        choices=["default", "reduce-overhead", "max-autotune"],
+    )
+    p.add_argument("--torch-compile-fullgraph", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--cudnn-benchmark", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--dataloader-num-workers", type=int, default=-1)
+    p.add_argument("--dataloader-prefetch-factor", type=int, default=2)
+    p.add_argument("--dataloader-persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--task-id", type=int, default=0)
     p.add_argument("--include-task-embedding", action="store_true")
     p.add_argument("--include-spatial-proj", action=argparse.BooleanOptionalAction, default=True)
@@ -323,6 +376,9 @@ def _build_dataloader(
     max_seq_length: int,
     batch_size: int,
     max_samples: int,
+    dataloader_num_workers: int,
+    dataloader_prefetch_factor: int,
+    dataloader_persistent_workers: bool,
 ) -> DataLoader:
     if load_dataset is None:
         raise RuntimeError("datasets package is required for SCA recalibration")
@@ -344,10 +400,12 @@ def _build_dataloader(
     tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
     return DataLoader(
         tokenized,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=torch.cuda.is_available(),
+        **resolve_dataloader_kwargs(
+            batch_size=int(batch_size),
+            num_workers=int(dataloader_num_workers),
+            prefetch_factor=int(dataloader_prefetch_factor),
+            persistent_workers=bool(dataloader_persistent_workers),
+        ),
     )
 
 
@@ -1117,6 +1175,7 @@ def main() -> None:
     print("DEBUG: Entering main")
     cfg = _parse_args()
     print(f"DEBUG: Parsed args. Output dir: {cfg.output_dir}")
+    configure_runtime_environment(cudnn_benchmark=bool(cfg.cudnn_benchmark))
     _set_seed(cfg.seed)
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1185,6 +1244,10 @@ def main() -> None:
     model.strict_decode_enable_repetition_penalty = False
     model.strict_decode_upper_layer_cap_enabled = bool(cfg.strict_decode_upper_layer_cap_enabled)
     _configure_strict_runtime_parity(model, cfg)
+    gradient_checkpointing_enabled = maybe_enable_gradient_checkpointing(
+        model,
+        enabled=bool(cfg.gradient_checkpointing),
+    )
 
     selected_layers = _choose_layer_selection(model, selected_layers)
     speech_anchor_layers = _choose_speech_anchor_layers(
@@ -1209,6 +1272,14 @@ def main() -> None:
         recalibration_mode=cfg.recalibration_mode,
         hybrid_checkpoint_path=cfg.hybrid_checkpoint,
     )
+    model = maybe_compile_module(
+        model,
+        enabled=bool(cfg.torch_compile_enabled),
+        mode=str(cfg.torch_compile_mode),
+        fullgraph=bool(cfg.torch_compile_fullgraph),
+    )
+    amp_enabled, amp_dtype = resolve_amp_dtype(device=model.device, requested=str(cfg.amp_dtype))
+    scaler = build_grad_scaler(enabled=bool(cfg.amp_enabled and amp_enabled))
 
     if cfg.recalibration_mode == "export_only" or int(cfg.steps) <= 0:
         metrics = {
@@ -1224,6 +1295,10 @@ def main() -> None:
             "estimated_bytes_fetched_per_token": 0.0,
             "fallback_rate_by_layer": {},
             "elapsed_seconds": float(time.perf_counter() - t0),
+            "optimizer": {},
+            "amp_enabled": bool(getattr(scaler, "is_enabled", lambda: False)()),
+            "amp_dtype": str(amp_dtype).replace("torch.", ""),
+            "gradient_checkpointing_enabled": bool(gradient_checkpointing_enabled),
             "config": asdict(cfg),
         }
         state_path, metrics_path = _save_artifacts(model, out_dir, metrics)
@@ -1256,6 +1331,9 @@ def main() -> None:
         max_seq_length=cfg.max_seq_length,
         batch_size=cfg.batch_size,
         max_samples=cfg.max_samples,
+        dataloader_num_workers=int(cfg.dataloader_num_workers),
+        dataloader_prefetch_factor=int(cfg.dataloader_prefetch_factor),
+        dataloader_persistent_workers=bool(cfg.dataloader_persistent_workers),
     )
     cached_batches = _collect_batches(dataloader, max_batches=max(cfg.steps, 1))
     smoke_prompts = [
@@ -1305,6 +1383,7 @@ def main() -> None:
     latent_support_unique_fraction_values: List[float] = []
     nonfinite_events = 0
     skipped_dense_kl_steps = 0
+    tokens_processed = 0
 
     total_steps = int(cfg.steps)
     global_step = 0
@@ -1315,7 +1394,13 @@ def main() -> None:
         list(stage_plan[0].get("active_sparse_layers", stage_plan[0]["layers"])) if stage_plan else list(selected_layers)
     )
     active_stage_lr_scale = float(stage_plan[0]["lr_scale"]) if stage_plan else 1.0
-    optimizer = AdamW(trainable, lr=float(cfg.lr) * float(active_stage_lr_scale), weight_decay=cfg.weight_decay)
+    optimizer, optimizer_meta = build_runtime_optimizer(
+        list(trainable),
+        optimizer_name=str(cfg.optimizer_name),
+        lr=float(cfg.lr) * float(active_stage_lr_scale),
+        weight_decay=float(cfg.weight_decay),
+    )
+    setattr(optimizer, "_performance_metadata", dict(optimizer_meta))
     _enforce_stage1_decode_scale_freeze(model, cfg=cfg, selected_layers=selected_layers, active_layers=train_stage_layers)
     model.configure_sparse_block_banking(
         enabled=bool(cfg.block_banking_enabled),
@@ -1345,7 +1430,13 @@ def main() -> None:
                 recalibration_mode=cfg.recalibration_mode,
                 hybrid_checkpoint_path=cfg.hybrid_checkpoint,
             )
-            optimizer = AdamW(trainable, lr=float(cfg.lr) * float(active_stage_lr_scale), weight_decay=cfg.weight_decay)
+            optimizer, optimizer_meta = build_runtime_optimizer(
+                list(trainable),
+                optimizer_name=str(cfg.optimizer_name),
+                lr=float(cfg.lr) * float(active_stage_lr_scale),
+                weight_decay=float(cfg.weight_decay),
+            )
+            setattr(optimizer, "_performance_metadata", dict(optimizer_meta))
             _enforce_stage1_decode_scale_freeze(model, cfg=cfg, selected_layers=selected_layers, active_layers=train_stage_layers)
             if cfg.verbose:
                 print(
@@ -1364,6 +1455,7 @@ def main() -> None:
         batch = cached_batches[step % len(cached_batches)]
         input_ids = batch["input_ids"].to(model.device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(model.device, non_blocking=True)
+        tokens_processed += int(attention_mask.sum().item()) if attention_mask is not None else int(input_ids.numel())
         labels = input_ids.masked_fill(attention_mask == 0, -100)
         decode_manifold_mode = cfg.recalibration_mode == "decode_manifold_alignment"
         aux: Dict[str, Any] = {}
@@ -1384,28 +1476,38 @@ def main() -> None:
             if use_teacher_kl or use_teacher_cos:
                 model.neuroplasticity_enabled = False
                 with torch.no_grad():
-                    dense_out = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        use_cache=False,
-                        return_dict=True,
-                        output_hidden_states=bool(use_teacher_cos),
-                        task_id=int(cfg.task_id),
-                    )
+                    with autocast_context(
+                        device=model.device,
+                        enabled=bool(cfg.amp_enabled and amp_enabled),
+                        amp_dtype=amp_dtype,
+                    ):
+                        dense_out = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                            return_dict=True,
+                            output_hidden_states=bool(use_teacher_cos),
+                            task_id=int(cfg.task_id),
+                        )
             model.neuroplasticity_enabled = True
-            sparse_out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-                output_hidden_states=bool(use_teacher_cos),
-                task_id=int(cfg.task_id),
-            )
-            ce_loss = model.model.loss_function(
-                logits=sparse_out.logits,
-                labels=labels,
-                vocab_size=int(model.model.config.vocab_size),
-            )
+            with autocast_context(
+                device=model.device,
+                enabled=bool(cfg.amp_enabled and amp_enabled),
+                amp_dtype=amp_dtype,
+            ):
+                sparse_out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                    output_hidden_states=bool(use_teacher_cos),
+                    task_id=int(cfg.task_id),
+                )
+                ce_loss = model.model.loss_function(
+                    logits=sparse_out.logits,
+                    labels=labels,
+                    vocab_size=int(model.model.config.vocab_size),
+                )
             teacher_kl = torch.zeros((), device=model.device, dtype=torch.float32)
             if use_teacher_kl and dense_out is not None:
                 teacher_kl_tensor = F.kl_div(
@@ -1495,14 +1597,19 @@ def main() -> None:
                 prev_enabled = model.neuroplasticity_enabled
                 model.neuroplasticity_enabled = False
                 with torch.no_grad():
-                    dense_out = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        use_cache=False,
-                        return_dict=True,
-                        output_hidden_states=bool(use_speech_anchor),
-                        task_id=int(cfg.task_id),
-                    )
+                    with autocast_context(
+                        device=model.device,
+                        enabled=bool(cfg.amp_enabled and amp_enabled),
+                        amp_dtype=amp_dtype,
+                    ):
+                        dense_out = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                            return_dict=True,
+                            output_hidden_states=bool(use_speech_anchor),
+                            task_id=int(cfg.task_id),
+                        )
                     if use_logits_kl and step >= int(cfg.logits_warmup_steps):
                         dense_logits = dense_out.logits.detach().float()
                         if not torch.isfinite(dense_logits).all():
@@ -1522,14 +1629,19 @@ def main() -> None:
             sparse_out = None
             retries = int(max(0, cfg.nonfinite_max_retries_per_step))
             for attempt in range(retries + 1):
-                candidate = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    return_dict=True,
-                    output_hidden_states=bool(use_speech_anchor),
-                    task_id=int(cfg.task_id),
-                )
+                with autocast_context(
+                    device=model.device,
+                    enabled=bool(cfg.amp_enabled and amp_enabled),
+                    amp_dtype=amp_dtype,
+                ):
+                    candidate = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        use_cache=False,
+                        return_dict=True,
+                        output_hidden_states=bool(use_speech_anchor),
+                        task_id=int(cfg.task_id),
+                    )
                 if torch.isfinite(candidate.logits).all():
                     sparse_out = candidate
                     break
@@ -1650,35 +1762,46 @@ def main() -> None:
             raise RuntimeError(f"Non-finite total loss at step {step+1}")
 
         optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        _mask_layer_output_scale_grad(model, train_stage_layers)
-        if cfg.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=float(cfg.grad_clip))
-        optimizer.step()
+        backward_step(
+            total_loss,
+            optimizer=optimizer,
+            scaler=scaler,
+            params=trainable,
+            max_grad_norm=float(cfg.grad_clip),
+            after_unscale=lambda: _mask_layer_output_scale_grad(model, train_stage_layers),
+        )
         _apply_output_scale_caps(model, cfg=cfg, selected_layers=selected_layers)
         _enforce_stage1_decode_scale_freeze(model, cfg=cfg, selected_layers=selected_layers, active_layers=train_stage_layers)
 
         if do_rollout_step:
             rollout_prompts = smoke_prompts[:1]
             optimizer.zero_grad(set_to_none=True)
-            rollout_kl, rollout_entropy_penalty, rollout_quality = _compute_rollout_refinement_kl(
-                model=model,
-                tokenizer=tokenizer,
-                prompts=rollout_prompts,
-                task_id=int(cfg.task_id),
-                max_new_tokens=int(cfg.rollout_max_new_tokens),
-                entropy_floor=float(cfg.entropy_floor),
-            )
+            with autocast_context(
+                device=model.device,
+                enabled=bool(cfg.amp_enabled and amp_enabled),
+                amp_dtype=amp_dtype,
+            ):
+                rollout_kl, rollout_entropy_penalty, rollout_quality = _compute_rollout_refinement_kl(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompts=rollout_prompts,
+                    task_id=int(cfg.task_id),
+                    max_new_tokens=int(cfg.rollout_max_new_tokens),
+                    entropy_floor=float(cfg.entropy_floor),
+                )
             if bool(torch.isfinite(rollout_kl)) and bool(getattr(rollout_kl, "requires_grad", False)):
                 rollout_loss = (
                     float(cfg.rollout_kl_weight) * rollout_kl
                     + float(cfg.rollout_entropy_floor_weight) * rollout_entropy_penalty
                 )
-                rollout_loss.backward()
-                _mask_layer_output_scale_grad(model, train_stage_layers)
-                if cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(trainable, max_norm=float(cfg.grad_clip))
-                optimizer.step()
+                backward_step(
+                    rollout_loss,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    params=trainable,
+                    max_grad_norm=float(cfg.grad_clip),
+                    after_unscale=lambda: _mask_layer_output_scale_grad(model, train_stage_layers),
+                )
                 _apply_output_scale_caps(model, cfg=cfg, selected_layers=selected_layers)
                 _enforce_stage1_decode_scale_freeze(model, cfg=cfg, selected_layers=selected_layers, active_layers=train_stage_layers)
                 aux["rollout_kl"] = float(rollout_kl.detach().cpu().item())
@@ -1711,6 +1834,7 @@ def main() -> None:
         latent_support_unique_fraction_values.append(float(sparse_diag.get("mean_latent_support_unique_fraction", 0.0)))
 
         if cfg.verbose or step == 0 or (step + 1) % 10 == 0:
+            elapsed = max(time.perf_counter() - t0, 1e-6)
             print(
                 f"[sca-recal] step={step+1}/{cfg.steps} "
                 f"stage={stage_plan[stage_idx]['name'] if stage_plan else 'full'} "
@@ -1719,7 +1843,8 @@ def main() -> None:
                 f"speech={aux.get('speech_anchor_loss', 0.0):.6f} "
                 f"ce={aux.get('ce_loss', 0.0):.6f} "
                 f"rollout_kl={aux.get('rollout_kl', 0.0):.6f} "
-                f"fallback={aux.get('fallback_rate', 0.0):.4f}"
+                f"fallback={aux.get('fallback_rate', 0.0):.4f} "
+                f"tok_s={tokens_processed / elapsed:.1f}"
             )
         stage_remaining -= 1
         global_step += 1
@@ -1749,6 +1874,12 @@ def main() -> None:
                 "fallback_rate_by_layer": {
                     k: float(sum(v) / max(len(v), 1)) for k, v in fallback_accum.items()
                 },
+                "tokens_processed": int(tokens_processed),
+                "tokens_per_second": float(tokens_processed / max(time.perf_counter() - t0, 1e-6)),
+                "optimizer": dict(getattr(optimizer, "_performance_metadata", {})),
+                "amp_enabled": bool(getattr(scaler, "is_enabled", lambda: False)()),
+                "amp_dtype": str(amp_dtype).replace("torch.", ""),
+                "gradient_checkpointing_enabled": bool(gradient_checkpointing_enabled),
                 "elapsed_seconds": float(time.perf_counter() - t0),
                 "layer_selection": selected_layers,
                 "stage_plan": stage_plan,
@@ -1788,6 +1919,12 @@ def main() -> None:
         "skipped_dense_kl_steps": int(skipped_dense_kl_steps),
         "fallback_rate_by_layer": fallback_rate_by_layer,
         "fallback_warning_layers_over_50pct": warned_layers,
+        "tokens_processed": int(tokens_processed),
+        "tokens_per_second": float(tokens_processed / max(time.perf_counter() - t0, 1e-6)),
+        "optimizer": dict(getattr(optimizer, "_performance_metadata", {})),
+        "amp_enabled": bool(getattr(scaler, "is_enabled", lambda: False)()),
+        "amp_dtype": str(amp_dtype).replace("torch.", ""),
+        "gradient_checkpointing_enabled": bool(gradient_checkpointing_enabled),
         "elapsed_seconds": float(time.perf_counter() - t0),
         "mean_rollout_kl": float(sum(rollout_kl_values) / max(len(rollout_kl_values), 1)) if rollout_kl_values else 0.0,
         "mean_rollout_entropy_penalty": float(sum(rollout_entropy_values) / max(len(rollout_entropy_values), 1))

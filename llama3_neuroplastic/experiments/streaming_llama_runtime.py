@@ -5,7 +5,7 @@ import gc
 import json
 import os
 import threading
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -29,6 +29,18 @@ try:
     from ..gqa_taylor_ssd import GQATaylorSSDSelfAttention, TaylorSSDLayerCache
 except ImportError:  # pragma: no cover
     from gqa_taylor_ssd import GQATaylorSSDSelfAttention, TaylorSSDLayerCache
+
+def _resolve_ram_cache_limit_bytes() -> Optional[int]:
+    raw = os.getenv("STREAMING_RAM_CACHE_MAX_GB", "").strip()
+    if raw:
+        try:
+            limit_gb = float(raw)
+        except ValueError:
+            limit_gb = 0.0
+        if limit_gb > 0:
+            return int(limit_gb * (1024 ** 3))
+        return None
+    return None
 
 
 def _resolve_snapshot_dir(model_name_or_path: str, *, local_files_only: bool) -> Path:
@@ -79,8 +91,27 @@ class ShardedSafetensorLoader:
         # After the first forward pass all weights live here; subsequent tokens
         # do RAM→GPU transfers instead of SSD→GPU (typically 5–10× faster).
         self._ram_cache: Dict[str, Tuple[torch.Tensor, Dict[str, torch.Tensor]]] = {}
+        self._ram_cache_lru: "OrderedDict[str, None]" = OrderedDict()
+        self._ram_cache_entry_bytes: Dict[str, int] = {}
+        self._ram_cache_current_bytes: int = 0
+        self._ram_cache_limit_bytes: Optional[int] = _resolve_ram_cache_limit_bytes()
         self._ram_cache_enabled: bool = True
         self._ram_cache_lock = threading.Lock()
+
+    @staticmethod
+    def _entry_nbytes(weight: torch.Tensor, quant_aux: Dict[str, torch.Tensor]) -> int:
+        total = int(weight.numel() * weight.element_size())
+        for tensor in quant_aux.values():
+            total += int(tensor.numel() * tensor.element_size())
+        return total
+
+    def _evict_ram_cache_locked(self) -> None:
+        if self._ram_cache_limit_bytes is None:
+            return
+        while self._ram_cache_current_bytes > self._ram_cache_limit_bytes and self._ram_cache_lru:
+            victim, _ = self._ram_cache_lru.popitem(last=False)
+            self._ram_cache.pop(victim, None)
+            self._ram_cache_current_bytes -= self._ram_cache_entry_bytes.pop(victim, 0)
 
     def _load_exact_tensors(self, names: Sequence[str]) -> Dict[str, torch.Tensor]:
         requested = [str(name) for name in names if str(name) in self._available_names]
@@ -101,7 +132,10 @@ class ShardedSafetensorLoader:
 
             with safe_open(str(shard_path), framework="pt", device="cpu") as handle:
                 for key in shard_keys:
-                    out[key] = handle.get_tensor(key)
+                    tensor = handle.get_tensor(key)
+                    if os.name == "nt":
+                        tensor = tensor.clone().contiguous()
+                    out[key] = tensor
         return out
 
     def load_parameter(self, name: str) -> torch.Tensor:
@@ -123,6 +157,8 @@ class ShardedSafetensorLoader:
         if self._ram_cache_enabled:
             with self._ram_cache_lock:
                 cached = self._ram_cache.get(full_name)
+                if cached is not None and self._ram_cache_limit_bytes is not None:
+                    self._ram_cache_lru.move_to_end(full_name, last=True)
             if cached is not None:
                 weight, quant_aux = cached
                 return weight, dict(quant_aux)
@@ -136,7 +172,7 @@ class ShardedSafetensorLoader:
         quant_aux = {k: v for k, v in tensors.items() if k != full_name}
 
         if self._ram_cache_enabled:
-            if os.name == "nt":
+            if os.name == "nt" and self._cache_shard_handles:
                 weight = weight.clone().contiguous()
                 quant_aux = {k: v.clone().contiguous() for k, v in quant_aux.items()}
             # Store as plain CPU tensors — no pin_memory() to avoid CUDA driver
@@ -144,7 +180,19 @@ class ShardedSafetensorLoader:
             # with GPU kernels on the main thread and risk OOM on Windows.
             # Plain RAM→GPU DMA is still 5–10× faster than SSD→GPU.
             with self._ram_cache_lock:
+                cached = self._ram_cache.get(full_name)
+                if cached is not None:
+                    if self._ram_cache_limit_bytes is not None:
+                        self._ram_cache_lru.move_to_end(full_name, last=True)
+                    weight_cached, quant_aux_cached = cached
+                    return weight_cached, dict(quant_aux_cached)
                 self._ram_cache[full_name] = (weight, quant_aux)
+                if self._ram_cache_limit_bytes is not None:
+                    self._ram_cache_lru[full_name] = None
+                    self._ram_cache_lru.move_to_end(full_name, last=True)
+                    self._ram_cache_entry_bytes[full_name] = self._entry_nbytes(weight, quant_aux)
+                    self._ram_cache_current_bytes += self._ram_cache_entry_bytes[full_name]
+                    self._evict_ram_cache_locked()
             return weight, dict(quant_aux)
 
         return weight, dict(quant_aux)
@@ -301,6 +349,7 @@ class StreamingLlamaRuntime:
         taylor_state_decay: float = 1.0,
         local_files_only: bool = True,
         ram_cache: bool = True,
+        materialize_lm_head: bool = True,
         sparse_basis_path: Optional[str] = None,
         sparse_top_k: Optional[int] = None,
         attn_head_importance_path: Optional[str] = None,
@@ -348,6 +397,7 @@ class StreamingLlamaRuntime:
             self.loader.load_parameter("model.embed_tokens.weight").to(dtype=self.dtype)
         )
         self.embed_tokens.requires_grad_(False)
+        self._materialize_lm_head = bool(materialize_lm_head)
 
         self.norm = LlamaRMSNorm(int(self.config.hidden_size), eps=float(self.config.rms_norm_eps)).to(
             device=self.device,
@@ -359,20 +409,22 @@ class StreamingLlamaRuntime:
         self.norm.requires_grad_(False)
 
         # Keep lm_head on CPU alongside embed_tokens — projection is done on CPU at end of forward.
-        self.lm_head = nn.Linear(int(self.config.hidden_size), int(self.config.vocab_size), bias=False)
-        lm_head_weight_name = (
-            "lm_head.weight"
-            if "lm_head.weight" in self.loader.weight_map
-            else "model.embed_tokens.weight"
-        )
-        if lm_head_weight_name == "model.embed_tokens.weight":
-            self.lm_head.weight = self.embed_tokens.weight
-        else:
-            self.lm_head.to(device=torch.device("cpu"), dtype=self.dtype)
-            self.lm_head.weight.data.copy_(
-                self.loader.load_parameter(lm_head_weight_name).to(dtype=self.dtype)
+        self.lm_head: Optional[nn.Linear] = None
+        if self._materialize_lm_head:
+            self.lm_head = nn.Linear(int(self.config.hidden_size), int(self.config.vocab_size), bias=False)
+            lm_head_weight_name = (
+                "lm_head.weight"
+                if "lm_head.weight" in self.loader.weight_map
+                else "model.embed_tokens.weight"
             )
-        self.lm_head.requires_grad_(False)
+            if lm_head_weight_name == "model.embed_tokens.weight":
+                self.lm_head.weight = self.embed_tokens.weight
+            else:
+                self.lm_head.to(device=torch.device("cpu"), dtype=self.dtype)
+                self.lm_head.weight.data.copy_(
+                    self.loader.load_parameter(lm_head_weight_name).to(dtype=self.dtype)
+                )
+            self.lm_head.requires_grad_(False)
 
         self.rotary_emb = LlamaRotaryEmbedding(self.config, device=self.device)
         self._taylor_caches: List[Optional[TaylorSSDLayerCache]] = [None for _ in range(self.num_layers)]
@@ -466,7 +518,11 @@ class StreamingLlamaRuntime:
         # exclusively (--sparse-basis-path) so the dense path is never reached there.
         _ffn = int(getattr(self.config, "intermediate_size", _h * 4))
         self._mlp_proj_staging: Optional[torch.Tensor] = None
-        if torch.cuda.is_available():
+        # Skip the ~1.6 GB MLP staging buffer when sparse routing is active —
+        # sparse inference never uses _dense_mlp_forward_streaming_fast, and
+        # skipping this allocation saves critical VRAM on 8 GB cards.
+        _skip_mlp_staging = bool(sparse_basis_path and str(sparse_basis_path).strip())
+        if torch.cuda.is_available() and not _skip_mlp_staging:
             try:
                 self._mlp_proj_staging = torch.empty(
                     _ffn * _h, dtype=self.dtype, device=self.device
@@ -520,11 +576,13 @@ class StreamingLlamaRuntime:
                 if not (0 <= _lidx < self.num_layers):
                     continue
                 self._sparse_routing[_lidx] = {
-                    # Move routing weights to GPU at init time so _route_sparse_mlp
-                    # never pays the CPU→GPU transfer cost during the hot loop.
-                    "enc_w": _state["encoder_weight"].to(dtype=self.dtype, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")),  # [R, H]
-                    "enc_b": _state["encoder_bias"].to(dtype=self.dtype, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")),    # [R]
-                    "dec":   _state["decoder_blocks"].to(dtype=self.dtype, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")),  # [B, R, S]
+                    # Keep on CPU — each layer's routing tensors are ~12 MB total
+                    # (enc_w [96,16384] + dec [1664,96,32]). Storing all 83 layers
+                    # on GPU would consume ~1 GB of VRAM permanently. Transfer is
+                    # done lazily per-layer in _route_sparse_mlp (~12 MB/layer).
+                    "enc_w": _state["encoder_weight"].to(dtype=self.dtype),  # [R, H] CPU
+                    "enc_b": _state["encoder_bias"].to(dtype=self.dtype),    # [R]    CPU
+                    "dec":   _state["decoder_blocks"].to(dtype=self.dtype),  # [B, R, S] CPU
                 }
             _pct = int(round(self._sparse_top_k * 100 / max(_num_blocks, 1)))
             print(f"[sparse] loaded routing for {len(self._sparse_routing)}/{self.num_layers} layers "
@@ -623,10 +681,10 @@ class StreamingLlamaRuntime:
         if routing is None:
             return None
 
-        # Routing tensors are already on the device (moved at init time).
-        enc_w = routing["enc_w"]  # [R, H]
-        enc_b = routing["enc_b"]  # [R]
-        dec   = routing["dec"]    # [B, R, S]
+        # Transfer routing tensors for this layer from CPU to GPU (~12 MB).
+        enc_w = routing["enc_w"].to(device=self.device, non_blocking=True)  # [R, H]
+        enc_b = routing["enc_b"].to(device=self.device, non_blocking=True)  # [R]
+        dec   = routing["dec"].to(device=self.device, non_blocking=True)    # [B, R, S]
 
         N = hidden.shape[0] * hidden.shape[1]
         h = hidden.view(N, -1).to(dtype=enc_w.dtype)
@@ -960,27 +1018,24 @@ class StreamingLlamaRuntime:
         if gate_proj is None or up_proj is None or down_proj is None:
             return self._dense_mlp_forward_streaming(mlp, hidden)
         if self._mlp_proj_staging is None:
-            # VRAM-constrained fallback: return zeros so the residual stream passes
-            # through unchanged.  Acceptable for attention head importance calibration
-            # (the hook fires on attention projections, not MLP).  Not used during
-            # inference when --sparse-basis-path is provided.
-            return torch.zeros_like(hidden)
+            # No staging buffer (sparse mode or VRAM-constrained): fall back to
+            # the streaming dense path which transfers one weight at a time.
+            return self._dense_mlp_forward_streaming(mlp, hidden)
 
         flat_hidden = hidden.view(-1, hidden.shape[-1])
         prefix = f"model.layers.{int(layer_idx)}.mlp."
 
-        # Allocate a single transient GPU buffer sized for the largest projection.
-        # All three projections share this buffer sequentially; it is freed after the
-        # MLP forward.  PyTorch's caching allocator reuses the same block across layers
-        # (same size each call), so fragmentation is not a concern.
-        # Using copy_() from CPU avoids a second GPU allocation that `.to(device=gpu)`
-        # would require — the copy is a direct DMA without an intermediate staging tensor.
+        # Reuse the pre-allocated projection staging buffer. This avoids a large
+        # cudaMalloc/free per layer invocation and keeps the collector on a stable
+        # memory footprint during long streaming runs.
         max_numel = max(
             gate_proj.weight.numel(),
             up_proj.weight.numel(),
             down_proj.weight.numel(),
         )
-        staging = torch.empty(max_numel, dtype=self.dtype, device=self.device)
+        if self._mlp_proj_staging is None or int(self._mlp_proj_staging.numel()) < int(max_numel):
+            raise RuntimeError("MLP projection staging buffer is unavailable or undersized")
+        staging = self._mlp_proj_staging[:max_numel]
 
         def _linear_stream(x: torch.Tensor, linear: nn.Module, param_name: str) -> torch.Tensor:
             weight = getattr(linear, "weight", None)
@@ -1007,7 +1062,6 @@ class StreamingLlamaRuntime:
         act = F.silu(gate) * up
         del gate, up
         out = _linear_stream(act, down_proj, f"{prefix}down_proj.weight")
-        del staging
         return out.view_as(hidden)
 
     # ── Sparse Attention Head helpers ─────────────────────────────────────────
@@ -1393,12 +1447,17 @@ class StreamingLlamaRuntime:
             print("", flush=True)
         hidden = self.norm(hidden)
         # Move the 32 KB hidden vector to CPU for lm_head projection (weight stays on CPU).
-        logits = self.lm_head(hidden.cpu().to(dtype=self.lm_head.weight.dtype)).float()
+        if self.lm_head is None:
+            logits = torch.zeros((hidden.shape[0], hidden.shape[1], 1), dtype=torch.float32)
+        else:
+            logits = self.lm_head(hidden.cpu().to(dtype=self.lm_head.weight.dtype)).float()
         return logits, captures
 
     def forward_sequence(
         self,
         token_ids: torch.LongTensor,
+        *,
+        selected_layers_set: Optional[set] = None,
     ) -> None:
         """Run a full-sequence calibration pass with a layer-first loop.
 
@@ -1411,15 +1470,25 @@ class StreamingLlamaRuntime:
         zero-passthrough fallback when _mlp_proj_staging is None).
 
         Speedup vs forward_token(): seq_len× fewer PCIe layer loads.
+
+        selected_layers_set: if provided, layers not in this set are skipped entirely
+        (no PCIe load, hidden states pass through unchanged). Saves ~(1 - K/N)× bandwidth.
         """
         if token_ids.ndim != 2 or int(token_ids.shape[0]) != 1:
             raise RuntimeError("forward_sequence requires batch_size=1")
 
         seq_len = int(token_ids.shape[1])
         all_hidden = self.embed_tokens(token_ids.cpu()).to(device=self.device, dtype=self.dtype)
+        position_ids = torch.arange(seq_len, device=self.device, dtype=torch.long)
+        # Pre-allocate second buffer once — avoids cudaMalloc on every layer iteration.
+        next_hidden = torch.empty_like(all_hidden)
 
         for layer_idx in range(self.num_layers):
-            if torch.cuda.is_available():
+            # Skip PCIe load entirely for layers not being profiled.
+            if selected_layers_set is not None and layer_idx not in selected_layers_set:
+                continue
+
+            if torch.cuda.is_available() and layer_idx % 10 == 0:
                 alloc_gb = torch.cuda.memory_allocated() / 1e9
                 reserv_gb = torch.cuda.memory_reserved() / 1e9
                 print(
@@ -1427,30 +1496,114 @@ class StreamingLlamaRuntime:
                     end="\r", flush=True,
                 )
             layer = self._load_layer(layer_idx)
-            new_hidden_list = []
 
+            # Process one token at a time (batch=1, seq=1).
+            # The batch-as-tokens trick (batch=seq_len) causes the Taylor local-attention
+            # to allocate [seq_len, 128_heads, local_window, head_dim] = ~268 MB tensors,
+            # overflowing VRAM and causing Windows WDDM to page to system RAM.
+            # Single-token processing keeps all Taylor state tensors at [1, ...] = tiny.
             for pos in range(seq_len):
-                h = all_hidden[:, pos : pos + 1, :].contiguous()  # [1, 1, hidden]
-                # Compute rope per-position exactly as forward_token() does.
-                position_ids_pos = torch.tensor([[pos]], device=self.device, dtype=torch.long)
-                rope_pos = self.rotary_emb(h, position_ids_pos)
+                h = all_hidden[:, pos : pos + 1, :]                     # [1, 1, hidden]
+                position_ids_tok = position_ids[pos : pos + 1].unsqueeze(0)  # [1, 1]
+                rope_tok = self.rotary_emb(h, position_ids_tok)
                 h_norm = layer.input_layernorm(h)
-                # No past_key_values: each token is processed independently.
-                # Avoids DynamicCache index-extension crash when layer_idx > 0.
                 attn_out, _ = layer.self_attn(
                     hidden_states=h_norm,
-                    position_embeddings=rope_pos,
+                    position_embeddings=rope_tok,
                     attention_mask=None,
                     past_key_values=None,
-                    cache_position=position_ids_pos.view(-1),
                 )
-                new_hidden_list.append(h + attn_out)
+                next_hidden[:, pos : pos + 1, :] = h + attn_out
 
-            all_hidden = torch.cat(new_hidden_list, dim=1)
-            del new_hidden_list
+            all_hidden, next_hidden = next_hidden, all_hidden  # swap — no allocation
             self._release_modules(layer)
 
         print("", flush=True)
+
+    def _forward_prefill(self, token_ids: torch.LongTensor) -> torch.Tensor:
+        """Process all prompt tokens with each of the 126 layers loaded only once.
+
+        Instead of the naive loop (load layer N for token 1, load layer N for
+        token 2, …), we invert the loops: load layer N once, then run all prompt
+        tokens through it sequentially before unloading.  For a P-token prompt
+        this reduces layer loads from P×126 to 126.
+
+        Attention is still processed one token at a time (Taylor-SSD is a
+        recurrent operator; running seq_len>1 through it allocates ~268 MB
+        local-attention tensors per layer and overflows 8 GB VRAM).  MLP is
+        batched over all tokens at once — the sparse path transfers only the
+        active-block NF4 bytes regardless of seq_len.
+        """
+        seq_len = int(token_ids.shape[1])
+        all_hidden = self.embed_tokens(token_ids.cpu()).to(device=self.device, dtype=self.dtype)
+        # [1, seq_len, hidden]
+        next_hidden = torch.empty_like(all_hidden)
+        position_ids_all = torch.arange(seq_len, device=self.device, dtype=torch.long)
+
+        for layer_idx in range(self.num_layers):
+            if torch.cuda.is_available():
+                alloc_gb = torch.cuda.memory_allocated() / 1e9
+                reserv_gb = torch.cuda.memory_reserved() / 1e9
+                print(
+                    f"  [prefill layer {layer_idx + 1}/{self.num_layers}] VRAM {alloc_gb:.2f}/{reserv_gb:.2f} GB",
+                    end="\r", flush=True,
+                )
+            layer = self._load_layer(layer_idx)
+
+            # ── Attention: one token at a time ────────────────────────────
+            use_taylor = layer_idx in self.taylor_layer_set
+            if use_taylor:
+                taylor_attn = self._shared_taylor_attn
+                taylor_attn.layer_idx = layer_idx
+
+            for pos in range(seq_len):
+                h = all_hidden[:, pos : pos + 1, :]           # [1, 1, hidden]
+                pos_ids = position_ids_all[pos : pos + 1].unsqueeze(0)  # [1, 1]
+                rope_tok = self.rotary_emb(h, pos_ids)
+                h_norm = layer.input_layernorm(h)
+
+                if use_taylor:
+                    attn_out, _, present = taylor_attn(
+                        hidden_states=h_norm,
+                        position_ids=pos_ids,
+                        position_embeddings=rope_tok,
+                        past_key_value=self._taylor_caches[layer_idx],
+                        use_cache=True,
+                    )
+                    self._taylor_caches[layer_idx] = present
+                else:
+                    attn_out, _ = layer.self_attn(
+                        hidden_states=h_norm,
+                        position_embeddings=rope_tok,
+                        attention_mask=None,
+                        past_key_values=self._dense_cache,
+                        cache_position=pos_ids.view(-1),
+                    )
+
+                next_hidden[:, pos : pos + 1, :] = h + attn_out
+
+            all_hidden, next_hidden = next_hidden, all_hidden  # swap — no allocation
+            # all_hidden is now the post-attention residual for all tokens
+
+            # ── MLP: batched over all tokens ──────────────────────────────
+            residual = all_hidden
+            mlp_input = layer.post_attention_layernorm(all_hidden)
+            _active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
+            if _active_blocks is not None:
+                mlp_out = self._sparse_mlp_forward_fast(layer_idx, layer.mlp, mlp_input, _active_blocks)
+            else:
+                mlp_out = self._dense_mlp_forward_streaming_fast(layer_idx, layer.mlp, mlp_input)
+            all_hidden = residual + mlp_out
+
+            self._release_modules(layer)
+
+        print("", flush=True)
+        all_hidden = self.norm(all_hidden)
+        # Only the last token's logits are needed to start generation.
+        logits = self.lm_head(
+            all_hidden[:, -1:, :].cpu().to(dtype=self.lm_head.weight.dtype)
+        ).float()
+        return logits
 
     def generate(
         self,
@@ -1465,13 +1618,19 @@ class StreamingLlamaRuntime:
     ) -> torch.LongTensor:
         if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
             raise RuntimeError("StreamingLlamaRuntime.generate currently supports batch_size=1 only")
+        if self.lm_head is None:
+            raise RuntimeError("StreamingLlamaRuntime.generate requires materialize_lm_head=True")
 
         generated = input_ids.to(device=self.device)
         self.reset_caches()
         logits: Optional[torch.Tensor] = None
         with torch.no_grad():
-            for pos in range(int(generated.shape[1])):
-                logits, _ = self.forward_token(generated[:, pos : pos + 1], position_index=pos)
+            prompt_len = int(generated.shape[1])
+            if prompt_len > 1:
+                print(f"[prompt] batched prefill: {prompt_len} tokens × 1 layer pass", flush=True)
+                logits = self._forward_prefill(generated)
+            else:
+                logits, _ = self.forward_token(generated[:, 0:1], position_index=0)
             if logits is None:
                 raise RuntimeError("No prompt tokens were provided")
 
@@ -1506,38 +1665,66 @@ class StreamingLlamaRuntime:
             )
         if not selected_layers:
             return
+        if self._mlp_proj_staging is None:
+            raise RuntimeError(
+                "collect_dense_mlp_rows: _mlp_proj_staging is None — VRAM was insufficient to "
+                "allocate the MLP staging buffer at startup. All collected dense_mlp_out values "
+                "would be zeros, producing a useless checkpoint. Free VRAM or reduce other "
+                "pre-allocated buffers before collecting."
+            )
 
         valid_len = int(attention_mask[0].sum().item()) if attention_mask is not None else int(input_ids.shape[1])
         self.reset_caches()
         with torch.no_grad():
-            for pos in range(valid_len):
+            selected_set = {int(idx) for idx in selected_layers}
+            all_hidden = self.embed_tokens(input_ids[:, :valid_len].cpu()).to(device=self.device, dtype=self.dtype)
+            next_hidden = torch.empty_like(all_hidden)
+            attn_hidden = torch.empty_like(all_hidden)
+            position_ids = torch.arange(valid_len, device=self.device, dtype=torch.long)
+            printed_progress = False
+
+            for layer_idx in range(self.num_layers):
                 pending_layers = [idx for idx in selected_layers if int(layer_rows[int(idx)]) < int(max_rows)]
                 if not pending_layers:
                     break
                 rows_done = sum(1 for idx in selected_layers if int(layer_rows[int(idx)]) >= int(max_rows))
-                print(
-                    f"[collect] token {pos+1}/{valid_len} "
-                    f"({rows_done}/{len(selected_layers)} layers saturated, {len(pending_layers)} still collecting)",
-                    flush=True,
+                printed_progress = True
+                status = (
+                    f"[collect] layer {layer_idx+1}/{self.num_layers} "
+                    f"({rows_done}/{len(selected_layers)} layers saturated, {len(pending_layers)} still collecting)"
                 )
-                _logits, captures = self.forward_token(
-                    input_ids[:, pos : pos + 1],
-                    position_index=pos,
-                    capture_layers=pending_layers,
-                    use_attention_cache=False,
-                )
-                for layer_idx in pending_layers:
-                    capture = captures.get(int(layer_idx))
-                    if capture is None:
-                        continue
+                print(status.ljust(120), end="\r", flush=True)
+                layer = self._load_layer(layer_idx)
+
+                for pos in range(valid_len):
+                    h = all_hidden[:, pos : pos + 1, :]
+                    position_ids_tok = position_ids[pos : pos + 1].unsqueeze(0)
+                    rope_tok = self.rotary_emb(h, position_ids_tok)
+                    h_norm = layer.input_layernorm(h)
+                    attn_out, _ = layer.self_attn(
+                        hidden_states=h_norm,
+                        position_embeddings=rope_tok,
+                        attention_mask=None,
+                        past_key_values=None,
+                    )
+                    attn_hidden[:, pos : pos + 1, :] = h + attn_out
+
+                mlp_input = layer.post_attention_layernorm(attn_hidden)
+                mlp_out = self._dense_mlp_forward_streaming_fast(layer_idx, layer.mlp, mlp_input)
+
+                if int(layer_idx) in selected_set:
                     remain = int(max_rows) - int(layer_rows[int(layer_idx)])
-                    if remain <= 0:
-                        continue
-                    x = capture["mlp_input"].reshape(-1, capture["mlp_input"].shape[-1]).float()
-                    y = capture["dense_mlp_out"].reshape(-1, capture["dense_mlp_out"].shape[-1]).float()
-                    take = min(int(remain), int(x.shape[0]))
-                    if take <= 0:
-                        continue
-                    layer_x[int(layer_idx)].append(x[:take])
-                    layer_y[int(layer_idx)].append(y[:take])
-                    layer_rows[int(layer_idx)] += int(take)
+                    if remain > 0:
+                        x = mlp_input.reshape(-1, mlp_input.shape[-1]).float()
+                        y = mlp_out.reshape(-1, mlp_out.shape[-1]).float()
+                        take = min(int(remain), int(x.shape[0]))
+                        if take > 0:
+                            layer_x[int(layer_idx)].append(x[:take].detach().cpu())
+                            layer_y[int(layer_idx)].append(y[:take].detach().cpu())
+                            layer_rows[int(layer_idx)] += int(take)
+
+                next_hidden.copy_(attn_hidden + mlp_out)
+                all_hidden, next_hidden = next_hidden, all_hidden
+                self._release_modules(layer)
+            if printed_progress:
+                print("", flush=True)

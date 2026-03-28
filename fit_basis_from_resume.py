@@ -16,6 +16,8 @@ from typing import Any, Dict
 
 import torch
 
+from llama3_neuroplastic.basis_fitting import fit_layer_basis
+
 
 def _fit_layer_basis(
     x: torch.Tensor,
@@ -23,55 +25,17 @@ def _fit_layer_basis(
     *,
     basis_rank: int,
     block_size: int,
+    pca_method: str,
+    pca_batch_rows: int,
 ) -> Dict[str, Any]:
-    if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0]:
-        raise RuntimeError("x/y must be 2D with matching rows")
-    hidden_size = int(y.shape[1])
-    num_blocks = hidden_size // int(block_size)
-    if num_blocks * int(block_size) != hidden_size:
-        raise RuntimeError("hidden_size must be divisible by block_size")
-
-    y_mean = y.mean(dim=0)
-    y_centered = y - y_mean
-    rows = int(y_centered.shape[0])
-    rank_eff = int(max(min(int(basis_rank), rows, hidden_size), 1))
-
-    _u, s, v = torch.pca_lowrank(y_centered, q=rank_eff, center=False, niter=2)
-    v = v[:, :rank_eff].contiguous()
-    coeff = y_centered @ v
-
-    ones = torch.ones((x.shape[0], 1), dtype=x.dtype, device=x.device)
-    x_aug = torch.cat([x, ones], dim=-1)
-    lsq = torch.linalg.lstsq(x_aug, coeff)
-    proj = lsq.solution
-    enc_w_eff = proj[:-1, :].transpose(0, 1).contiguous()
-    enc_b_eff = proj[-1, :].contiguous()
-
-    basis = v.transpose(0, 1).contiguous()
-    if rank_eff < int(basis_rank):
-        pad_rows = int(basis_rank) - rank_eff
-        basis = torch.cat([basis, torch.zeros((pad_rows, hidden_size), dtype=basis.dtype)], dim=0)
-        enc_w_eff = torch.cat(
-            [enc_w_eff, torch.zeros((pad_rows, enc_w_eff.shape[1]), dtype=enc_w_eff.dtype)], dim=0
-        )
-        enc_b_eff = torch.cat([enc_b_eff, torch.zeros((pad_rows,), dtype=enc_b_eff.dtype)], dim=0)
-
-    decoder_blocks = basis.view(int(basis_rank), num_blocks, int(block_size)).permute(1, 0, 2).contiguous()
-    decoder_bias = y_mean.view(num_blocks, int(block_size)).contiguous()
-
-    total_var = y_centered.pow(2).sum().clamp_min(1e-8)
-    captured_var = coeff.pow(2).sum()
-    explained = float((captured_var / total_var).detach().cpu().item())
-    return {
-        "encoder_weight": enc_w_eff.detach().cpu().float(),
-        "encoder_bias": enc_b_eff.detach().cpu().float(),
-        "decoder_blocks": decoder_blocks.detach().cpu().float(),
-        "decoder_bias": decoder_bias.detach().cpu().float(),
-        "scale": torch.tensor(1.0, dtype=torch.float32),
-        "samples": int(x.shape[0]),
-        "explained_variance_ratio": explained,
-        "rank_effective": int(rank_eff),
-    }
+    return fit_layer_basis(
+        x=x,
+        y=y,
+        basis_rank=int(basis_rank),
+        block_size=int(block_size),
+        pca_method=str(pca_method),
+        pca_batch_rows=int(pca_batch_rows),
+    )
 
 
 def main() -> None:
@@ -80,6 +44,8 @@ def main() -> None:
     p.add_argument("--output", required=True, help="Path to write final .pt file")
     p.add_argument("--basis-rank", type=int, default=96)
     p.add_argument("--block-size", type=int, default=32)
+    p.add_argument("--pca-method", type=str, default="auto", choices=["auto", "lowrank", "incremental"])
+    p.add_argument("--pca-batch-rows", type=int, default=1024)
     args = p.parse_args()
 
     resume_path = Path(args.resume)
@@ -109,10 +75,21 @@ def main() -> None:
         y = torch.cat([t.view(1, -1) if t.ndim == 1 else t.view(t.shape[0], -1) for t in ys], dim=0).float()
 
         try:
-            fitted = _fit_layer_basis(x, y, basis_rank=args.basis_rank, block_size=args.block_size)
+            fitted = _fit_layer_basis(
+                x,
+                y,
+                basis_rank=args.basis_rank,
+                block_size=args.block_size,
+                pca_method=args.pca_method,
+                pca_batch_rows=args.pca_batch_rows,
+            )
             layer_states[str(layer_idx)] = fitted
             ev = fitted["explained_variance_ratio"]
-            print(f"  [{i+1}/{len(layers)}] layer {layer_idx}: rows={x.shape[0]} rank_eff={fitted['rank_effective']} explained={ev:.3f}")
+            method = fitted.get("pca_method", args.pca_method)
+            print(
+                f"  [{i+1}/{len(layers)}] layer {layer_idx}: "
+                f"rows={x.shape[0]} rank_eff={fitted['rank_effective']} pca={method} explained={ev:.3f}"
+            )
         except Exception as e:
             print(f"  [{i+1}/{len(layers)}] layer {layer_idx}: ERROR {e}")
 
@@ -130,6 +107,8 @@ def main() -> None:
             "sparse_placement": "learned_basis",
             "basis_rank": args.basis_rank,
             "block_size": args.block_size,
+            "pca_method": args.pca_method,
+            "pca_batch_rows": args.pca_batch_rows,
             "num_blocks": num_blocks_example,
         },
     }

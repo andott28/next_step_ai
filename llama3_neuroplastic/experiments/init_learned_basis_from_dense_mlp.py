@@ -16,9 +16,13 @@ except ImportError:  # pragma: no cover
     load_dataset = None
 
 try:
+    from ..basis_fitting import fit_layer_basis
+    from ..performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
     from .neuroplastic_llama_gqa_mamba import NeuroplasticLlama
     from .streaming_llama_runtime import StreamingLlamaRuntime
 except ImportError:  # pragma: no cover
+    from llama3_neuroplastic.basis_fitting import fit_layer_basis
+    from llama3_neuroplastic.performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
     from neuroplastic_llama_gqa_mamba import NeuroplasticLlama
     from streaming_llama_runtime import StreamingLlamaRuntime
 
@@ -52,6 +56,9 @@ def _build_dataloader(
     max_seq_length: int,
     batch_size: int,
     max_samples: int,
+    dataloader_num_workers: int,
+    dataloader_prefetch_factor: int,
+    dataloader_persistent_workers: bool,
 ) -> DataLoader:
     if load_dataset is None:
         raise RuntimeError("datasets package is required")
@@ -70,7 +77,15 @@ def _build_dataloader(
 
     tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
     tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
-    return DataLoader(tokenized, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=torch.cuda.is_available())
+    return DataLoader(
+        tokenized,
+        **resolve_dataloader_kwargs(
+            batch_size=int(batch_size),
+            num_workers=int(dataloader_num_workers),
+            prefetch_factor=int(dataloader_prefetch_factor),
+            persistent_workers=bool(dataloader_persistent_workers),
+        ),
+    )
 
 
 def _choose_layers(model: NeuroplasticLlama, explicit_layers: Optional[List[int]]) -> List[int]:
@@ -112,56 +127,17 @@ def _fit_layer_basis(
     *,
     basis_rank: int,
     block_size: int,
+    pca_method: str,
+    pca_batch_rows: int,
 ) -> Dict[str, Any]:
-    if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0]:
-        raise RuntimeError("x/y must be 2D with matching rows")
-    hidden_size = int(y.shape[1])
-    num_blocks = hidden_size // int(block_size)
-    if num_blocks * int(block_size) != hidden_size:
-        raise RuntimeError("hidden_size must be divisible by block_size")
-
-    y_mean = y.mean(dim=0)
-    y_centered = y - y_mean
-    rows = int(y_centered.shape[0])
-    rank_eff = int(max(min(int(basis_rank), rows, hidden_size), 1))
-
-    _u, s, v = torch.pca_lowrank(y_centered, q=rank_eff, center=False, niter=2)
-    v = v[:, :rank_eff].contiguous()
-    coeff = y_centered @ v
-
-    ones = torch.ones((x.shape[0], 1), dtype=x.dtype, device=x.device)
-    x_aug = torch.cat([x, ones], dim=-1)
-    lsq = torch.linalg.lstsq(x_aug, coeff)
-    proj = lsq.solution
-    enc_w_eff = proj[:-1, :].transpose(0, 1).contiguous()
-    enc_b_eff = proj[-1, :].contiguous()
-
-    basis = v.transpose(0, 1).contiguous()
-    if rank_eff < int(basis_rank):
-        pad_rows = int(basis_rank) - rank_eff
-        basis = torch.cat([basis, torch.zeros((pad_rows, hidden_size), dtype=basis.dtype, device=basis.device)], dim=0)
-        enc_w_eff = torch.cat(
-            [enc_w_eff, torch.zeros((pad_rows, enc_w_eff.shape[1]), dtype=enc_w_eff.dtype, device=enc_w_eff.device)],
-            dim=0,
-        )
-        enc_b_eff = torch.cat([enc_b_eff, torch.zeros((pad_rows,), dtype=enc_b_eff.dtype, device=enc_b_eff.device)], dim=0)
-
-    decoder_blocks = basis.view(int(basis_rank), num_blocks, int(block_size)).permute(1, 0, 2).contiguous()
-    decoder_bias = y_mean.view(num_blocks, int(block_size)).contiguous()
-
-    total_var = y_centered.pow(2).sum().clamp_min(1e-8)
-    captured_var = coeff.pow(2).sum()
-    explained = float((captured_var / total_var).detach().cpu().item())
-    return {
-        "encoder_weight": enc_w_eff.detach().cpu().float(),
-        "encoder_bias": enc_b_eff.detach().cpu().float(),
-        "decoder_blocks": decoder_blocks.detach().cpu().float(),
-        "decoder_bias": decoder_bias.detach().cpu().float(),
-        "scale": torch.tensor(1.0, dtype=torch.float32),
-        "samples": int(x.shape[0]),
-        "explained_variance_ratio": explained,
-        "rank_effective": int(rank_eff),
-    }
+    return fit_layer_basis(
+        x=x,
+        y=y,
+        basis_rank=int(basis_rank),
+        block_size=int(block_size),
+        pca_method=str(pca_method),
+        pca_batch_rows=int(pca_batch_rows),
+    )
 
 
 def _load_profile_overrides(path: str) -> Dict[str, Dict[int, int]]:
@@ -226,12 +202,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=256)
     p.add_argument("--max-seq-length", type=int, default=128)
     p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--max-rows-per-layer", type=int, default=4096)
+    p.add_argument("--max-rows-per-layer", type=int, default=1024)
     p.add_argument("--basis-rank", type=int, default=64)
+    p.add_argument("--pca-method", type=str, default="auto", choices=["auto", "lowrank", "incremental"])
+    p.add_argument("--pca-batch-rows", type=int, default=1024)
     p.add_argument("--sca-block-size", type=int, default=32)
     p.add_argument("--sca-bottom-buffer-layers", type=int, default=2)
     p.add_argument("--sca-decode-guard-layers", type=int, default=12)
     p.add_argument("--sca-dense-anchor-stride", type=int, default=0)
+    p.add_argument("--dataloader-num-workers", type=int, default=0)
+    p.add_argument("--dataloader-prefetch-factor", type=int, default=2)
+    p.add_argument("--dataloader-persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dense-rollout-tokens", type=int, default=8)
     p.add_argument("--profile-path", type=str, default="")
     p.add_argument("--use-streaming-harness", action=argparse.BooleanOptionalAction, default=False)
@@ -261,6 +242,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    configure_runtime_environment(cudnn_benchmark=True)
     if bool(args.use_streaming_harness) and int(args.batch_size) != 1:
         raise RuntimeError("Streaming harness mode currently requires --batch-size 1")
     if (not bool(args.use_streaming_harness)) and not str(args.hybrid_checkpoint).strip():
@@ -282,22 +264,29 @@ def main() -> None:
         max_seq_length=int(args.max_seq_length),
         batch_size=int(args.batch_size),
         max_samples=int(args.max_samples),
+        dataloader_num_workers=int(args.dataloader_num_workers),
+        dataloader_prefetch_factor=int(args.dataloader_prefetch_factor),
+        dataloader_persistent_workers=bool(args.dataloader_persistent_workers),
     )
 
     artifact: Dict[str, Any] = {}
     model: Optional[NeuroplasticLlama] = None
     runtime: Optional[StreamingLlamaRuntime] = None
+    _batch_count: int = 0
     if bool(args.use_streaming_harness):
+        parsed_taylor_layers = _parse_layers(args.taylor_layers)
         runtime = StreamingLlamaRuntime(
             model_name_or_path=str(args.model_name),
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
             dtype=torch.float16,
-            taylor_layers=_parse_layers(args.taylor_layers),
+            taylor_layers=[] if parsed_taylor_layers is None else parsed_taylor_layers,
             taylor_feature_map=str(args.taylor_feature_map),
             taylor_local_window=int(args.taylor_local_window),
             taylor_feature_dim=int(args.taylor_feature_dim),
             taylor_state_decay=float(args.taylor_state_decay),
             local_files_only=bool(args.local_files_only),
+            ram_cache=False,
+            materialize_lm_head=False,
         )
         selected_layers = _choose_layers_from_layout(
             total_layers=int(runtime.num_layers),
@@ -385,20 +374,23 @@ def main() -> None:
                 layer_rows=layer_rows,
                 max_rows=max_rows,
             )
-            # Save raw activation buffers after every completed pass so a crash mid-pass
-            # only loses that one pass, not all previously collected rows.
-            torch.save(
-                {
-                    "layer_states": layer_states,
-                    "stats": stats,
-                    "layer_x": {idx: layer_x[idx] for idx in selected_layers if layer_x[idx]},
-                    "layer_y": {idx: layer_y[idx] for idx in selected_layers if layer_y[idx]},
-                },
-                _resume_path,
-            )
+            _batch_count += 1
             _rows_done = sum(1 for idx in selected_layers if str(idx) in layer_states)
             _rows_partial = sum(1 for idx in selected_layers if layer_rows[idx] > 0 and str(idx) not in layer_states)
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting — resume saved", flush=True)
+            # Save activation buffers every 4 batches to reduce SSD write overhead.
+            if _batch_count % 4 == 0:
+                torch.save(
+                    {
+                        "layer_states": layer_states,
+                        "stats": stats,
+                        "layer_x": {idx: layer_x[idx] for idx in selected_layers if layer_x[idx]},
+                        "layer_y": {idx: layer_y[idx] for idx in selected_layers if layer_y[idx]},
+                    },
+                    _resume_path,
+                )
+                print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting — resume saved", flush=True)
+            else:
+                print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting", flush=True)
         else:
             assert model is not None
             input_ids = batch["input_ids"].to(model.device, non_blocking=True)
@@ -467,7 +459,14 @@ def main() -> None:
                 continue
             _x = torch.cat(_xs, dim=0)
             _y = torch.cat(_ys, dim=0)
-            _fitted = _fit_layer_basis(_x, _y, basis_rank=int(args.basis_rank), block_size=int(block_size))
+            _fitted = _fit_layer_basis(
+                _x,
+                _y,
+                basis_rank=int(args.basis_rank),
+                block_size=int(block_size),
+                pca_method=str(args.pca_method),
+                pca_batch_rows=int(args.pca_batch_rows),
+            )
             layer_states[str(layer_idx)] = {
                 "encoder_weight": _fitted["encoder_weight"],
                 "encoder_bias": _fitted["encoder_bias"],
@@ -479,6 +478,7 @@ def main() -> None:
                 "samples": float(_fitted["samples"]),
                 "rank_effective": float(_fitted["rank_effective"]),
                 "explained_variance_ratio": float(_fitted["explained_variance_ratio"]),
+                "pca_method": str(_fitted.get("pca_method", args.pca_method)),
             }
             # Once a layer is fitted, stop collecting more token rows for it in
             # the current run. Resume loading already treats fitted layers this way.
@@ -511,6 +511,8 @@ def main() -> None:
             y=y,
             basis_rank=int(args.basis_rank),
             block_size=int(block_size),
+            pca_method=str(args.pca_method),
+            pca_batch_rows=int(args.pca_batch_rows),
         )
         layer_states[str(layer_idx)] = {
             "encoder_weight": fitted["encoder_weight"],
@@ -523,6 +525,7 @@ def main() -> None:
             "samples": float(fitted["samples"]),
             "rank_effective": float(fitted["rank_effective"]),
             "explained_variance_ratio": float(fitted["explained_variance_ratio"]),
+            "pca_method": str(fitted.get("pca_method", args.pca_method)),
         }
     missing_layers = [idx for idx in selected_layers if str(idx) not in layer_states]
     if missing_layers:
@@ -544,6 +547,8 @@ def main() -> None:
             "decode_guard_layers": int(args.sca_decode_guard_layers),
             "dense_anchor_stride": int(args.sca_dense_anchor_stride),
             "basis_rank": int(args.basis_rank),
+            "pca_method": str(args.pca_method),
+            "pca_batch_rows": int(args.pca_batch_rows),
             "basis_rank_by_layer": overrides["basis_rank_by_layer"],
             "basis_top_k_by_layer": overrides["basis_top_k_by_layer"],
             "top_k_by_layer": overrides["top_k_by_layer"],
