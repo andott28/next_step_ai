@@ -59,6 +59,11 @@ What is working:
   - dense fallback MLPs stream one projection at a time through a reusable GPU staging buffer
   - Windows shard tensors are cloned into normal CPU RAM in the cache to avoid mmap-backed CUDA copy instability
   - sparse execution has been verified with real 405B weights in lightweight streamed checks across multiple layers without changing model math
+- 405B streaming runtime improvements (March 28, 2026):
+  - **OOM fix for sparse mode:** non-sparse MLP layers (those without routing coverage) previously crashed with CUDA OOM by materialising three ~1.7 GB GPU tensors (gate/up/down) when `_mlp_proj_staging` was skipped. They now compute on CPU using the RAM-cached dequantised weights and only transfer the 32 KB output back to GPU.
+  - **Batched prompt prefill:** `_forward_prefill` loads each of the 126 layers exactly once per prompt regardless of prompt length, then processes all prompt tokens sequentially within that layer before moving on. This reduces layer loads from `prompt_len × 126` to `126` for multi-token prompts.
+  - **Persistent interactive mode:** `run_streaming_inference.py` without `--prompt` now enters a REPL loop instead of exiting. The `StreamingLlamaRuntime` and its RAM weight cache survive between queries — the first query warms whatever layers fit in RAM; subsequent queries skip SSD for those layers. Pass `--prompt "..."` to keep the old scripted single-shot behaviour.
+  - **Auto RAM cache sizing:** on startup the runtime calls `psutil` to detect available system RAM and caps the weight cache at 70% of it (printed at startup). Override with `STREAMING_RAM_CACHE_MAX_GB`; set to `0` to disable caching entirely. Without an explicit limit the cache previously grew unbounded toward 200 GB and would silently exhaust system RAM on 32 GB machines.
 
 - Hybrid Softmax-Linear Attention landing (March 23, 2026):
   - Fixed severe repetition collapse (`Write Write ...`) by implementing an exact causal local softmax window plus a Performer-style compressed recurrent tail.
@@ -79,31 +84,67 @@ The project now supports running **Llama 3.1 405B (Instruct)** on consumer hardw
 - **Dense Fallback Path:** Non-sparse MLP layers stream one projection at a time through a reusable GPU buffer instead of keeping the full FFN resident.
 - **Windows Stability Tradeoff:** Full bitsandbytes CUDA dequant during layer-load is not currently reliable on the tested Windows 11 + 8 GB setup, so streamed layer materialization still uses the stable CPU dequant path there.
 - **Zero-Shot PCA:** Use `init_learned_basis_from_dense_mlp.py` with the `--use-streaming-harness` flag to initialize the sparse routing geometry analytically without ever loading the full model into system RAM.
+- **Sparse Attention Head Loading:** Use `init_learned_attn_head_importance.py` to profile per-head contribution norms, then pass the resulting checkpoint via `--attn-head-importance-path`. Only the top-K heads' NF4 bytes are transferred per layer, reducing attention PCIe traffic by 50–87%.
 
 ### 405B Streaming Status
 
 - Verified: streamed 405B forwards with real `unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit` weights and real learned-basis routing checkpoints complete through multiple sparse-enabled layers.
 - Verified sparse layers in lightweight checks: layers `2`, `3`, and `4` executed through the sparse Triton path without falling back to dense MLP execution.
 - Verified output shape in those checks: `logits_shape == (1, 1, 128256)`.
-- Current bottleneck is no longer the sparse neuron-selection path itself; the main remaining cost is per-layer weight materialization plus the still-dense layers that do not have routing coverage.
-- Recommended interpretation: sparse routing is working for the streaming runtime, but full end-to-end 405B decode on 8 GB VRAM remains a systems-optimization problem rather than a routing-correctness problem.
+- MLP routing checkpoint (`results/learned_basis_init_405b_96r.pt`): 83/126 layers fitted, rank=96, block_size=32, ~100% explained variance. Reduces MLP weight transfers by ~96% for covered layers.
+- Attention head importance checkpoint (`results/attn_head_importance_405b.pt`): **not yet generated.** Run the command under "Generating the attention importance checkpoint" below.
+- Current bottleneck is per-layer attention weight transfer (~285 MB/layer × 126 layers per token). Sparse attention head loading is the next major bandwidth reduction.
 
-### 405B Inference Command:
+### 405B Inference Command (interactive):
+
+Omitting `--prompt` starts a persistent REPL. The runtime stays loaded between queries — the RAM cache warms on the first query and partially carries over to subsequent ones.
+
 ```powershell
 $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 .\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --prompt "The capital of Norway is" `
-  --max-new-tokens 20 `
+  --max-new-tokens 64 `
   --taylor-layers "0-125" `
-  --taylor-feature-map hybrid_performer
+  --taylor-feature-map hybrid_performer `
+  --sparse-basis-path ".\results\learned_basis_init_405b_96r.pt"
+```
+
+With the attention importance checkpoint also available:
+
+```powershell
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
+.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
+  --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
+  --max-new-tokens 64 `
+  --taylor-layers "0-125" `
+  --taylor-feature-map hybrid_performer `
+  --sparse-basis-path ".\results\learned_basis_init_405b_96r.pt" `
+  --attn-head-importance-path ".\results\attn_head_importance_405b.pt"
+```
+
+Pass `--prompt "..."` instead to run a single query and exit (scripted mode).
+
+### Generating the attention importance checkpoint
+
+Only needs to be run once. Takes roughly the same wall time as the basis init run.
+
+```powershell
+$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
+.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\init_learned_attn_head_importance.py `
+  --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
+  --output-path ".\results\attn_head_importance_405b.pt" `
+  --taylor-layers "0-125" `
+  --taylor-feature-map hybrid_performer `
+  --max-samples 64 `
+  --max-seq-length 128 `
+  --max-tokens-per-layer 2048
 ```
 
 Practical note:
 
-- The command above is the canonical full decode entrypoint, but it is not the right loop for low-latency debugging on 405B.
+- Speed per token is dominated by how many layers lack sparse coverage. With both the MLP routing and attention importance checkpoints active, per-layer transfer drops from ~1.6 GB to roughly 200 MB.
+- On 32 GB RAM the weight cache holds ~9 layers (70% of available RAM / 1.6 GB per layer). The LRU keeps the most recently used layers warm; layers 117–125 will always be cached between queries in interactive mode.
 - For runtime verification, prefer short streamed checks that cap `runtime.num_layers` in-process and confirm whether a target sparse layer reaches `sparse_mlp` successfully.
-- The current Windows-safe fast path preserves model math, but speed still depends heavily on how many layers remain outside sparse routing coverage.
 
 ### 405B Learned-Basis Init Notes
 
