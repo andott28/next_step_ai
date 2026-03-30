@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
 
 def _parse_layer_selection(spec: str | None) -> Optional[List[int]]:
     if spec is None or str(spec).strip() == "":
-        return None
+        return []
     out: set[int] = set()
     for part in str(spec).split(","):
         token = part.strip()
@@ -62,6 +62,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--taylor-feature-dim", type=int, default=64)
     p.add_argument("--taylor-state-decay", type=float, default=1.0)
     p.add_argument("--dump-json", type=str, default="")
+    p.add_argument(
+        "--max-runtime-layers",
+        type=int,
+        default=0,
+        help="Optional smoke-test cap for runtime.num_layers. Keeps the exact command surface but limits layer passes.",
+    )
     p.add_argument(
         "--no-ram-cache",
         action="store_true",
@@ -143,7 +149,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable dedicated H2D CUDA stream overlap for sparse weight transfers.",
     )
+    p.add_argument(
+        "--no-stream-output",
+        action="store_true",
+        default=False,
+        help="Disable incremental token streaming to stdout and only print the final text after generation.",
+    )
     return p
+
+
+def _make_token_callback(tokenizer: Any, args: Any) -> tuple[Dict[str, bool], Any]:
+    state = {"started": False}
+
+    def _token_callback(next_token: torch.Tensor, _generated: torch.LongTensor) -> None:
+        if bool(args.no_stream_output):
+            return
+        token_id = int(next_token.view(-1)[0].item())
+        if tokenizer.eos_token_id is not None and token_id == int(tokenizer.eos_token_id):
+            return
+        piece = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if not piece:
+            return
+        if not state["started"]:
+            print("[stream] ", end="", flush=True)
+            state["started"] = True
+        print(piece, end="", flush=True)
+
+    return state, _token_callback
 
 
 def _run_single_prompt(
@@ -153,9 +189,12 @@ def _run_single_prompt(
     tokenizer: Any,
     args: Any,
     prompt_idx: int = 0,
+    reuse_session_cache: bool = False,
 ) -> Dict[str, Any]:
     encoded = tokenizer(prompt, return_tensors="pt")
     input_ids = encoded["input_ids"]
+    stream_state, token_callback = _make_token_callback(tokenizer, args)
+
     t0 = time.perf_counter()
     with torch.no_grad():
         generated = runtime.generate(
@@ -166,8 +205,12 @@ def _run_single_prompt(
             temperature=float(args.temperature),
             top_k=int(args.top_k),
             top_p=float(args.top_p),
+            token_callback=token_callback,
+            reuse_session_cache=bool(reuse_session_cache),
         )
     elapsed = time.perf_counter() - t0
+    if stream_state["started"]:
+        print("", flush=True)
     text = tokenizer.decode(generated[0], skip_special_tokens=True)
     new_tokens = max(int(generated.shape[-1] - input_ids.shape[-1]), 1)
     row = {
@@ -207,7 +250,7 @@ def main() -> None:
         taylor_state_decay=float(args.taylor_state_decay),
         local_files_only=bool(args.local_files_only),
         ram_cache=not bool(args.no_ram_cache),
-        ram_cache_pinned=not bool(args.no_ram_cache_pinned),
+        ram_cache_pinned=False if bool(args.no_ram_cache_pinned) else None,
         sparse_basis_path=str(args.sparse_basis_path) if args.sparse_basis_path else None,
         sparse_top_k=int(args.sparse_top_k) if args.sparse_top_k is not None else None,
         vram_hot_cache_gb=float(args.vram_hot_cache_gb) if args.vram_hot_cache_gb is not None else None,
@@ -220,6 +263,9 @@ def main() -> None:
         enable_triton_fused_sparse_mlp=not bool(args.disable_triton_fused_sparse_mlp),
         enable_cuda_h2d_overlap=not bool(args.disable_cuda_h2d_overlap),
     )
+    if int(args.max_runtime_layers) > 0:
+        runtime.num_layers = min(int(runtime.num_layers), int(args.max_runtime_layers))
+        print(f"[smoke] runtime capped to {int(runtime.num_layers)} layers", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(args.model_name), use_fast=True, local_files_only=bool(args.local_files_only)
@@ -234,10 +280,7 @@ def main() -> None:
         for idx, prompt in enumerate(prompts):
             rows.append(_run_single_prompt(prompt, runtime=runtime, tokenizer=tokenizer, args=args, prompt_idx=idx))
     else:
-        # Interactive mode: keep the runtime alive between queries so the RAM
-        # cache stays warm. The first query is slow (SSD reads); subsequent
-        # queries skip already-cached layers.
-        print("[interactive] Model loaded. Type a prompt and press Enter. Ctrl+C or blank line to quit.")
+        print("[interactive] Model loaded. Type a prompt. Use /reset to clear cached prefix state. Ctrl+C or blank line to quit.")
         idx = 0
         while True:
             try:
@@ -247,8 +290,23 @@ def main() -> None:
                 break
             if not prompt:
                 break
+            if prompt.lower() in {"exit", "quit"}:
+                break
+            if prompt.lower() in {"/reset", "reset", "new"}:
+                runtime.clear_session_state()
+                print("[session] cleared", flush=True)
+                continue
             try:
-                rows.append(_run_single_prompt(prompt, runtime=runtime, tokenizer=tokenizer, args=args, prompt_idx=idx))
+                rows.append(
+                    _run_single_prompt(
+                        prompt,
+                        runtime=runtime,
+                        tokenizer=tokenizer,
+                        args=args,
+                        prompt_idx=idx,
+                        reuse_session_cache=True,
+                    )
+                )
             except Exception:
                 import traceback
                 traceback.print_exc()
