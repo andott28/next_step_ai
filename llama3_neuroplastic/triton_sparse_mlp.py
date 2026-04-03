@@ -24,7 +24,17 @@ _DEFAULT_MAX_FUSED_TOPK = 32
 
 
 def triton_sparse_mlp_available() -> bool:
-    return bool(_TRITON_AVAILABLE)
+    if not _TRITON_AVAILABLE:
+        return False
+    if _env_flag("SCA_TRITON_ALLOW_WINDOWS_PRE_AMPERE", False):
+        return True
+    if os.name == "nt" and torch.cuda.is_available():
+        try:
+            if _is_pre_ampere(torch.device("cuda")):
+                return False
+        except Exception:
+            pass
+    return True
 
 
 def _next_power_of_two(value: int) -> int:

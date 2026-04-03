@@ -150,6 +150,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Disable dedicated H2D CUDA stream overlap for sparse weight transfers.",
     )
     p.add_argument(
+        "--kv-basis-path",
+        type=str,
+        default="",
+        help="Path to K/V routing basis checkpoint (.pt) from init_learned_basis_from_dense_mlp.py. "
+             "Enables sparse K/V projection loading (~10%% of column blocks transferred per token).",
+    )
+    p.add_argument(
+        "--kv-sparse-top-k",
+        type=int,
+        default=None,
+        help="Override number of active K/V column blocks per token (default: from checkpoint config).",
+    )
+    p.add_argument(
         "--no-stream-output",
         action="store_true",
         default=False,
@@ -262,6 +275,8 @@ def main() -> None:
         attn_max_active_heads=int(args.attn_max_active_heads) if args.attn_max_active_heads is not None else None,
         enable_triton_fused_sparse_mlp=not bool(args.disable_triton_fused_sparse_mlp),
         enable_cuda_h2d_overlap=not bool(args.disable_cuda_h2d_overlap),
+        kv_basis_path=str(args.kv_basis_path) if args.kv_basis_path else None,
+        kv_sparse_top_k=int(args.kv_sparse_top_k) if args.kv_sparse_top_k is not None else None,
     )
     if int(args.max_runtime_layers) > 0:
         runtime.num_layers = min(int(runtime.num_layers), int(args.max_runtime_layers))

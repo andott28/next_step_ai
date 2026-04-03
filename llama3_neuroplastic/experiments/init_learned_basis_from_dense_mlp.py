@@ -18,17 +18,25 @@ except ImportError:  # pragma: no cover
 try:
     from ..basis_fitting import fit_layer_basis
     from ..performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
-    from .neuroplastic_llama_gqa_mamba import NeuroplasticLlama
     from .streaming_llama_runtime import StreamingLlamaRuntime
+    from .init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn
 except ImportError:  # pragma: no cover
     from llama3_neuroplastic.basis_fitting import fit_layer_basis
     from llama3_neuroplastic.performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
-    from neuroplastic_llama_gqa_mamba import NeuroplasticLlama
     from streaming_llama_runtime import StreamingLlamaRuntime
+    from init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn  # type: ignore
+
+try:
+    from .neuroplastic_llama_gqa_mamba import NeuroplasticLlama  # type: ignore[attr-defined]
+except ImportError:
+    try:
+        from neuroplastic_llama_gqa_mamba import NeuroplasticLlama  # type: ignore[no-redef]
+    except ImportError:
+        NeuroplasticLlama = None  # type: ignore[assignment,misc]
 
 
 def _parse_layers(spec: str | None) -> Optional[List[int]]:
-    if spec is None or spec.strip() == "":
+    if spec is None or spec.strip() == "" or spec.strip().lower() == "all":
         return None
     out: set[int] = set()
     for part in spec.split(","):
@@ -267,6 +275,8 @@ def _save_basis_resume(
     layer_y: Dict[int, List[torch.Tensor]],
     selected_layers: List[int],
     include_buffers: bool,
+    layer_kv_x: Optional[Dict[int, List[torch.Tensor]]] = None,
+    layer_kv_rows: Optional[Dict[int, int]] = None,
 ) -> None:
     payload: Dict[str, Any] = {
         "layer_states": layer_states,
@@ -275,6 +285,10 @@ def _save_basis_resume(
     if bool(include_buffers):
         payload["layer_x"] = {idx: layer_x[idx] for idx in selected_layers if layer_x[idx]}
         payload["layer_y"] = {idx: layer_y[idx] for idx in selected_layers if layer_y[idx]}
+    if layer_kv_x is not None:
+        payload["layer_kv_x"] = {idx: layer_kv_x[idx] for idx in selected_layers if layer_kv_x.get(idx)}
+    if layer_kv_rows is not None:
+        payload["layer_kv_rows"] = dict(layer_kv_rows)
     torch.save(payload, resume_path)
 
 
@@ -331,6 +345,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--write-partial-output-every-batches", type=int, default=1)
     p.add_argument("--max-batches", type=int, default=0)
     p.add_argument("--only-missing-from-output", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--no-resume", action="store_true", default=False,
+                   help="Ignore any existing checkpoint and start data collection from scratch.")
     p.add_argument("--layer-chunk-size", type=int, default=0)
     p.add_argument("--layer-chunk-index", type=int, default=0)
     p.add_argument("--plan-only", action=argparse.BooleanOptionalAction, default=False)
@@ -357,6 +373,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1")
     p.add_argument("--dataset-split", type=str, default="train")
     p.add_argument("--text-column", type=str, default="text")
+    p.add_argument(
+        "--kv-basis-output-path", type=str, default="",
+        help="If set, K/V column-block routing basis is fitted in the same forward pass "
+             "and saved to this path. Only supported with --use-streaming-harness.",
+    )
+    p.add_argument("--kv-basis-rank", type=int, default=32,
+                   help="Encoder rank for K/V router (default 32).")
+    p.add_argument("--kv-basis-top-k", type=int, default=51,
+                   help="Active column-blocks at inference (default 51 = 10%% of 512).")
+    p.add_argument("--kv-max-rows", type=int, default=256,
+                   help="Max rows to collect per layer for KV basis fitting (default 256).")
     return p.parse_args()
 
 
@@ -371,9 +398,13 @@ def main() -> None:
     _resume_path = _output_path.with_suffix(".resume.pt")
     _existing_output: Dict[str, Any] = {}
     if _output_path.exists():
-        _loaded_output = torch.load(_output_path, map_location="cpu")
-        if isinstance(_loaded_output, dict):
-            _existing_output = _loaded_output
+        try:
+            _loaded_output = torch.load(_output_path, map_location="cpu")
+            if isinstance(_loaded_output, dict):
+                _existing_output = _loaded_output
+        except Exception:
+            print(f"[warn] Could not load existing output at {_output_path} (corrupt?), starting fresh.")
+            _output_path.unlink(missing_ok=True)
     _existing_config = (
         dict(_existing_output.get("config", {})) if isinstance(_existing_output.get("config", {}), dict) else {}
     )
@@ -411,10 +442,10 @@ def main() -> None:
                 dense_anchor_stride=_effective_dense_anchor_stride,
             )
         layer_states: Dict[str, Dict[str, torch.Tensor]] = {}
-        if _resume_path.exists():
+        if not bool(args.no_resume) and _resume_path.exists():
             _resume_data = torch.load(_resume_path, map_location="cpu")
             layer_states = _resume_data.get("layer_states", {})
-        elif _existing_output:
+        elif not bool(args.no_resume) and _existing_output:
             layer_states = _existing_output.get("layer_states", {})
         completed_layers = sorted(int(_k) for _k in layer_states.keys())
         selected_layers = list(requested_layers)
@@ -542,16 +573,21 @@ def main() -> None:
     stats: Dict[str, Dict[str, float]] = {}
     _loaded_layer_x: Dict[int, List[torch.Tensor]] = {}
     _loaded_layer_y: Dict[int, List[torch.Tensor]] = {}
-    if _resume_path.exists():
+    _loaded_layer_kv_x: Dict[int, List[torch.Tensor]] = {}
+    _loaded_layer_kv_rows: Dict[int, int] = {}
+    if not bool(args.no_resume) and _resume_path.exists():
         _resume_data = torch.load(_resume_path, map_location="cpu")
         layer_states = _resume_data.get("layer_states", {})
         stats = _resume_data.get("stats", {})
         _loaded_layer_x = {int(_k): _xs for _k, _xs in _resume_data.get("layer_x", {}).items()}
         _loaded_layer_y = {int(_k): _ys for _k, _ys in _resume_data.get("layer_y", {}).items()}
+        _loaded_layer_kv_x = {int(_k): _xs for _k, _xs in _resume_data.get("layer_kv_x", {}).items()}
+        _loaded_layer_kv_rows = {int(_k): int(_v) for _k, _v in _resume_data.get("layer_kv_rows", {}).items()}
+        _kv_resumed = sum(v for v in _loaded_layer_kv_rows.values())
         print(f"[resume] loaded {len(layer_states)}/{len(selected_layers)} fitted layers, "
               f"{sum(1 for idx in _loaded_layer_x if int(idx) not in {int(s) for s in layer_states})} "
-              f"partially collected, from {_resume_path}")
-    elif _output_path.exists():
+              f"partially collected, {_kv_resumed} kv rows, from {_resume_path}")
+    elif not bool(args.no_resume) and _output_path.exists():
         _resume_data = torch.load(_output_path, map_location="cpu")
         layer_states = _resume_data.get("layer_states", {})
         stats = _resume_data.get("stats", {})
@@ -604,7 +640,19 @@ def main() -> None:
     layer_x: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
     layer_y: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
     layer_rows: Dict[int, int] = {int(idx): 0 for idx in selected_layers}
+
+    # KV co-collection setup (streaming harness only)
+    _kv_output_path: Optional[Path] = (
+        Path(str(args.kv_basis_output_path))
+        if bool(args.use_streaming_harness) and str(args.kv_basis_output_path).strip()
+        else None
+    )
+    _do_kv = _kv_output_path is not None
+    layer_kv_x: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers} if _do_kv else {}
+    layer_kv_rows: Dict[int, int] = {int(idx): 0 for idx in selected_layers} if _do_kv else {}
+    kv_layer_states: Dict[str, Any] = {}
     max_rows = int(max(args.max_rows_per_layer, 32))
+    _kv_max_rows = int(max(args.kv_max_rows, 32)) if _do_kv else max_rows
     rollout_tokens = int(max(args.dense_rollout_tokens, 1))
     for _k in layer_states:
         if int(_k) in layer_rows:
@@ -616,10 +664,31 @@ def main() -> None:
     for _k, _ys in _loaded_layer_y.items():
         if int(_k) in layer_y and int(_k) not in _completed_layer_ids:
             layer_y[int(_k)] = _ys
+    if _do_kv:
+        for _k, _xs in _loaded_layer_kv_x.items():
+            if int(_k) in layer_kv_x:
+                layer_kv_x[int(_k)] = _xs
+        for _k, _v in _loaded_layer_kv_rows.items():
+            if int(_k) in layer_kv_rows:
+                layer_kv_rows[int(_k)] = int(_v)
 
     _resume_save_every_batches = max(int(args.resume_save_every_batches), 0)
     _partial_output_every_batches = max(int(args.write_partial_output_every_batches), 0)
     overrides = _load_profile_overrides(str(args.profile_path))
+
+    # --- EVR-adaptive fitting thresholds -----------------------------------
+    # _fit_threshold: minimum rows before we attempt a first fit (1/8 of max).
+    # _EVR_LOW: if explained-variance-ratio < this after a fit, the basis is too
+    #   poor to trust; keep collecting and re-fit at 2× the current row count.
+    # _EVR_HIGH: EVR at or above this is "excellent" — accept without waiting for
+    #   more data (the current early-stop behaviour, unchanged).
+    # _layer_next_fit_at: per-layer "don't try to fit until this many rows" counter.
+    #   Starts at _fit_threshold for every layer; bumped to 2× on poor-EVR fits.
+    _fit_threshold = max(64, max_rows // 8)
+    _EVR_LOW: float = 0.50
+    _EVR_HIGH: float = 0.85
+    _layer_next_fit_at: Dict[int, int] = {int(idx): _fit_threshold for idx in selected_layers}
+    # -----------------------------------------------------------------------
 
     for batch in dataloader:
         if runtime is not None:
@@ -631,6 +700,9 @@ def main() -> None:
                 layer_y=layer_y,
                 layer_rows=layer_rows,
                 max_rows=max_rows,
+                layer_kv_x=layer_kv_x if _do_kv else None,
+                layer_kv_rows=layer_kv_rows if _do_kv else None,
+                kv_max_rows=_kv_max_rows,
             )
         else:
             assert model is not None
@@ -701,6 +773,8 @@ def main() -> None:
                 layer_y=layer_y,
                 selected_layers=selected_layers,
                 include_buffers=True,
+                layer_kv_x=layer_kv_x if _do_kv else None,
+                layer_kv_rows=layer_kv_rows if _do_kv else None,
             )
             _saved_resume = True
         if _partial_output_every_batches > 0 and _batch_count % _partial_output_every_batches == 0:
@@ -716,20 +790,34 @@ def main() -> None:
                 existing_config=_existing_config,
             )
             _saved_output = True
+        _min_rows = min((layer_rows[idx] for idx in selected_layers if str(idx) not in layer_states), default=0)
+        _max_rows_seen = max((layer_rows[idx] for idx in selected_layers if str(idx) not in layer_states), default=0)
+        _unfitted_idxs = [idx for idx in selected_layers if str(idx) not in layer_states]
+        _next_fit_min = min((_layer_next_fit_at[idx] for idx in _unfitted_idxs), default=0)
+        _row_info = f" rows=[{_min_rows}..{_max_rows_seen}] next_fit>={_next_fit_min}"
+        if _do_kv:
+            _kv_min = min((layer_kv_rows.get(int(idx), 0) for idx in selected_layers), default=0)
+            _kv_max_seen = max((layer_kv_rows.get(int(idx), 0) for idx in selected_layers), default=0)
+            _kv_pending = sum(1 for idx in selected_layers if layer_kv_rows.get(int(idx), 0) < _kv_max_rows)
+            _row_info += f" kv=[{_kv_min}..{_kv_max_seen}] kv_pending={_kv_pending}"
         if _saved_resume and _saved_output:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting — resume + partial output saved", flush=True)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} — resume + partial output saved", flush=True)
         elif _saved_resume:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting — resume saved", flush=True)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} — resume saved", flush=True)
         elif _saved_output:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting — partial output saved", flush=True)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} — partial output saved", flush=True)
         else:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting", flush=True)
-        # Fit and free any layer that has collected enough rows. Using 1/8 of max_rows
-        # as the threshold so layers are saved early and the resume file is written
-        # after just a few batches rather than waiting for all layers to be fully saturated.
-        _fit_threshold = max(64, max_rows // 8)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info}", flush=True)
+        # Fit layers that have collected enough rows.
+        # Each layer has an independent _layer_next_fit_at milestone (starts at
+        # _fit_threshold). After a fit, EVR decides what happens:
+        #   EVR >= _EVR_LOW  → accept the fit, stop collecting for this layer.
+        #   EVR <  _EVR_LOW  → basis too poor; keep all collected rows and
+        #                       re-fit when row count doubles (capped at max_rows).
+        # At max_rows capacity we always accept, whatever the EVR, since there is
+        # no more data to gather.
         for layer_idx in selected_layers:
-            if str(layer_idx) in layer_states or layer_rows[layer_idx] < _fit_threshold:
+            if str(layer_idx) in layer_states or layer_rows[layer_idx] < _layer_next_fit_at[layer_idx]:
                 continue
             _xs = layer_x[layer_idx]
             _ys = layer_y[layer_idx]
@@ -745,53 +833,80 @@ def main() -> None:
                 pca_method=str(_effective_pca_method),
                 pca_batch_rows=int(_effective_pca_batch_rows),
             )
-            layer_states[str(layer_idx)] = {
-                "encoder_weight": _fitted["encoder_weight"],
-                "encoder_bias": _fitted["encoder_bias"],
-                "decoder_blocks": _fitted["decoder_blocks"],
-                "decoder_bias": _fitted["decoder_bias"],
-                "scale": _fitted["scale"],
-            }
-            stats[str(layer_idx)] = {
-                "samples": float(_fitted["samples"]),
-                "rank_effective": float(_fitted["rank_effective"]),
-                "explained_variance_ratio": float(_fitted["explained_variance_ratio"]),
-                "pca_method": str(_fitted.get("pca_method", _effective_pca_method)),
-            }
-            # Once a layer is fitted, stop collecting more token rows for it in
-            # the current run. Resume loading already treats fitted layers this way.
-            layer_rows[layer_idx] = max_rows
-            layer_x[layer_idx].clear()
-            layer_y[layer_idx].clear()
-            _save_basis_resume(
-                resume_path=_resume_path,
-                layer_states=layer_states,
-                stats=stats,
-                layer_x=layer_x,
-                layer_y=layer_y,
-                selected_layers=selected_layers,
-                include_buffers=True,
-            )
-            _save_basis_output(
-                output_path=_output_path,
-                args=args,
-                selected_layers=_layers_for_output_save(selected_layers=selected_layers, layer_states=layer_states),
-                layer_states=layer_states,
-                stats=stats,
-                block_size=block_size,
-                num_blocks=num_blocks,
-                overrides=overrides,
-                existing_config=_existing_config,
-            )
-            pct_done = int(len(layer_states) * 100 // max(len(selected_layers), 1))
-            print(
-                f"[checkpoint] {len(layer_states)}/{len(selected_layers)} layers fitted ({pct_done}%)"
-                f" — resume + partial output saved"
-            )
+            _evr = float(_fitted.get("explained_variance_ratio", 1.0))
+            _at_capacity = layer_rows[layer_idx] >= max_rows
+            if _evr >= _EVR_LOW or _at_capacity:
+                # Accept: EVR is good enough, or we have used all the data we will get.
+                _evr_tag = (
+                    "excellent" if _evr >= _EVR_HIGH
+                    else ("acceptable" if _evr >= _EVR_LOW else "best-effort")
+                )
+                layer_states[str(layer_idx)] = {
+                    "encoder_weight": _fitted["encoder_weight"],
+                    "encoder_bias": _fitted["encoder_bias"],
+                    "decoder_blocks": _fitted["decoder_blocks"],
+                    "decoder_bias": _fitted["decoder_bias"],
+                    "scale": _fitted["scale"],
+                }
+                stats[str(layer_idx)] = {
+                    "samples": float(_fitted["samples"]),
+                    "rank_effective": float(_fitted["rank_effective"]),
+                    "explained_variance_ratio": _evr,
+                    "pca_method": str(_fitted.get("pca_method", _effective_pca_method)),
+                }
+                # Stop collecting for this layer.
+                layer_rows[layer_idx] = max_rows
+                layer_x[layer_idx].clear()
+                layer_y[layer_idx].clear()
+                _save_basis_resume(
+                    resume_path=_resume_path,
+                    layer_states=layer_states,
+                    stats=stats,
+                    layer_x=layer_x,
+                    layer_y=layer_y,
+                    selected_layers=selected_layers,
+                    include_buffers=True,
+                    layer_kv_x=layer_kv_x if _do_kv else None,
+                    layer_kv_rows=layer_kv_rows if _do_kv else None,
+                )
+                _save_basis_output(
+                    output_path=_output_path,
+                    args=args,
+                    selected_layers=_layers_for_output_save(selected_layers=selected_layers, layer_states=layer_states),
+                    layer_states=layer_states,
+                    stats=stats,
+                    block_size=block_size,
+                    num_blocks=num_blocks,
+                    overrides=overrides,
+                    existing_config=_existing_config,
+                )
+                pct_done = int(len(layer_states) * 100 // max(len(selected_layers), 1))
+                print(
+                    f"[checkpoint] layer {layer_idx}: EVR={_evr:.3f} ({_evr_tag}),"
+                    f" {_fitted['samples']} samples —"
+                    f" {len(layer_states)}/{len(selected_layers)} fitted ({pct_done}%)"
+                    f" — resume + partial output saved",
+                    flush=True,
+                )
+            else:
+                # Poor fit: keep the collected data and schedule a re-fit once the
+                # row count doubles (or reaches max_rows, whichever comes first).
+                _next_milestone = min(layer_rows[layer_idx] * 2, max_rows)
+                _layer_next_fit_at[layer_idx] = _next_milestone
+                print(
+                    f"[refit] layer {layer_idx}: EVR={_evr:.3f} < {_EVR_LOW} with"
+                    f" {layer_rows[layer_idx]} rows — keeping data, re-fit at {_next_milestone} rows",
+                    flush=True,
+                )
         if int(args.max_batches) > 0 and _batch_count >= int(args.max_batches):
             print(f"[bounded] reached max_batches={int(args.max_batches)}; stopping early", flush=True)
             break
-        if all(v >= max_rows for v in layer_rows.values()):
+        _mlp_done = all(v >= max_rows for v in layer_rows.values())
+        _kv_done = (
+            not _do_kv
+            or all(layer_kv_rows.get(int(idx), 0) >= _kv_max_rows for idx in selected_layers)
+        )
+        if _mlp_done and _kv_done:
             break
 
     # Fit any layers that stopped short of max_rows (e.g. dataset exhausted early)
@@ -849,6 +964,57 @@ def main() -> None:
         existing_config=_existing_config,
     )
     print(json.dumps({"output_path": str(_output_path), "layers_initialized": len(layer_states), "stats": stats}, indent=2))
+
+    # ── KV basis fitting (same collected h_norm data, zero extra forward passes) ──
+    if _do_kv and _kv_output_path is not None and runtime is not None:
+        print("[kv_basis] fitting K/V routing basis from co-collected activations...", flush=True)
+        _kv_hidden_size = int(getattr(runtime.config, "hidden_size", 16384))
+        _kv_kv_hidden = int(
+            getattr(runtime.config, "num_key_value_heads", 8)
+            * getattr(runtime.config, "head_dim", 128)
+        )
+        _kv_block_size = 32
+        _kv_num_col_blocks = _kv_hidden_size // _kv_block_size
+        for layer_idx in selected_layers:
+            xs = layer_kv_x.get(int(layer_idx), [])
+            if not xs:
+                print(f"[kv_basis] layer {layer_idx}: no data — skipping", flush=True)
+                continue
+            x = torch.cat(xs, dim=0)
+            print(f"[kv_basis] layer {layer_idx}: fitting on {int(x.shape[0])} rows...", flush=True)
+            fitted_kv = _fit_kv_basis_fn(
+                x=x,
+                kv_out=torch.zeros(int(x.shape[0]), _kv_kv_hidden),  # unused in routing fit
+                basis_rank=int(args.kv_basis_rank),
+                block_size=_kv_block_size,
+                hidden_size=_kv_hidden_size,
+                pca_method=str(_effective_pca_method),
+                pca_batch_rows=int(_effective_pca_batch_rows),
+            )
+            kv_layer_states[str(layer_idx)] = {
+                "encoder_weight":  fitted_kv["encoder_weight"],
+                "encoder_bias":    fitted_kv["encoder_bias"],
+                "decoder_blocks":  fitted_kv["decoder_blocks"],
+                "decoder_bias":    fitted_kv["decoder_bias"],
+                "block_importance": fitted_kv["block_importance"],
+            }
+        _kv_output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "config": {
+                    "hidden_size":      _kv_hidden_size,
+                    "kv_hidden":        _kv_kv_hidden,
+                    "block_size":       _kv_block_size,
+                    "num_col_blocks":   _kv_num_col_blocks,
+                    "basis_rank":       int(args.kv_basis_rank),
+                    "top_k":            int(args.kv_basis_top_k),
+                    "separate_k_v_routing": False,
+                },
+                "layer_states": kv_layer_states,
+            },
+            _kv_output_path,
+        )
+        print(f"[kv_basis] saved {len(kv_layer_states)} layers → {_kv_output_path}", flush=True)
 
 
 if __name__ == "__main__":
