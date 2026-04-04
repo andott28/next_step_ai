@@ -22,10 +22,15 @@ except ImportError:  # pragma: no cover
 
 
 def _parse_layer_selection(spec: str | None) -> Optional[List[int]]:
-    if spec is None or str(spec).strip() == "":
+    if spec is None:
+        return None
+    stripped = str(spec).strip()
+    if stripped == "" or stripped.lower() == "all":
+        return None
+    if stripped.lower() in {"none", "off", "disable", "disabled"}:
         return []
     out: set[int] = set()
-    for part in str(spec).split(","):
+    for part in stripped.split(","):
         token = part.strip()
         if not token:
             continue
@@ -51,7 +56,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--taylor-layers", type=str, default="", help="Layer selection, for example '0-31'")
+    p.add_argument(
+        "--taylor-layers",
+        type=str,
+        default="",
+        help="Taylor-attention layer selection, for example '0-31'. Omit or use 'all' for the runtime default, use 'none' to disable Taylor attention.",
+    )
     p.add_argument(
         "--taylor-feature-map",
         type=str,

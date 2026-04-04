@@ -1,0 +1,10 @@
+probe_start=1775246616.253657
+init_s=3.51
+prefill_s=167.29
+topk_begin
+1	128006	'<|start_header_id|>'	17.796875
+2	121648	'患者'	8.9140625
+3	14924	'Question'	8.1171875
+4	17385	' migrationBuilder'	8.0625
+5	125240	'治疗'	8.0625
+topk_end
