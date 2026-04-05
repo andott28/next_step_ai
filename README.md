@@ -1,25 +1,23 @@
 ﻿# next_step_ai
 
-This repository contains the current Neuroplastic Llama experimentation stack focused on sparse MLP routing, hybrid GQA/Mamba attention, Taylor-SSD attention integration, and strict autoregressive decode stability.
+This repository contains the current Neuroplastic Llama experimentation stack focused on training-faithful learned-basis MLP execution, layer-streamed 405B inference, sparse attention/KV transfer, Taylor-SSD integration, and strict autoregressive decode regression testing.
 
 The canonical model class is `llama3_neuroplastic/neuroplastic_llama_gqa_mamba.py`.
-The canonical sparse path for legacy experiments is:
 
-- `sparse_placement="learned_basis"`
-- `routing_mode="semantic_latent"`
+For the 405B streamed runtime, the source of truth is split intentionally:
 
-For Taylor rollout experiments, the preferred sparse path is:
-
-- `sparse_placement="input_mask"`
-- block-bank manifest loading through `load_sparse_mlp_bank_manifest(...)`
+- CLI and wiring: `llama3_neuroplastic/experiments/run_streaming_inference.py`
+- Runtime implementation: `llama3_neuroplastic/experiments/streaming_llama_runtime.py`
+- Learned-basis artifact contract: `llama3_neuroplastic/basis_fitting.py`
+- Learned-basis semantic execution: `llama3_neuroplastic/sca_sparse_mlp.py`
+- Sparse config defaults and per-layer basis-top-k semantics: `llama3_neuroplastic/sca_sparse_config.py`
 
 ## What this project is building
 
-This repo does not train from scratch. It starts from a dense Llama-family checkpoint (usually `unsloth/Meta-Llama-3.1-8B-bnb-4bit`) and replaces parts of runtime/training with sparse and hybrid components while trying to preserve normal greedy decode quality.
+This repo does not train from scratch. It starts from dense Llama-family checkpoints and replaces parts of runtime and calibration with sparse and hybrid components while trying to preserve normal greedy decode quality.
 
-Current long-term target:
+Current target:
 
-- Use the 8B model as the proving platform.
 - Push architecture/runtime ideas toward a 405B-class deployment strategy on 8 GB VRAM using sparsity, quantization, and off-GPU streaming.
 - **No-Training Invariant:** Deep SGD schedules are structurally prohibited. The architecture relies entirely on exact closed-form alignment strategies (e.g., PCA basis initialization, analytical mean-shift compensation, layer-adaptive capacity profiling). Downstream manifold integration must resolve analytically zero-shot.
 
@@ -36,146 +34,167 @@ Compared to the original Unsloth execution path, this repo is heavily modified:
 
 In short: base weights are reused, but execution and calibration logic are substantially different.
 
-## Current state (March 2026)
+## Current status
 
-What is working:
+- The 405B streamed runtime is correctness-first and stable on the current sparse MLP path.
+- The learned-basis MLP execution now matches the training-side semantics in the critical latent and bias handling paths.
+- Sparse-attention decode is stable again, but the runtime is still far below the `2.8 tok/s` throughput target because attention remains compute-dense and uncovered MLP layers still use exact dense guards.
 
-- Bottom buffer guard (`sca_bottom_buffer_layers=2`) fixes the early-layer collapse issue.
-- Semantic-latent routing path is implemented and tested.
-- Routing collapse mitigations (balance penalties, per-layer controls) are in place.
-- Runtime cleanup pass (March 22, 2026) landed without feature removal:
-  - bounded-context attention now uses an explicit wrapper module instead of forward monkeypatching
-  - generation/cache runtime mode checks are cached in internal runtime flags
-  - decode loop reduces hot-path overhead (vectorized EOS/repetition penalty logic, lower per-step churn)
-  - sparse config now validates incompatible runtime combinations earlier and supports per-layer canonicalized overrides
-- Taylor rollout harness stability fixes (March 23, 2026):
-  - Taylor recurrent cache is now surfaced correctly as `present` in `gqa_taylor_ssd.py`
-  - ablation runner isolates each variant in a fresh subprocess to avoid sequential 4-bit model-load VRAM churn/device-map failures
-  - Taylor order-2 feature map now includes the linear term in symmetric mode and uses corrected quadratic scaling coefficients
-  - Windows 405B streaming now re-opens safetensor shards on demand instead of pinning many shard handles open for the whole run; this avoids the later-shard access-violation crash seen around the mid-model layers
-- 405B streaming sparse-runtime fixes (March 26, 2026):
-  - the layer skeleton now keeps the large MLP module off GPU so first-token VRAM headroom stays within 8 GB-class cards
-  - sparse MLP execution uses the repo's Triton 4-bit sparse kernels again instead of `Params4bit[...]` indexing
-  - dense fallback MLPs stream one projection at a time through a reusable GPU staging buffer
-  - Windows shard tensors are cloned into normal CPU RAM in the cache to avoid mmap-backed CUDA copy instability
-  - sparse execution has been verified with real 405B weights in lightweight streamed checks across multiple layers without changing model math
-- 405B streaming runtime improvements (March 28, 2026):
-  - **OOM fix for sparse mode:** non-sparse MLP layers (those without routing coverage) previously crashed with CUDA OOM by materialising three ~1.7 GB GPU tensors (gate/up/down) when `_mlp_proj_staging` was skipped. They now compute on CPU using the RAM-cached dequantised weights and only transfer the 32 KB output back to GPU.
-  - **Batched prompt prefill:** `_forward_prefill` loads each of the 126 layers exactly once per prompt regardless of prompt length, then processes all prompt tokens sequentially within that layer before moving on. This reduces layer loads from `prompt_len Ã— 126` to `126` for multi-token prompts.
-  - **Persistent interactive mode:** `run_streaming_inference.py` without `--prompt` now enters a REPL loop instead of exiting. The `StreamingLlamaRuntime` and its RAM weight cache survive between queries â€” the first query warms whatever layers fit in RAM; subsequent queries skip SSD for those layers. Pass `--prompt "..."` to keep the old scripted single-shot behaviour.
-  - **Auto RAM cache sizing:** on startup the runtime calls `psutil` to detect available system RAM and caps the weight cache at 90% of it by default (printed at startup, bounded by `STREAMING_RAM_CACHE_AUTO_FRACTION`). Override with `STREAMING_RAM_CACHE_MAX_GB`; set to `0` to disable caching entirely. Without an explicit limit the cache previously grew unbounded toward 200 GB and would silently exhaust system RAM on 32 GB machines.
- - 405B prompt-reuse/runtime improvements (March 30, 2026):
-  - decoded tokens now stream to stdout incrementally during generation instead of only appearing at the end
-  - interactive mode remains a plain prompt REPL, but it now keeps the runtime alive and reuses the longest common token prefix between the previous processed sequence and the new prompt
-  - on divergence, the runtime crops the existing `DynamicCache` to the shared prefix and only prefills the changed suffix (`[prompt] delta prefill: reused X/Y tokens; streaming Z new tokens`)
-  - if the new prompt exactly matches the old prefix, the runtime replays only the prompt tail needed to recover fresh logits instead of doing a full cold prefill
-  - the runtime keeps `lm_head` on CPU when putting it on GPU would starve the sparse q/o VRAM hot-cache on 8 GB cards
+## 405B Runtime Architecture
 
-- Hybrid Softmax-Linear Attention landing (March 23, 2026):
-  - Fixed severe repetition collapse (`Write Write ...`) by implementing an exact causal local softmax window plus a Performer-style compressed recurrent tail.
-  - Fixed a generation bug where `use_cache` was not being correctly forwarded by `transformers` to the Taylor wrapper layers.
-  - The local window (default $W=64$) preserves 100% on-manifold signals for the critical local context, while the Performer tail provides infinite-context retrieval.
+The project supports running **Llama 3.1 405B Instruct** on an 8 GB card using a layer-streamed out-of-core runtime plus sparse sidecar artifacts.
 
-- Practical implication: The 8B model is the stable proving ground, but the architecture is now fully verified for **405B Out-of-Core Deployment**.
-- Taylor attention with **Hybrid Performer** feature map (`feature_map="hybrid_performer"`, the new default) is the recommended attention backend. This uses an exact local window (sliding buffer) to preserve manifold alignment and a Performer-style recurrent tail for long-range context.
+### Active artifacts
 
-## 405B Out-of-Core Deployment
+- `results/mlp_basis.pt`
+  - learned-basis MLP checkpoint
+  - `110/126` covered layers
+  - layers `2..111`
+  - output-space blocks over the `16384`-dim MLP output
+  - `block_size=32`, `num_blocks=512`, `basis_rank=64`
+- `results/attn_head_importance_405b.pt`
+  - full `126/126` layer coverage
+  - head-importance metadata for sparse q/o transfer
+- `results/kv_basis_r32.pt`
+  - sparse K/V column-block routing artifact
+  - `block_size=32`, `basis_rank=32`, `top_k=51`
 
-The project now supports running **Llama 3.1 405B (Instruct)** on consumer hardware (8GB VRAM) using a layer-by-layer SSD streaming harness.
+### How the runtime currently works
 
-### How it works:
-- **Layer Streaming:** Only one 405B layer (~1.6 GB in 4-bit) is present in VRAM at any time. Weights are streamed directly from NVMe SSD to GPU.
-- **CPU Offloading:** The massive `embed_tokens` and `lm_head` (4.2 GB each) are kept on System RAM to stay within the 8GB GPU limit.
-- **Sparse MLP Fast Path:** Learned-basis sparse layers use Triton 4-bit sparse kernels on GPU, driven from packed NF4 weights cached on CPU.
-- **Dense Fallback Path:** Non-sparse MLP layers stream one projection at a time through a reusable GPU buffer instead of keeping the full FFN resident.
-- **Windows Stability Tradeoff:** Full bitsandbytes CUDA dequant during layer-load is not currently reliable on the tested Windows 11 + 8 GB setup, so streamed layer materialization still uses the stable CPU dequant path there.
-- **Zero-Shot PCA:** Use `init_learned_basis_from_dense_mlp.py` with the `--use-streaming-harness` flag to initialize the sparse routing geometry analytically without ever loading the full model into system RAM.
-- **Sparse Attention Head Loading:** Use `init_learned_attn_head_importance.py` to profile per-head contribution norms, then pass the resulting checkpoint via `--attn-head-importance-path`. Only the top-K heads' NF4 bytes are transferred per layer, reducing attention PCIe traffic by 50â€“87%.
+- **Layer streaming:** only one decoder layer skeleton is materialized on GPU at a time. Large base weights are RAM-cached and streamed into that skeleton.
+- **Embed/lm_head placement:** `embed_tokens` and `lm_head` stay off the 8 GB hot path. The runtime favors GPU headroom for layer execution over keeping those giant tensors resident.
+- **Covered MLP layers:** layers present in `results/mlp_basis.pt` run through the training-faithful learned-basis path in `streaming_llama_runtime.py`.
+  - Shared latent path: `encoder linear -> SiLU -> latent top-k mask`
+  - Latent support top-k is separate from block-routing top-k and follows checkpoint config or the training default from `sca_sparse_config.py`
+  - Default executor is `full_output_latent`, meaning the runtime reconstructs the full MLP output from only the active latent coordinates
+  - The old routed-block executor is still available only as a debug switch via `STREAMING_SPARSE_BASIS_EXECUTION=routed_blocks`
+  - Decoder bias is not broadcast to inactive blocks
+- **Uncovered MLP layers:** layers `0`, `1`, and `112..125` use an exact chunked 4-bit dense guard path on GPU.
+  - This is correctness-first
+  - It is not a zero-pass-through approximation
+  - It is also the single most expensive remaining MLP path
+- **Decode attention:** sparse attention currently reduces transfer, not dense attention math.
+  - q/o weights are loaded only for selected heads using `results/attn_head_importance_405b.pt`
+  - those partial weights are scattered into dense q/o skeleton tensors
+  - the normal dense attention module then runs on that skeleton
+  - on the tested 8 GB RTX 2080 path, `--attn-active-heads 64 --attn-max-active-heads 64` typically produces a 64-head candidate pool but only `16/128` live decode heads
+- **Decode KV:** K/V uses routed column-block transfer from `results/kv_basis_r32.pt`
+  - active blocks are predicted from the post-layernorm hidden states
+  - active K/V columns are loaded and scattered into dense K/V skeleton tensors
+  - the downstream attention compute remains dense
+- **Prefill policy:** prefill defaults to dense q/o and dense K/V even when sparse artifacts are present.
+  - this is deliberate
+  - sparse prefill was the source of the old `AppBundle` corruption
+  - the current runtime keeps prefill correctness above first-token speed
+- **Taylor policy:** Taylor is auto-disabled when streamed sparse attention is active unless `STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN=1` is set.
 
-### 405B Streaming Status
+## 405B Streaming Status
 
-- Verified: streamed 405B forwards with real `unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit` weights and real learned-basis routing checkpoints complete through multiple sparse-enabled layers.
-- Verified sparse layers in lightweight checks: layers `2`, `3`, and `4` executed through the sparse Triton path without falling back to dense MLP execution.
-- Verified output shape in those checks: `logits_shape == (1, 1, 128256)`.
-- Learned-basis checkpoint (`results/learned_basis_init_405b_96r.pt`) is complete for its intended sparse layout: `83` selected MLP layers, rank `96`, block size `32`, `dense_anchor_stride=4`, `bottom_buffer_layers=2`, `decode_guard_layers=12`.
-- Attention head importance checkpoint (`results/attn_head_importance_405b.pt`) now has full `126/126` layer coverage.
-- The runtime now executes learned-basis layers directly as learned-basis MLPs, keeps gathered sparse tensors on the pinned H2D path, caches sparse q/o hot heads in VRAM, and clears only previously-written q/o rows and columns instead of zeroing full q/o matrices every layer.
-- Fast bounded checks have already reached decode traffic of about `27.8 MB/layer`, which is inside the earlier `26-32 MB/layer` target band.
-- Measured pinned H2D bandwidth on the test machine is about `11.5 GB/s`, and the full production command is now stable with no OOM recovery spam on the corrected sparse path.
-- Current measured warm decode is still below the original throughput target: after prompt prefill and first-step hot-cache warmup, the third generated token was about `2.9 s/token` (`~0.34 tok/s`) on the test machine.
+- The correctness regression that produced `AppBundle` is fixed.
+- The runtime now logs `non-selected layers use exact streamed dense guard execution`, which reflects the real behavior.
+- The sparse MLP side is now much closer to the intended architecture than the attention side.
+- The runtime is still **well below** the historical `2.8 tok/s` target on the test machine.
 
-### 405B Inference Command (interactive prompt REPL):
+### Why throughput is still low
 
-Omitting `--prompt` starts a persistent plain-prompt REPL. The runtime stays loaded between queries, decoded tokens stream to stdout incrementally, and the prompt cache is reused by longest-common-prefix matching. Use `/reset` to clear the cached prefix state.
+- Sparse MLP execution is now computationally sparse for the `110` covered layers, but attention is still mostly transfer-sparse and compute-dense.
+- The `16` uncovered MLP layers still pay the exact chunked dense guard cost every decode token.
+- Prefill intentionally stays dense for q/o and K/V, so first-token latency remains expensive.
+- The VRAM hot-cache can auto-clamp off when free VRAM falls below the configured safety margin, which pushes more traffic back onto the RAM->GPU path.
 
-```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
-  --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --max-new-tokens 64 `
-  --sparse-basis-path ".\results\learned_basis_init_405b_96r.pt" `
-  --attn-head-importance-path ".\results\attn_head_importance_405b.pt" `
-  --attn-active-heads 64 `
-  --vram-hot-cache-gb 2.0 `
-  --hot-block-threshold 0.80
-```
+Bounded current measurements on the test machine:
 
-Pass `--prompt "..."` instead to run a single query and exit (scripted mode, cold prompt path).
+- `2` runtime layers and `1` generated token: `18.0s`, `overall=1762.06 MB/layer`
+- `2` runtime layers and `2` generated tokens: `46.5s`, `decode=1510.06 MB/layer`, `overall=1636.06 MB/layer`
 
-### 405B Inference Command (scripted single-shot):
+Those bounded probes hit the early dense-guard layers, so they are not representative of the sparse-covered middle band. They are still useful because they show where the current byte budget is being burned.
+
+## 405B Commands
+
+The sections above describe the architecture and current performance envelope. The commands below are the current repo-supported entrypoints for that runtime.
+
+### 405B Inference Command (interactive prompt REPL)
+
+Omitting `--prompt` starts a persistent plain-prompt REPL. The runtime stays alive between queries, decoded tokens stream to stdout, and the prompt cache is reused by longest-common-prefix matching. Use `/reset` to clear the cached prefix state.
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.run_streaming_inference `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --prompt "Write one sentence about the history of Norway." `
-  --max-new-tokens 24 `
-  --sparse-basis-path ".\results\learned_basis_init_405b_96r.pt" `
-  --attn-head-importance-path ".\results\attn_head_importance_405b.pt" `
+  --local-files-only `
+  --sparse-basis-path results/mlp_basis.pt `
+  --sparse-top-k 51 `
+  --attn-head-importance-path results/attn_head_importance_405b.pt `
   --attn-active-heads 64 `
+  --attn-max-active-heads 64 `
+  --kv-basis-path results/kv_basis_r32.pt `
+  --kv-sparse-top-k 51 `
   --vram-hot-cache-gb 2.0 `
-  --hot-block-threshold 0.80
+  --max-new-tokens 64
 ```
 
-Practical note:
+Pass `--prompt "..."` to run a single query and exit.
 
-- On Windows the RAM cache is pageable by default. The runtime repins transient hot-path tensors before H2D copies, which is the stable high-throughput path on this setup.
-- `--attn-active-heads 64` is safe on the command line. The runtime auto-caps the actual active head budget to the target layer traffic budget (`STREAMING_TARGET_LAYER_MB`, default `30 MB/layer`).
-- Interactive prompt mode is the lowest-latency path available here because it can reuse the old prompt prefix and only prefill the changed suffix.
-
-### 405B Throughput Smoke Command
-
-Use the exact production command surface plus `--max-runtime-layers` when you want a tiny verification pass without paying for a full 126-layer decode:
+### 405B Inference Command (scripted single-shot)
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.run_streaming_inference `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --prompt "Write one sentence about the history of Norway." `
-  --max-new-tokens 24 `
-  --sparse-basis-path ".\results\learned_basis_init_405b_96r.pt" `
-  --attn-head-importance-path ".\results\attn_head_importance_405b.pt" `
+  --local-files-only `
+  --sparse-basis-path results/mlp_basis.pt `
+  --sparse-top-k 51 `
+  --attn-head-importance-path results/attn_head_importance_405b.pt `
   --attn-active-heads 64 `
+  --attn-max-active-heads 64 `
+  --kv-basis-path results/kv_basis_r32.pt `
+  --kv-sparse-top-k 51 `
   --vram-hot-cache-gb 2.0 `
-  --hot-block-threshold 0.80 `
-  --max-runtime-layers 8
+  --max-new-tokens 32 `
+  --prompt "The capital of France is"
 ```
 
-This smoke run should show:
+Practical notes:
 
-- no `[sparse] VRAM hot-cache disabled ...` message
-- no repeated sparse-attention OOM recovery
-- decode traffic staying near `26-32 MB/layer`
+- `run_streaming_inference.py` passes `--prompt` straight to the tokenizer. It does not apply a chat template for instruct checkpoints.
+- `--attn-active-heads 64 --attn-max-active-heads 64` means a 64-head candidate pool, not guaranteed 64 live decode heads.
+- On the tested 8 GB path, the healthy sparse-attention decode log shape is usually `active_heads=16/128 ... min=16 max=64`.
 
-Remove `--max-runtime-layers` for the real benchmark.
+### 405B Throughput / Correctness Micro-Probe
+
+Use the exact production command surface plus `--max-runtime-layers` for a cheap probe before paying for a full `126`-layer run.
+
+```powershell
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.run_streaming_inference `
+  --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
+  --local-files-only `
+  --sparse-basis-path results/mlp_basis.pt `
+  --sparse-top-k 51 `
+  --attn-head-importance-path results/attn_head_importance_405b.pt `
+  --attn-active-heads 64 `
+  --attn-max-active-heads 64 `
+  --kv-basis-path results/kv_basis_r32.pt `
+  --kv-sparse-top-k 51 `
+  --vram-hot-cache-gb 2.0 `
+  --max-runtime-layers 4 `
+  --max-new-tokens 2 `
+  --no-stream-output `
+  --prompt "The capital of France is"
+```
+
+Healthy signals for this micro-probe:
+
+- no `AppBundle`
+- no `zero-pass-through` wording in the sparse MLP log
+- no Taylor non-finite decode crash
+- a traffic report is emitted at the end
+
+Do not expect `2.8 tok/s` from the current runtime architecture. The micro-probe is for regression detection and hot-path attribution, not for proving the final throughput target.
 
 ### Rebuilding the attention importance checkpoint
 
 The attention checkpoint already exists in `results/attn_head_importance_405b.pt`. Re-run this only if you want to regenerate it.
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\init_learned_attn_head_importance.py `
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.init_learned_attn_head_importance `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
   --output-path ".\results\attn_head_importance_405b.pt" `
   --taylor-layers "0-125" `
@@ -187,15 +206,15 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 
 Practical note:
 
-- Speed per token is dominated by per-layer traffic, not just whether sparse features are technically enabled. The current runtime is designed around the `26-32 MB/layer` decode target rather than the old `~285 MB/layer` attention path.
-- On 32 GB RAM the weight cache budget is now based on about 90% of currently available system RAM, not the older fixed 70% cap. The exact hot-layer count depends on free RAM at launch.
+- Speed per token is now dominated by per-layer byte traffic and dense attention compute, not by whether the sparse MLP path itself is active.
+- On 32 GB RAM the weight cache budget is auto-sized from currently available RAM at startup.
 - For runtime verification, prefer short streamed checks that use `--max-runtime-layers` and inspect the emitted traffic report before paying for a full benchmark.
 
-### Immediate Next Steps
+### Current limits
 
-1. Use interactive prompt mode for any repeated prompt-edit workflow; that is the path that now reuses the old prefix.
-2. Use scripted mode only for cold-start benchmarks or one-off prompts.
-3. If more latency work is needed, the remaining problem is first-token latency, not sparse-path correctness or cache reuse plumbing.
+1. The sparse learned-basis MLP path is now the corrected reference implementation, but the exact dense guard path for uncovered layers is still expensive.
+2. Sparse attention and sparse KV currently save transfer, not dense attention compute.
+3. If more latency work is needed, the next target is the attention/runtime hot path, not the learned-basis MLP semantics.
 
 ### 405B Learned-Basis Init Notes
 
@@ -225,19 +244,18 @@ Partial artifacts:
 Collection depth:
 
 - the default `--max-rows-per-layer 4096` implies an early-fit threshold of `max(64, 4096 / 8) = 512` rows per selected layer
-- because one token contributes roughly one row to every still-pending selected layer, the runtime cost is mostly determined by total valid tokens processed, not by `83 x tokens` separate forward passes
+- because one token contributes roughly one row to every still-pending selected layer, the runtime cost is mostly determined by total valid tokens processed, not by `selected_layers x tokens` separate forward passes
 - lowering `--max-rows-per-layer` is the main lever for faster smoke runs
 
 Fast smoke-run example that produces a real output checkpoint rather than only a resume file:
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\init_learned_basis_from_dense_mlp.py `
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.init_learned_basis_from_dense_mlp `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --output-path ".\results\learned_basis_init_405b_smoke.pt" `
+  --output-path ".\results\mlp_basis_smoke.pt" `
   --use-streaming-harness `
   --batch-size 1 `
-  --basis-rank 96 `
+  --basis-rank 64 `
   --sca-block-size 32 `
   --sca-dense-anchor-stride 4 `
   --max-samples 2 `
@@ -246,15 +264,7 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 
 This smoke command intentionally ends after a tiny bounded dataset slice so the script finalizes whatever rows were collected and writes a real checkpoint suitable for plumbing tests.
 
-### Safe operating ranges (March 2026)
-
-| Component       | Safe layers (32-layer 8B)            | Notes                                              |
-|-----------------|--------------------------------------|----------------------------------------------------|
-| Sparse MLP      | 3â€“7 (mid-band only)                  | Use `--sca-bottom-buffer-layers 3 --sca-decode-guard-layers 24` |
-| Taylor attention| 4â€“27 (Hybrid Performer)             | `local_window=64, feature_dim=64` are now the stable defaults |
-| Dense fallback  | all                                  | Always baseline-safe                               |
-
-- **Acceptance Criteria.** Short prompts can look superficially coherent even when the architecture is failing under strict decode metrics. In practice, the real acceptance criteria are rollout KL, hidden-state cosine, degeneration rate, and strict greedy continuation quality rather than one-off prompt samples.
+**Acceptance Criteria.** Short prompts can look superficially coherent even when the architecture is failing under strict decode metrics. In practice, the real acceptance criteria are rollout KL, hidden-state cosine, degeneration rate, and strict greedy continuation quality rather than one-off prompt samples.
 
 ## Key files
 
@@ -262,7 +272,7 @@ This smoke command intentionally ends after a tiny bounded dataset slice so the 
 - `llama3_neuroplastic/gqa_taylor_ssd.py`: deterministic Taylor-SSD recurrent attention backend
 - `llama3_neuroplastic/sca_sparse_mlp.py`: sparse MLP wrapper, semantic routing, curriculum/banking hooks, and learned-basis execution logic
 - `llama3_neuroplastic/sca_sparse_config.py`: sparse config, runtime compatibility validation, and per-layer override canonicalization
-- `llama3_neuroplastic/triton_sparse_mlp.py`: Triton sparse MLP kernels used by the fast runtime path
+- `llama3_neuroplastic/triton_sparse_mlp.py`: Triton sparse-weight kernels used by legacy and debug sparse-weight paths; not the default executor for `results/mlp_basis.pt`
 - `llama3_neuroplastic/basis_fitting.py`: closed-form learned-basis fitting utilities
 - `llama3_neuroplastic/experiments/run_streaming_inference.py`: high-bandwidth SSD streaming inference entrypoint
 - `llama3_neuroplastic/experiments/streaming_llama_runtime.py`: layer-by-layer out-of-core runtime (FP16/4-bit)
@@ -284,7 +294,6 @@ Run from repo root in PowerShell.
 ### 1) Runtime regression test
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 .\verification_env\Scripts\python.exe -m pytest `
   tests/test_streaming_llama_runtime.py `
   -q
@@ -293,12 +302,11 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 ### 2) Learned-basis init / resume
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\init_learned_basis_from_dense_mlp.py `
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.init_learned_basis_from_dense_mlp `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --output-path ".\results\learned_basis_init_405b_96r.pt" `
+  --output-path ".\results\mlp_basis.pt" `
   --use-streaming-harness `
-  --basis-rank 96 `
+  --basis-rank 64 `
   --sca-block-size 32 `
   --resume-save-every-batches 1 `
   --write-partial-output-every-batches 1
@@ -307,20 +315,23 @@ $env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
 ### 3) Streaming inference run
 
 ```powershell
-$env:PYTHONPATH='.;.\llama3_neuroplastic;.\llama3_neuroplastic\experiments'
-.\verification_env\Scripts\python.exe .\llama3_neuroplastic\experiments\run_streaming_inference.py `
+.\verification_env\Scripts\python.exe -u -m llama3_neuroplastic.experiments.run_streaming_inference `
   --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" `
-  --prompt "Write one sentence about the history of Norway." `
-  --max-new-tokens 24 `
-  --sparse-basis-path ".\results\learned_basis_init_405b_96r.pt" `
+  --local-files-only `
+  --prompt "The capital of France is" `
+  --max-new-tokens 32 `
+  --sparse-basis-path ".\results\mlp_basis.pt" `
+  --sparse-top-k 51 `
   --attn-head-importance-path ".\results\attn_head_importance_405b.pt" `
   --attn-active-heads 64 `
-  --vram-hot-cache-gb 2.0 `
-  --hot-block-threshold 0.80
+  --attn-max-active-heads 64 `
+  --kv-basis-path ".\results\kv_basis_r32.pt" `
+  --kv-sparse-top-k 51 `
+  --vram-hot-cache-gb 2.0
 ```
 
 ## Notes
 
 - This repo is now inference-first. The critical reproducible path is: build or resume the learned-basis checkpoint, then run the streaming inference entrypoint with the 405B sparse artifacts.
 - The thin wrapper modules under `llama3_neuroplastic/` are intentionally not required. Use the direct `experiments/` paths shown above.
-- Results pruning is acceptable as long as the runtime-critical checkpoints remain present, especially `results/learned_basis_init_405b_96r.pt` and `results/attn_head_importance_405b.pt`.
+- Results pruning is acceptable as long as the runtime-critical checkpoints remain present, especially `results/mlp_basis.pt`, `results/attn_head_importance_405b.pt`, and `results/kv_basis_r32.pt`.

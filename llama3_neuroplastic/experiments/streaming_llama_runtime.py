@@ -25,7 +25,20 @@ try:
 except Exception:  # pragma: no cover
     DynamicCache = None
 
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRMSNorm, LlamaRotaryEmbedding
+from transformers.models.llama.modeling_llama import (
+    LlamaDecoderLayer,
+    LlamaRMSNorm,
+    LlamaRotaryEmbedding,
+    apply_rotary_pos_emb,
+)
+
+try:
+    from ..token_posting_archive import TokenPostingArchive
+except ImportError:
+    try:
+        from llama3_neuroplastic.token_posting_archive import TokenPostingArchive
+    except ImportError:
+        TokenPostingArchive = None  # type: ignore
 
 try:
     from ..gqa_taylor_ssd import GQATaylorSSDSelfAttention, TaylorSSDLayerCache
@@ -129,6 +142,49 @@ def _configure_llama_mlp_shape_only(mlp: nn.Module, *, hidden_size: int, interme
 
 def _torch_dtype_itemsize(dtype: torch.dtype) -> int:
     return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _unpermute_q_factor_rows(factor_u: torch.Tensor, head_perm: torch.Tensor, *, head_dim: int) -> torch.Tensor:
+    if factor_u.ndim != 2:
+        raise RuntimeError(f"Expected a rank-2 q factor, got shape {tuple(factor_u.shape)}")
+    num_heads = int(head_perm.numel())
+    if int(factor_u.shape[0]) != int(num_heads * int(head_dim)):
+        raise RuntimeError(
+            f"Q factor rows {int(factor_u.shape[0])} do not match num_heads*head_dim "
+            f"({num_heads} * {int(head_dim)})."
+        )
+    aligned = factor_u.view(num_heads, int(head_dim), int(factor_u.shape[1]))
+    out = torch.empty_like(aligned)
+    out.index_copy_(0, head_perm.to(device=out.device, dtype=torch.long), aligned)
+    return out.view_as(factor_u)
+
+
+def _unpermute_o_factor_cols(factor_v: torch.Tensor, head_perm: torch.Tensor, *, head_dim: int) -> torch.Tensor:
+    if factor_v.ndim != 2:
+        raise RuntimeError(f"Expected a rank-2 o factor, got shape {tuple(factor_v.shape)}")
+    num_heads = int(head_perm.numel())
+    if int(factor_v.shape[1]) != int(num_heads * int(head_dim)):
+        raise RuntimeError(
+            f"O factor cols {int(factor_v.shape[1])} do not match num_heads*head_dim "
+            f"({num_heads} * {int(head_dim)})."
+        )
+    aligned = factor_v.view(int(factor_v.shape[0]), num_heads, int(head_dim))
+    out = torch.empty_like(aligned)
+    out.index_copy_(1, head_perm.to(device=out.device, dtype=torch.long), aligned)
+    return out.view_as(factor_v)
+
+
+def _unpermute_headwise_tensor(tensor: torch.Tensor, head_perm: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim < 1:
+        raise RuntimeError(f"Expected tensor with head axis, got shape {tuple(tensor.shape)}")
+    num_heads = int(head_perm.numel())
+    if int(tensor.shape[0]) != num_heads:
+        raise RuntimeError(
+            f"Headwise tensor first dimension {int(tensor.shape[0])} does not match head_perm size {num_heads}."
+        )
+    out = torch.empty_like(tensor)
+    out.index_copy_(0, head_perm.to(device=out.device, dtype=torch.long), tensor)
+    return out
 
 
 def _tensor_byte_view_cpu(tensor: torch.Tensor) -> torch.Tensor:
@@ -930,6 +986,7 @@ class StreamingLlamaRuntime:
         vram_hot_cache_gb: Optional[float] = None,
         hot_block_threshold: float = 0.80,
         attn_head_importance_path: Optional[str] = None,
+        attn_share_path: Optional[str] = None,
         attn_active_heads: Optional[int] = None,
         attn_head_activity_threshold: float = 0.10,
         attn_min_active_heads: int = 16,
@@ -938,6 +995,14 @@ class StreamingLlamaRuntime:
         enable_cuda_h2d_overlap: bool = True,
         kv_basis_path: Optional[str] = None,
         kv_sparse_top_k: Optional[int] = None,
+        # ── Token-posting sparse attention ────────────────────────────────────
+        attn_token_posting_path: Optional[str] = None,
+        attn_retrieval_ring_size: int = 256,
+        attn_retrieval_num_sinks: int = 16,
+        attn_retrieval_candidates: int = 64,
+        attn_retrieval_r_query: int = 6,
+        attn_retrieval_token_topk: int = 8,
+        attn_retrieval_archive_capacity: int = 16384,
     ) -> None:
         self.snapshot_dir = _resolve_snapshot_dir(model_name_or_path, local_files_only=bool(local_files_only))
         self.config = AutoConfig.from_pretrained(str(self.snapshot_dir), local_files_only=bool(local_files_only))
@@ -965,6 +1030,14 @@ class StreamingLlamaRuntime:
             raise RuntimeError(
                 "STREAMING_SPARSE_BIAS_MODE must be one of: selected, none"
             )
+        self._sparse_basis_execution = (
+            os.getenv("STREAMING_SPARSE_BASIS_EXECUTION", "full_output_latent").strip().lower()
+            or "full_output_latent"
+        )
+        if self._sparse_basis_execution not in {"full_output_latent", "routed_blocks"}:
+            raise RuntimeError(
+                "STREAMING_SPARSE_BASIS_EXECUTION must be one of: full_output_latent, routed_blocks"
+            )
         self._sparse_attn_prefill_mode = os.getenv("STREAMING_SPARSE_ATTN_PREFILL_MODE", "dense").strip().lower() or "dense"
         if self._sparse_attn_prefill_mode not in {"dense", "sparse"}:
             raise RuntimeError(
@@ -974,6 +1047,11 @@ class StreamingLlamaRuntime:
         if self._sparse_kv_prefill_mode not in {"dense", "sparse"}:
             raise RuntimeError(
                 "STREAMING_SPARSE_KV_PREFILL_MODE must be one of: dense, sparse"
+            )
+        self._attn_share_prefill_mode = os.getenv("STREAMING_ATTN_SHARE_PREFILL_MODE", "dense").strip().lower() or "dense"
+        if self._attn_share_prefill_mode not in {"dense", "shared"}:
+            raise RuntimeError(
+                "STREAMING_ATTN_SHARE_PREFILL_MODE must be one of: dense, shared"
             )
         _guard_chunk_blocks_raw = os.getenv("STREAMING_GUARD_MLP_CHUNK_BLOCKS", "").strip()
         self._guard_mlp_chunk_blocks = int(_guard_chunk_blocks_raw) if _guard_chunk_blocks_raw else 64
@@ -1112,6 +1190,58 @@ class StreamingLlamaRuntime:
         self.rotary_emb = LlamaRotaryEmbedding(self.config, device=self.device)
         self._taylor_caches: List[Optional[TaylorSSDLayerCache]] = [None for _ in range(self.num_layers)]
         self._dense_cache = DynamicCache(config=self.config) if DynamicCache is not None else None
+
+        # ── Token-posting sparse attention archive ────────────────────────────
+        self._token_archive: Optional["TokenPostingArchive"] = None
+        self._retrieval_layers: Set[int] = set()
+        self._retrieval_candidates: int = int(attn_retrieval_candidates)
+        if attn_token_posting_path is not None and TokenPostingArchive is not None:
+            _tp_path = Path(attn_token_posting_path)
+            if _tp_path.exists():
+                _tp_ckpt = torch.load(str(_tp_path), map_location="cpu", weights_only=False)
+                _tp_cfg = _tp_ckpt.get("config", {})
+                _tp_layers = list(_tp_cfg.get("retrieval_layers", []))
+                _tp_rank = int(_tp_cfg.get("basis_rank", 32))
+                _tp_G = int(_tp_cfg.get("num_kv_groups", getattr(self.config, "num_key_value_heads", 8)))
+                _tp_D = int(_tp_cfg.get("head_dim", getattr(self.config, "head_dim", 128)))
+                self._retrieval_layers = set(_tp_layers)
+                self._token_archive = TokenPostingArchive(
+                    retrieval_layers=_tp_layers,
+                    num_kv_groups=_tp_G,
+                    head_dim=_tp_D,
+                    basis_rank=_tp_rank,
+                    ring_size=int(attn_retrieval_ring_size),
+                    num_sinks=int(attn_retrieval_num_sinks),
+                    archive_capacity=int(attn_retrieval_archive_capacity),
+                    token_topk=int(attn_retrieval_token_topk),
+                    r_query=int(attn_retrieval_r_query),
+                    candidates=int(attn_retrieval_candidates),
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                # Load per-(layer, group) PCA basis from checkpoint.
+                for _ls_key, _ls_val in _tp_ckpt.get("layer_states", {}).items():
+                    _ls_idx = int(_ls_key)
+                    _grp_bases = _ls_val.get("group_bases", [])
+                    _idf_weights = _ls_val.get("idf_weights", [])
+                    _key_means = _ls_val.get("key_means", [])
+                    import numpy as _np
+                    for _g_idx in range(len(_grp_bases)):
+                        self._token_archive.load_basis(
+                            _ls_idx,
+                            _g_idx,
+                            _np.asarray(_grp_bases[_g_idx], dtype=_np.float32),
+                            _np.asarray(_idf_weights[_g_idx], dtype=_np.float32),
+                            _np.asarray(_key_means[_g_idx], dtype=_np.float32)
+                            if _g_idx < len(_key_means) else None,
+                        )
+                print(
+                    f"[token_posting] loaded basis for {len(_tp_layers)} retrieval layers "
+                    f"| rank={_tp_rank} G={_tp_G} D={_tp_D}",
+                    flush=True,
+                )
+            else:
+                print(f"[token_posting] path not found: {_tp_path}", flush=True)
         skeleton_config = copy.deepcopy(self.config)
         skeleton_config.intermediate_size = 1
         self._layer_skeleton = LlamaDecoderLayer(skeleton_config, layer_idx=0).to(device=self.device, dtype=self.dtype)
@@ -1351,6 +1481,15 @@ class StreamingLlamaRuntime:
                 _dec_norm_t = _dec.norm(dim=-1).transpose(0, 1).contiguous()
                 if self._sparse_semantic_block_score_normalized:
                     _dec_norm_t = F.normalize(_dec_norm_t, p=2.0, dim=-1, eps=1e-6)
+                _dec_full_weight = None
+                _dec_full_bias = None
+                if self._sparse_basis_execution == "full_output_latent":
+                    _dec_full_weight = _dec.permute(0, 2, 1).reshape(
+                        _layer_num_blocks * int(self._sparse_block_size),
+                        _basis_rank,
+                    ).contiguous()
+                    if _dec_bias is not None and self._sparse_basis_bias_mode != "none":
+                        _dec_full_bias = _dec_bias.reshape(-1).contiguous()
                 # decoder_blocks are output-space basis blocks over hidden_size, not
                 # intermediate FFN blocks; keep them on the learned-basis path only.
                 self._sparse_routing[_lidx] = {
@@ -1366,6 +1505,8 @@ class StreamingLlamaRuntime:
                     ).contiguous(),
                     "dec": _dec,
                     "dec_bias": _dec_bias,
+                    "dec_full_weight": _dec_full_weight,
+                    "dec_full_bias": _dec_full_bias,
                     "dec_norm_t": _dec_norm_t,
                     "scale": float(_scale.item()) if torch.is_tensor(_scale) and int(_scale.numel()) == 1 else 1.0,
                     "top_k": _layer_top_k,
@@ -1386,7 +1527,8 @@ class StreamingLlamaRuntime:
             _hot_blocks_total = sum(int(v.numel()) for v in self._mlp_hot_blocks_by_layer.values())
             print(f"[sparse] loaded routing for {len(self._sparse_routing)}/{self.num_layers} layers "
                   f"| top_k={self._sparse_top_k}/{_num_blocks} blocks ({_pct}%) "
-                  f"| block_size={self._sparse_block_size}", flush=True)
+                  f"| block_size={self._sparse_block_size} "
+                  f"| exec={self._sparse_basis_execution}", flush=True)
             if self._sparse_explicit_layer_selection:
                 _upper_guard_start = max(self._sparse_explicit_layer_selection) + 1
                 self._upper_decode_guard_layers = {
@@ -1443,6 +1585,9 @@ class StreamingLlamaRuntime:
         self._cpu_scratch: Dict[str, torch.Tensor] = {}
         # GPU FP16 staging buffer for dequantised partial q_proj rows: [K*head_dim, hidden].
         self._attn_q_head_staging: Optional[torch.Tensor] = None
+        self._attn_share_groups: Dict[str, Dict[str, Any]] = {}
+        self._attn_share_layer_state: Dict[int, Dict[str, Any]] = {}
+        self._attn_share_exact_layers: set[int] = set()
 
         # ── Sparse K/V routing ─────────────────────────────────────────────────
         self._kv_routing: Dict[int, Dict[str, Any]] = {}
@@ -1532,6 +1677,164 @@ class StreamingLlamaRuntime:
             )
 
         # ── Sparse K/V basis loading ───────────────────────────────────────────
+        if attn_share_path and str(attn_share_path).strip():
+            _share_payload = torch.load(str(attn_share_path), map_location="cpu", weights_only=False)
+            _share_cfg = _share_payload.get("config", {})
+            _hidden_size_cfg = int(_share_cfg.get("hidden_size", getattr(self.config, "hidden_size", 0)))
+            _num_heads_cfg = int(_share_cfg.get("num_heads", getattr(self.config, "num_attention_heads", 0)))
+            _num_kv_heads_cfg = int(_share_cfg.get("num_kv_heads", getattr(self.config, "num_key_value_heads", 0) or getattr(self.config, "num_attention_heads", 0)))
+            _head_dim_cfg = int(_share_cfg.get("head_dim", getattr(self.config, "head_dim", 0)))
+            _hidden_size_model = int(getattr(self.config, "hidden_size", 0))
+            _num_heads_model = int(getattr(self.config, "num_attention_heads", 0))
+            _num_kv_heads_model = int(getattr(self.config, "num_key_value_heads", 0) or _num_heads_model)
+            _head_dim_model = int(getattr(self.config, "head_dim", 0))
+            if (
+                _hidden_size_cfg != _hidden_size_model
+                or _num_heads_cfg != _num_heads_model
+                or _num_kv_heads_cfg != _num_kv_heads_model
+                or _head_dim_cfg != _head_dim_model
+            ):
+                raise RuntimeError(
+                    "Attention-sharing checkpoint dimensions do not match the loaded model: "
+                    f"artifact hidden/heads/kv_heads/head_dim={_hidden_size_cfg}/{_num_heads_cfg}/{_num_kv_heads_cfg}/{_head_dim_cfg}, "
+                    f"model={_hidden_size_model}/{_num_heads_model}/{_num_kv_heads_model}/{_head_dim_model}."
+                )
+            _share_dtype = self.dtype
+            for _gid_raw, _group_state in (_share_payload.get("group_states", {}) or {}).items():
+                _gid = str(_gid_raw)
+                _entry: Dict[str, Any] = {
+                    "layers": tuple(int(v) for v in _group_state.get("layers", [])),
+                    "sharing_format": str(_group_state.get("sharing_format", "matrix_v1")),
+                }
+                for _name in (
+                    "q_base_u",
+                    "q_base_v",
+                    "o_base_u",
+                    "o_base_v",
+                    "k_base_u",
+                    "k_base_v",
+                    "v_base_u",
+                    "v_base_v",
+                    "q_base_u_heads",
+                    "q_base_v_heads",
+                    "o_base_u_heads",
+                    "o_base_v_heads",
+                    "k_base_u_heads",
+                    "k_base_v_heads",
+                    "v_base_u_heads",
+                    "v_base_v_heads",
+                ):
+                    _tensor = _group_state.get(_name)
+                    if torch.is_tensor(_tensor):
+                        _entry[_name] = self.loader.prepare_h2d_source(
+                            _tensor.to(dtype=_share_dtype).contiguous(),
+                            dtype=_share_dtype,
+                        )
+                self._attn_share_groups[_gid] = _entry
+            for _exact_layer in (_share_payload.get("exact_layers", []) or []):
+                _exact_layer_idx = int(_exact_layer)
+                if 0 <= _exact_layer_idx < self.num_layers:
+                    self._attn_share_exact_layers.add(_exact_layer_idx)
+            for _lidx_raw, _layer_state in (_share_payload.get("layer_states", {}) or {}).items():
+                _lidx = int(_lidx_raw)
+                if not (0 <= _lidx < self.num_layers):
+                    continue
+                _gid = str(_layer_state.get("group_id", ""))
+                if _gid == "" or _gid not in self._attn_share_groups:
+                    self._attn_share_exact_layers.add(_lidx)
+                    continue
+                _head_perm = torch.as_tensor(
+                    _layer_state.get("head_perm", list(range(_num_heads_model))),
+                    dtype=torch.long,
+                    device=torch.device("cpu"),
+                ).contiguous()
+                if int(_head_perm.numel()) != _num_heads_model:
+                    raise RuntimeError(
+                        f"Attention-sharing layer {_lidx} head_perm has {int(_head_perm.numel())} entries; "
+                        f"expected {_num_heads_model}."
+                    )
+                _kv_head_perm = torch.as_tensor(
+                    _layer_state.get("kv_head_perm", list(range(_num_kv_heads_model))),
+                    dtype=torch.long,
+                    device=torch.device("cpu"),
+                ).contiguous()
+                if int(_kv_head_perm.numel()) != _num_kv_heads_model:
+                    raise RuntimeError(
+                        f"Attention-sharing layer {_lidx} kv_head_perm has {int(_kv_head_perm.numel())} entries; "
+                        f"expected {_num_kv_heads_model}."
+                    )
+                _q_resid_u = _layer_state.get("q_resid_u")
+                _q_resid_v = _layer_state.get("q_resid_v")
+                _o_resid_u = _layer_state.get("o_resid_u")
+                _o_resid_v = _layer_state.get("o_resid_v")
+                _k_resid_u = _layer_state.get("k_resid_u")
+                _k_resid_v = _layer_state.get("k_resid_v")
+                _v_resid_u = _layer_state.get("v_resid_u")
+                _v_resid_v = _layer_state.get("v_resid_v")
+                self._attn_share_layer_state[_lidx] = {
+                    "group_id": _gid,
+                    "head_perm": _head_perm,
+                    "kv_head_perm": _kv_head_perm,
+                    "q_resid_u": None if not torch.is_tensor(_q_resid_u) else self.loader.prepare_h2d_source(
+                        _q_resid_u.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "q_resid_v": None if not torch.is_tensor(_q_resid_v) else self.loader.prepare_h2d_source(
+                        _q_resid_v.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "o_resid_u": None if not torch.is_tensor(_o_resid_u) else self.loader.prepare_h2d_source(
+                        _o_resid_u.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "o_resid_v": None if not torch.is_tensor(_o_resid_v) else self.loader.prepare_h2d_source(
+                        _o_resid_v.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "k_resid_u": None if not torch.is_tensor(_k_resid_u) else self.loader.prepare_h2d_source(
+                        _k_resid_u.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "k_resid_v": None if not torch.is_tensor(_k_resid_v) else self.loader.prepare_h2d_source(
+                        _k_resid_v.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "v_resid_u": None if not torch.is_tensor(_v_resid_u) else self.loader.prepare_h2d_source(
+                        _v_resid_u.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                    "v_resid_v": None if not torch.is_tensor(_v_resid_v) else self.loader.prepare_h2d_source(
+                        _v_resid_v.to(dtype=_share_dtype).contiguous(),
+                        dtype=_share_dtype,
+                    ),
+                }
+                for _name in (
+                    "q_resid_u_heads",
+                    "q_resid_v_heads",
+                    "o_resid_u_heads",
+                    "o_resid_v_heads",
+                    "k_resid_u_heads",
+                    "k_resid_v_heads",
+                    "v_resid_u_heads",
+                    "v_resid_v_heads",
+                ):
+                    _tensor = _layer_state.get(_name)
+                    self._attn_share_layer_state[_lidx][_name] = (
+                        None
+                        if not torch.is_tensor(_tensor)
+                        else self.loader.prepare_h2d_source(
+                            _tensor.to(dtype=_share_dtype).contiguous(),
+                            dtype=_share_dtype,
+                        )
+                    )
+            if self._attn_share_layer_state:
+                print(
+                    f"[attn_share] loaded q/o sharing for {len(self._attn_share_layer_state)}/{self.num_layers} layers "
+                    f"| groups={len(self._attn_share_groups)} | exact={len(self._attn_share_exact_layers)} "
+                    f"| prefill={self._attn_share_prefill_mode}",
+                    flush=True,
+                )
+
         if kv_basis_path and str(kv_basis_path).strip():
             _kv_payload = torch.load(str(kv_basis_path), map_location="cpu", weights_only=False)
             _kv_cfg = _kv_payload.get("config", {})
@@ -1574,6 +1877,8 @@ class StreamingLlamaRuntime:
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
         self._dense_cache = DynamicCache(config=self.config) if DynamicCache is not None else None
+        if self._token_archive is not None:
+            self._token_archive.reset()
         for _layer_idx in list(self._session_sparse_route_layers):
             self._sparse_routing.pop(int(_layer_idx), None)
             self._sparse_top_k_by_layer.pop(int(_layer_idx), None)
@@ -1615,6 +1920,24 @@ class StreamingLlamaRuntime:
             self._dense_cache.crop(target)
             return True
         return False
+
+    def _release_dense_cache_for_retrieval_layers(self) -> None:
+        if self._dense_cache is None or not self._retrieval_layers:
+            return
+        key_cache = getattr(self._dense_cache, "key_cache", None)
+        value_cache = getattr(self._dense_cache, "value_cache", None)
+        if not isinstance(key_cache, list) or not isinstance(value_cache, list):
+            return
+        released = 0
+        for layer_idx in sorted(int(v) for v in self._retrieval_layers):
+            if 0 <= layer_idx < len(key_cache):
+                key_cache[layer_idx] = None
+                value_cache[layer_idx] = None
+                released += 1
+        if released > 0:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _set_session_state(self, token_ids_cpu: torch.LongTensor, logits: Optional[torch.Tensor]) -> None:
         self._session_token_ids_cpu = token_ids_cpu.detach().to(device=torch.device("cpu"), dtype=torch.long).contiguous()
@@ -2314,10 +2637,15 @@ class StreamingLlamaRuntime:
         layer_idx: int,
     ) -> Optional[torch.Tensor]:     # [N, top_k] long indices, or None
         """Return active K/V column-block indices for this layer, or None."""
+        if int(layer_idx) in self._retrieval_layers and self._token_archive is not None:
+            # Retrieval layers require full k_proj/v_proj for exact new-token K/V.
+            return None
         if (
             str(self._traffic_current_phase or "idle") == "prefill"
             and self._sparse_kv_prefill_mode == "dense"
         ):
+            return None
+        if self._should_use_attn_share_for_layer(layer_idx):
             return None
         routing = self._kv_routing.get(layer_idx)
         if routing is None:
@@ -2959,11 +3287,22 @@ class StreamingLlamaRuntime:
         _dec_norm_t = _dec.norm(dim=-1).transpose(0, 1).contiguous()
         if self._sparse_semantic_block_score_normalized:
             _dec_norm_t = F.normalize(_dec_norm_t, p=2.0, dim=-1, eps=1e-6)
+        _dec_full_weight = None
+        _dec_full_bias = None
+        if self._sparse_basis_execution == "full_output_latent":
+            _dec_full_weight = _dec.permute(0, 2, 1).reshape(
+                _layer_num_blocks * int(self._sparse_block_size),
+                _basis_rank,
+            ).contiguous()
+            if _dec_bias is not None and self._sparse_basis_bias_mode != "none":
+                _dec_full_bias = _dec_bias.reshape(-1).contiguous()
         self._sparse_routing[int(layer_idx)] = {
             "enc_w": _enc_w,
             "enc_b": _enc_b,
             "dec": _dec,
             "dec_bias": _dec_bias,
+            "dec_full_weight": _dec_full_weight,
+            "dec_full_bias": _dec_full_bias,
             "dec_norm_t": _dec_norm_t,
             "scale": float(scale),
             "top_k": _layer_top_k,
@@ -3127,6 +3466,67 @@ class StreamingLlamaRuntime:
             out_blocks[rows_valid, blocks_valid] += contrib
 
         out_flat = out_blocks.view(rows, num_blocks * block_size)
+        if scale != 1.0:
+            out_flat = out_flat * scale
+        return out_flat.view_as(hidden).to(device=hidden.device, dtype=hidden.dtype)
+
+    def _forward_learned_basis_mlp_full_output(
+        self,
+        layer_idx: int,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reconstruct the full MLP output from a sparse latent support.
+
+        The learned-basis artifact already parameterizes the full hidden-size
+        MLP output in output-space blocks. To preserve dense semantics while
+        minimizing compute, this path keeps only the top-k latent coordinates
+        and decodes the full output from those coordinates directly, without
+        dropping output blocks at runtime.
+        """
+        routing = self._sparse_routing.get(layer_idx)
+        if routing is None:
+            return torch.zeros_like(hidden)
+
+        dec = routing["dec"]
+        dec_bias = routing.get("dec_bias")
+        scale = float(routing.get("scale", 1.0))
+
+        rows = int(hidden.shape[0] * hidden.shape[1])
+        if rows <= 0:
+            return torch.zeros_like(hidden)
+
+        flat_hidden = hidden.view(rows, hidden.shape[-1])
+        latent = self._compute_sparse_basis_latent(flat_hidden, layer_idx, routing=routing)
+        latent = latent.to(device=dec.device, dtype=dec.dtype)
+
+        num_blocks = int(dec.shape[0])
+        block_size = int(dec.shape[-1])
+        if int(hidden.shape[-1]) % max(block_size, 1) != 0:
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} hidden size {int(hidden.shape[-1])} is not divisible by "
+                f"learned-basis block_size {block_size}."
+            )
+        expected_output_blocks = int(hidden.shape[-1]) // max(block_size, 1)
+        if num_blocks != expected_output_blocks:
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} learned-basis decoder exposes {num_blocks} output blocks, "
+                f"expected {expected_output_blocks} for hidden size {int(hidden.shape[-1])}. "
+                "Learned-basis sparse routing is defined over output-space blocks and cannot "
+                "be executed by the intermediate-space sparse 4-bit MLP path."
+            )
+
+        dec_full_weight = routing.get("dec_full_weight")
+        if dec_full_weight is None:
+            dec_full_weight = dec.permute(0, 2, 1).reshape(num_blocks * block_size, int(latent.shape[-1])).contiguous()
+        dec_full_weight = dec_full_weight.to(device=dec.device, dtype=dec.dtype)
+
+        bias_full = routing.get("dec_full_bias")
+        if bias_full is None and torch.is_tensor(dec_bias) and self._sparse_basis_bias_mode != "none":
+            bias_full = dec_bias.reshape(-1).contiguous()
+        if torch.is_tensor(bias_full):
+            bias_full = bias_full.to(device=dec.device, dtype=dec.dtype)
+
+        out_flat = F.linear(latent, dec_full_weight, bias_full)
         if scale != 1.0:
             out_flat = out_flat * scale
         return out_flat.view_as(hidden).to(device=hidden.device, dtype=hidden.dtype)
@@ -3435,6 +3835,8 @@ class StreamingLlamaRuntime:
         if layer_idx in self._sparse_routing:
             # Learned-basis sparse layers route over output-space blocks from the
             # checkpoint artifact, so they must stay on the basis decoder path.
+            if str(getattr(self, "_sparse_basis_execution", "full_output_latent")) == "full_output_latent":
+                return self._forward_learned_basis_mlp_full_output(layer_idx, hidden)
             return self._forward_learned_basis_mlp(layer_idx, hidden, active_blocks)
 
         gate_proj = getattr(mlp, "gate_proj", None)
@@ -4104,6 +4506,8 @@ class StreamingLlamaRuntime:
         mlp_input: torch.Tensor,
     ) -> torch.Tensor:
         if layer_idx in self._sparse_routing:
+            if str(getattr(self, "_sparse_basis_execution", "full_output_latent")) == "full_output_latent":
+                return self._forward_learned_basis_mlp_full_output(layer_idx, mlp_input)
             active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
             if active_blocks is None:
                 raise RuntimeError(f"Sparse basis routing disappeared for layer {int(layer_idx)}")
@@ -4111,6 +4515,356 @@ class StreamingLlamaRuntime:
         return self._dense_guard_mlp_forward_exact_chunked_4bit(layer_idx, layer.mlp, mlp_input)
 
     # ── Sparse Attention Head helpers ─────────────────────────────────────────
+
+    def _should_use_attn_share_for_layer(self, layer_idx: int) -> bool:
+        if int(layer_idx) not in self._attn_share_layer_state:
+            return False
+        if (
+            str(self._traffic_current_phase or "idle") == "prefill"
+            and self._attn_share_prefill_mode == "dense"
+        ):
+            return False
+        return True
+
+    def _load_shared_attn_qo(self, layer_idx: int) -> None:
+        state = self._attn_share_layer_state.get(int(layer_idx))
+        if state is None:
+            raise RuntimeError(f"No attention-sharing state registered for layer {int(layer_idx)}")
+        group = self._attn_share_groups.get(str(state["group_id"]))
+        if group is None:
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} references missing attention-sharing group {state['group_id']!r}"
+            )
+
+        head_dim = int(getattr(self.config, "head_dim", 0))
+        q_skel = self._layer_skeleton.self_attn.q_proj.weight
+        o_skel = self._layer_skeleton.self_attn.o_proj.weight
+        head_perm = torch.as_tensor(state["head_perm"], dtype=torch.long, device=torch.device("cpu")).contiguous()
+
+        if "q_base_u_heads" in group:
+            q_base_u_cpu = _unpermute_headwise_tensor(group["q_base_u_heads"], head_perm)
+            q_base_v_cpu = _unpermute_headwise_tensor(group["q_base_v_heads"], head_perm)
+            q_base_u_gpu = self._copy_cpu_to_gpu(
+                q_base_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_q_base_u_heads",
+            )
+            q_base_v_gpu = self._copy_cpu_to_gpu(
+                q_base_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_q_base_v_heads",
+            )
+            self._wait_for_h2d_stream()
+            q_recon = torch.bmm(q_base_u_gpu, q_base_v_gpu).reshape_as(q_skel)
+            q_skel.copy_(q_recon)
+
+            q_resid_u_heads_cpu = state.get("q_resid_u_heads")
+            q_resid_v_heads_cpu = state.get("q_resid_v_heads")
+            if torch.is_tensor(q_resid_u_heads_cpu) and torch.is_tensor(q_resid_v_heads_cpu):
+                q_resid_u_heads_cpu = _unpermute_headwise_tensor(q_resid_u_heads_cpu, head_perm)
+                q_resid_v_heads_cpu = _unpermute_headwise_tensor(q_resid_v_heads_cpu, head_perm)
+                q_resid_u_heads_gpu = self._copy_cpu_to_gpu(
+                    q_resid_u_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_q_resid_u_heads",
+                )
+                q_resid_v_heads_gpu = self._copy_cpu_to_gpu(
+                    q_resid_v_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_q_resid_v_heads",
+                )
+                self._wait_for_h2d_stream()
+                q_skel.add_(torch.bmm(q_resid_u_heads_gpu, q_resid_v_heads_gpu).reshape_as(q_skel))
+
+            o_base_u_cpu = _unpermute_headwise_tensor(group["o_base_u_heads"], head_perm)
+            o_base_v_cpu = _unpermute_headwise_tensor(group["o_base_v_heads"], head_perm)
+            o_base_u_gpu = self._copy_cpu_to_gpu(
+                o_base_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_o_base_u_heads",
+            )
+            o_base_v_gpu = self._copy_cpu_to_gpu(
+                o_base_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_o_base_v_heads",
+            )
+            self._wait_for_h2d_stream()
+            o_recon = torch.bmm(o_base_u_gpu, o_base_v_gpu).permute(1, 0, 2).reshape_as(o_skel)
+            o_skel.copy_(o_recon)
+
+            o_resid_u_heads_cpu = state.get("o_resid_u_heads")
+            o_resid_v_heads_cpu = state.get("o_resid_v_heads")
+            if torch.is_tensor(o_resid_u_heads_cpu) and torch.is_tensor(o_resid_v_heads_cpu):
+                o_resid_u_heads_cpu = _unpermute_headwise_tensor(o_resid_u_heads_cpu, head_perm)
+                o_resid_v_heads_cpu = _unpermute_headwise_tensor(o_resid_v_heads_cpu, head_perm)
+                o_resid_u_heads_gpu = self._copy_cpu_to_gpu(
+                    o_resid_u_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_o_resid_u_heads",
+                )
+                o_resid_v_heads_gpu = self._copy_cpu_to_gpu(
+                    o_resid_v_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_o_resid_v_heads",
+                )
+                self._wait_for_h2d_stream()
+                o_skel.add_(torch.bmm(o_resid_u_heads_gpu, o_resid_v_heads_gpu).permute(1, 0, 2).reshape_as(o_skel))
+
+            self._attn_loaded_q_rows = None
+            self._attn_loaded_o_cols = None
+            self._attn_qo_state = "shared"
+            return
+
+        q_base_u_cpu = _unpermute_q_factor_rows(group["q_base_u"], head_perm, head_dim=head_dim)
+        q_base_v_cpu = group["q_base_v"]
+        q_base_u_gpu = self._copy_cpu_to_gpu(
+            q_base_u_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_q_base_u",
+        )
+        q_base_v_gpu = self._copy_cpu_to_gpu(
+            q_base_v_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_q_base_v",
+        )
+        self._wait_for_h2d_stream()
+        torch.mm(q_base_u_gpu, q_base_v_gpu, out=q_skel)
+
+        q_resid_u_cpu = state.get("q_resid_u")
+        q_resid_v_cpu = state.get("q_resid_v")
+        if torch.is_tensor(q_resid_u_cpu) and torch.is_tensor(q_resid_v_cpu):
+            q_resid_u_cpu = _unpermute_q_factor_rows(q_resid_u_cpu, head_perm, head_dim=head_dim)
+            q_resid_u_gpu = self._copy_cpu_to_gpu(
+                q_resid_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_q_resid_u",
+            )
+            q_resid_v_gpu = self._copy_cpu_to_gpu(
+                q_resid_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_q_resid_v",
+            )
+            self._wait_for_h2d_stream()
+            q_skel.addmm_(q_resid_u_gpu, q_resid_v_gpu)
+
+        o_base_u_cpu = group["o_base_u"]
+        o_base_v_cpu = _unpermute_o_factor_cols(group["o_base_v"], head_perm, head_dim=head_dim)
+        o_base_u_gpu = self._copy_cpu_to_gpu(
+            o_base_u_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_o_base_u",
+        )
+        o_base_v_gpu = self._copy_cpu_to_gpu(
+            o_base_v_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_o_base_v",
+        )
+        self._wait_for_h2d_stream()
+        torch.mm(o_base_u_gpu, o_base_v_gpu, out=o_skel)
+
+        o_resid_u_cpu = state.get("o_resid_u")
+        o_resid_v_cpu = state.get("o_resid_v")
+        if torch.is_tensor(o_resid_u_cpu) and torch.is_tensor(o_resid_v_cpu):
+            o_resid_v_cpu = _unpermute_o_factor_cols(o_resid_v_cpu, head_perm, head_dim=head_dim)
+            o_resid_u_gpu = self._copy_cpu_to_gpu(
+                o_resid_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_o_resid_u",
+            )
+            o_resid_v_gpu = self._copy_cpu_to_gpu(
+                o_resid_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_o_resid_v",
+            )
+            self._wait_for_h2d_stream()
+            o_skel.addmm_(o_resid_u_gpu, o_resid_v_gpu)
+
+        self._attn_loaded_q_rows = None
+        self._attn_loaded_o_cols = None
+        self._attn_qo_state = "shared"
+
+    def _load_shared_attn_kv(self, layer_idx: int) -> None:
+        state = self._attn_share_layer_state.get(int(layer_idx))
+        if state is None:
+            raise RuntimeError(f"No attention-sharing state registered for layer {int(layer_idx)}")
+        group = self._attn_share_groups.get(str(state["group_id"]))
+        if group is None:
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} references missing attention-sharing group {state['group_id']!r}"
+            )
+
+        head_dim = int(getattr(self.config, "head_dim", 0))
+        k_skel = self._layer_skeleton.self_attn.k_proj.weight
+        v_skel = self._layer_skeleton.self_attn.v_proj.weight
+        kv_head_perm = torch.as_tensor(state["kv_head_perm"], dtype=torch.long, device=torch.device("cpu")).contiguous()
+
+        if "k_base_u_heads" in group:
+            k_base_u_cpu = _unpermute_headwise_tensor(group["k_base_u_heads"], kv_head_perm)
+            k_base_v_cpu = _unpermute_headwise_tensor(group["k_base_v_heads"], kv_head_perm)
+            k_base_u_gpu = self._copy_cpu_to_gpu(
+                k_base_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_k_base_u_heads",
+            )
+            k_base_v_gpu = self._copy_cpu_to_gpu(
+                k_base_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_k_base_v_heads",
+            )
+            self._wait_for_h2d_stream()
+            k_skel.copy_(torch.bmm(k_base_u_gpu, k_base_v_gpu).reshape_as(k_skel))
+
+            k_resid_u_heads_cpu = state.get("k_resid_u_heads")
+            k_resid_v_heads_cpu = state.get("k_resid_v_heads")
+            if torch.is_tensor(k_resid_u_heads_cpu) and torch.is_tensor(k_resid_v_heads_cpu):
+                k_resid_u_heads_cpu = _unpermute_headwise_tensor(k_resid_u_heads_cpu, kv_head_perm)
+                k_resid_v_heads_cpu = _unpermute_headwise_tensor(k_resid_v_heads_cpu, kv_head_perm)
+                k_resid_u_heads_gpu = self._copy_cpu_to_gpu(
+                    k_resid_u_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_k_resid_u_heads",
+                )
+                k_resid_v_heads_gpu = self._copy_cpu_to_gpu(
+                    k_resid_v_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_k_resid_v_heads",
+                )
+                self._wait_for_h2d_stream()
+                k_skel.add_(torch.bmm(k_resid_u_heads_gpu, k_resid_v_heads_gpu).reshape_as(k_skel))
+
+            v_base_u_cpu = _unpermute_headwise_tensor(group["v_base_u_heads"], kv_head_perm)
+            v_base_v_cpu = _unpermute_headwise_tensor(group["v_base_v_heads"], kv_head_perm)
+            v_base_u_gpu = self._copy_cpu_to_gpu(
+                v_base_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_v_base_u_heads",
+            )
+            v_base_v_gpu = self._copy_cpu_to_gpu(
+                v_base_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_v_base_v_heads",
+            )
+            self._wait_for_h2d_stream()
+            v_skel.copy_(torch.bmm(v_base_u_gpu, v_base_v_gpu).reshape_as(v_skel))
+
+            v_resid_u_heads_cpu = state.get("v_resid_u_heads")
+            v_resid_v_heads_cpu = state.get("v_resid_v_heads")
+            if torch.is_tensor(v_resid_u_heads_cpu) and torch.is_tensor(v_resid_v_heads_cpu):
+                v_resid_u_heads_cpu = _unpermute_headwise_tensor(v_resid_u_heads_cpu, kv_head_perm)
+                v_resid_v_heads_cpu = _unpermute_headwise_tensor(v_resid_v_heads_cpu, kv_head_perm)
+                v_resid_u_heads_gpu = self._copy_cpu_to_gpu(
+                    v_resid_u_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_v_resid_u_heads",
+                )
+                v_resid_v_heads_gpu = self._copy_cpu_to_gpu(
+                    v_resid_v_heads_cpu,
+                    dtype=self.dtype,
+                    layer_idx=layer_idx,
+                    tag="attn_share_v_resid_v_heads",
+                )
+                self._wait_for_h2d_stream()
+                v_skel.add_(torch.bmm(v_resid_u_heads_gpu, v_resid_v_heads_gpu).reshape_as(v_skel))
+
+            self._kv_loaded_cols = None
+            return
+
+        k_base_u_cpu = _unpermute_q_factor_rows(group["k_base_u"], kv_head_perm, head_dim=head_dim)
+        k_base_v_cpu = group["k_base_v"]
+        k_base_u_gpu = self._copy_cpu_to_gpu(
+            k_base_u_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_k_base_u",
+        )
+        k_base_v_gpu = self._copy_cpu_to_gpu(
+            k_base_v_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_k_base_v",
+        )
+        self._wait_for_h2d_stream()
+        torch.mm(k_base_u_gpu, k_base_v_gpu, out=k_skel)
+
+        k_resid_u_cpu = state.get("k_resid_u")
+        k_resid_v_cpu = state.get("k_resid_v")
+        if torch.is_tensor(k_resid_u_cpu) and torch.is_tensor(k_resid_v_cpu):
+            k_resid_u_cpu = _unpermute_q_factor_rows(k_resid_u_cpu, kv_head_perm, head_dim=head_dim)
+            k_resid_u_gpu = self._copy_cpu_to_gpu(
+                k_resid_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_k_resid_u",
+            )
+            k_resid_v_gpu = self._copy_cpu_to_gpu(
+                k_resid_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_k_resid_v",
+            )
+            self._wait_for_h2d_stream()
+            k_skel.addmm_(k_resid_u_gpu, k_resid_v_gpu)
+
+        v_base_u_cpu = _unpermute_q_factor_rows(group["v_base_u"], kv_head_perm, head_dim=head_dim)
+        v_base_v_cpu = group["v_base_v"]
+        v_base_u_gpu = self._copy_cpu_to_gpu(
+            v_base_u_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_v_base_u",
+        )
+        v_base_v_gpu = self._copy_cpu_to_gpu(
+            v_base_v_cpu,
+            dtype=self.dtype,
+            layer_idx=layer_idx,
+            tag="attn_share_v_base_v",
+        )
+        self._wait_for_h2d_stream()
+        torch.mm(v_base_u_gpu, v_base_v_gpu, out=v_skel)
+
+        v_resid_u_cpu = state.get("v_resid_u")
+        v_resid_v_cpu = state.get("v_resid_v")
+        if torch.is_tensor(v_resid_u_cpu) and torch.is_tensor(v_resid_v_cpu):
+            v_resid_u_cpu = _unpermute_q_factor_rows(v_resid_u_cpu, kv_head_perm, head_dim=head_dim)
+            v_resid_u_gpu = self._copy_cpu_to_gpu(
+                v_resid_u_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_v_resid_u",
+            )
+            v_resid_v_gpu = self._copy_cpu_to_gpu(
+                v_resid_v_cpu,
+                dtype=self.dtype,
+                layer_idx=layer_idx,
+                tag="attn_share_v_resid_v",
+            )
+            self._wait_for_h2d_stream()
+            v_skel.addmm_(v_resid_u_gpu, v_resid_v_gpu)
+
+        self._kv_loaded_cols = None
 
     def _get_attn_active_heads(self, layer_idx: int) -> Optional[torch.Tensor]:
         """Return sorted active head indices [K] for this layer, or None (dense).
@@ -4542,7 +5296,12 @@ class StreamingLlamaRuntime:
             str(self._traffic_current_phase or "idle") == "prefill"
             and self._sparse_attn_prefill_mode == "dense"
         )
-        _active_attn_heads = self._get_attn_active_heads(layer_idx) if _allow_sparse_attn else None
+        _use_shared_attn = self._should_use_attn_share_for_layer(layer_idx)
+        _active_attn_heads = (
+            None
+            if _use_shared_attn
+            else self._get_attn_active_heads(layer_idx) if _allow_sparse_attn else None
+        )
         _head_dim = int(getattr(self.config, "head_dim", 128))
         _hidden   = int(getattr(self.config, "hidden_size", 16384))
         _allow_sparse_kv = not (
@@ -4550,14 +5309,20 @@ class StreamingLlamaRuntime:
             and self._sparse_kv_prefill_mode == "dense"
         )
         # Keys to skip in the main loop (handled by _load_sparse_attn_heads below).
-        _skip_attn: set = (
-            {"self_attn.q_proj.weight", "self_attn.o_proj.weight"}
-            if _active_attn_heads is not None
-            else set()
-        )
+        _skip_attn: set = set()
+        if _active_attn_heads is not None:
+            _skip_attn = _skip_attn | {"self_attn.q_proj.weight", "self_attn.o_proj.weight"}
+        if _use_shared_attn:
+            _skip_attn = _skip_attn | {
+                "self_attn.q_proj.weight",
+                "self_attn.o_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+            }
         # Skip K/V weights when sparse KV routing is active — loaded on-demand
         # by _populate_sparse_kv_skeleton() inside forward_token/_forward_prefill.
-        if layer_idx in self._kv_routing and _allow_sparse_kv:
+        # Retrieval layers always load full k/v weights so new-token keys are exact.
+        if layer_idx in self._kv_routing and _allow_sparse_kv and not _use_shared_attn and layer_idx not in self._retrieval_layers:
             _skip_attn = _skip_attn | {"self_attn.k_proj.weight", "self_attn.v_proj.weight"}
             # Zero the skeleton so stale data from the previous layer doesn't bleed in.
             # _populate_sparse_kv_skeleton will then fill only the active col-blocks.
@@ -4623,14 +5388,18 @@ class StreamingLlamaRuntime:
                 raw = self.loader.load_parameter(full_name)
                 dest.copy_(raw)
 
-        if _active_attn_heads is None:
+        if _active_attn_heads is None and not _use_shared_attn:
             self._attn_loaded_q_rows = None
             self._attn_loaded_o_cols = None
             self._attn_qo_state = "dense"
 
+        if _use_shared_attn:
+            self._load_shared_attn_qo(layer_idx)
+            self._load_shared_attn_kv(layer_idx)
+
         # Sparse attention head loading: only transfer NF4 bytes for K active heads.
         # q_proj and o_proj are zeroed first; only the active head rows/columns are filled.
-        if _active_attn_heads is not None:
+        if _active_attn_heads is not None and not _use_shared_attn:
             if int(layer_idx) in self._attn_zero_only_layers:
                 self._clear_sparse_attn_qo_buffers(
                     q_skel=self._layer_skeleton.self_attn.q_proj.weight,
@@ -4783,9 +5552,14 @@ class StreamingLlamaRuntime:
             taylor_attn: Optional[GQATaylorSSDSelfAttention] = None
             residual = hidden
             hidden_norm = layer.input_layernorm(hidden)
+            _use_shared_attn = self._should_use_attn_share_for_layer(layer_idx)
+            _active_attn_heads = None if _use_shared_attn else self._get_attn_active_heads(layer_idx)
 
-            # Sparse K/V routing: predict active column-blocks and populate skeleton
-            _active_kv_blocks = self._route_kv_blocks(hidden_norm, layer_idx)
+            # Sparse K/V routing: predict active column-blocks and populate skeleton.
+            # Retrieval layers bypass sparse K/V and keep full k_proj/v_proj.
+            _active_kv_blocks = None
+            if layer_idx not in self._retrieval_layers:
+                _active_kv_blocks = self._route_kv_blocks(hidden_norm, layer_idx)
             if _active_kv_blocks is not None:
                 self._populate_sparse_kv_skeleton(layer_idx, _active_kv_blocks, layer)
 
@@ -4804,6 +5578,21 @@ class StreamingLlamaRuntime:
                     use_cache=True,
                 )
                 self._taylor_caches[layer_idx] = present
+            elif (
+                layer_idx in self._retrieval_layers
+                and self._token_archive is not None
+                and use_attention_cache
+            ):
+                if self._debug_steps:
+                    print(f"[debug] layer {layer_idx}: attn_forward_retrieval", flush=True)
+                attn_out = self._forward_retrieval_attn(
+                    layer_idx=layer_idx,
+                    layer=layer,
+                    hidden_norm=hidden_norm,
+                    rope=rope,
+                    position_index=int(position_ids.view(-1)[0].item()),
+                    active_heads=_active_attn_heads,
+                )
             else:
                 if self._debug_steps:
                     print(f"[debug] layer {layer_idx}: attn_forward_dense", flush=True)
@@ -5024,10 +5813,136 @@ class StreamingLlamaRuntime:
         # respective attention/MLP compute above; we sync once here before the
         # first decode token reads the hot-cache data.
         self._wait_for_h2d_stream()
+
+        # Populate the token-posting archive from the dense KV cache so that
+        # the very first decode token has access to the full prompt context.
+        if self._token_archive is not None and self._dense_cache is not None:
+            self._token_archive.warm_up_from_dense_cache(
+                self._dense_cache, seq_len=int(token_ids.shape[1])
+            )
+            self._release_dense_cache_for_retrieval_layers()
+
         all_hidden = self.norm(all_hidden)
         # Only the last token's logits are needed to start generation.
         logits = self._lm_head_forward(all_hidden[:, -1:, :]).float()
         return logits
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Token-posting retrieval attention
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _forward_retrieval_attn(
+        self,
+        layer_idx: int,
+        layer: "LlamaDecoderLayer",
+        hidden_norm: torch.Tensor,      # [1, 1, hidden_size]
+        rope: tuple,                    # (cos, sin) from self.rotary_emb
+        position_index: int,
+        active_heads: Optional[torch.Tensor],   # [K] sorted head indices, or None
+    ) -> torch.Tensor:
+        """Exact attention on a sparse shortlist of archived tokens.
+
+        Replaces the dense full-context ``layer.self_attn(past_key_values=...)``
+        call for retrieval layers.  The shortlist is assembled by the
+        ``TokenPostingArchive``:
+          • sink tokens  — first num_sinks, always on GPU
+          • archive candidates — top-M from posting-list probe
+          • ring tokens  — most recent ring_size, always on GPU
+
+        The new token's exact K/V is computed with the fully-loaded skeleton
+        weights and appended to the archive before returning.
+        """
+        archive = self._token_archive
+        cfg = self.config
+        head_dim = int(getattr(cfg, "head_dim", 128))
+        num_heads = int(getattr(cfg, "num_attention_heads", 128))
+        num_kv = int(getattr(cfg, "num_key_value_heads", 8))
+        queries_per_group = num_heads // num_kv   # e.g. 16 for 405B
+
+        # ── Step 1: Compute exact q, k, v for the new token ──────────────────
+        cos, sin = rope
+        q_raw = layer.self_attn.q_proj(hidden_norm)    # [1, 1, H*D]
+        k_raw = layer.self_attn.k_proj(hidden_norm)    # [1, 1, G*D]
+        v_raw = layer.self_attn.v_proj(hidden_norm)    # [1, 1, G*D]
+
+        # Reshape to [B, heads, S, D] for apply_rotary_pos_emb.
+        q = q_raw.view(1, 1, num_heads, head_dim).transpose(1, 2)    # [1, H, 1, D]
+        k = k_raw.view(1, 1, num_kv, head_dim).transpose(1, 2)       # [1, G, 1, D]
+        v = v_raw.view(1, 1, num_kv, head_dim).transpose(1, 2)       # [1, G, 1, D]
+
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        # q: [1, H, 1, D]   k: [1, G, 1, D]  (post-RoPE)
+
+        # ── Step 2: Determine active query heads and their KV group mapping ───
+        if active_heads is not None:
+            active_h_list: List[int] = active_heads.tolist()
+        else:
+            active_h_list = list(range(num_heads))
+
+        # Map each active head to its KV group.
+        from collections import defaultdict as _defaultdict
+        group_to_heads: Dict[int, List[int]] = _defaultdict(list)
+        for h in active_h_list:
+            group_to_heads[h // queries_per_group].append(h)
+
+        # ── Step 3: Probe archive per KV group and run exact attention ────────
+        step = archive.step
+        archive.step += 1
+
+        out_by_head: Dict[int, torch.Tensor] = {}
+
+        for g, heads_in_group in group_to_heads.items():
+            # Probe with all active head queries in this KV group and union candidates.
+            h_indices = torch.tensor(heads_in_group, device=self.device, dtype=torch.long)
+            q_rep = q[0, h_indices, 0, :]    # [H_group, D] FP16 GPU
+
+            # Fetch shortlist K/V from archive (sinks + archive candidates + ring).
+            k_ctx, v_ctx = archive.fetch_shortlist_kv(
+                layer_idx, g, q_rep, step, M=self._retrieval_candidates,
+            )    # [T, D] GPU FP16
+
+            # Also attend to the current new token itself (causal self-inclusion).
+            k_new_g = k[0, g, 0:1, :]    # [1, D]
+            v_new_g = v[0, g, 0:1, :]
+
+            if k_ctx.shape[0] > 0:
+                k_all = torch.cat([k_ctx, k_new_g], dim=0)    # [T+1, D]
+                v_all = torch.cat([v_ctx, v_new_g], dim=0)
+            else:
+                k_all = k_new_g
+                v_all = v_new_g
+
+            # Expand to [1, 1, T+1, D] for scaled_dot_product_attention.
+            k_4d = k_all.unsqueeze(0).unsqueeze(0)    # [1, 1, T+1, D]
+            v_4d = v_all.unsqueeze(0).unsqueeze(0)
+
+            # Per-head exact attention over shared shortlist.
+            for h in heads_in_group:
+                q_h = q[0:1, h:h+1, :, :]    # [1, 1, 1, D]
+                out_h = F.scaled_dot_product_attention(
+                    q_h, k_4d, v_4d,
+                    scale=head_dim ** -0.5,
+                )    # [1, 1, 1, D]
+                out_by_head[h] = out_h[0, 0, 0, :]    # [D]
+
+        # ── Step 4: Scatter head outputs and apply o_proj ─────────────────────
+        # Build dense output tensor; inactive heads remain zero (o_proj cols
+        # for those heads are also zero in sparse mode, so output is correct).
+        out_flat = torch.zeros(
+            1, 1, num_heads * head_dim,
+            dtype=self.dtype, device=self.device,
+        )
+        for h, out_h in out_by_head.items():
+            out_flat[0, 0, h * head_dim : (h + 1) * head_dim] = out_h
+
+        attn_out = layer.self_attn.o_proj(out_flat)    # [1, 1, hidden_size]
+
+        # ── Step 5: Append new token K/V to archive ───────────────────────────
+        k_new_cpu = k[0, :, 0, :].detach().cpu()    # [G, D]
+        v_new_cpu = v[0, :, 0, :].detach().cpu()
+        archive.append_token(layer_idx, position_index, k_new_cpu, v_new_cpu)
+
+        return attn_out
 
     def generate(
         self,

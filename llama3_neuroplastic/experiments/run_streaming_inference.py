@@ -124,6 +124,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
              "(only top-K heads' NF4 bytes transferred per token, reducing attention PCIe traffic).",
     )
     p.add_argument(
+        "--attn-share-path",
+        type=str,
+        default="",
+        help="Path to a no-training cross-layer attention sharing checkpoint (.pt). "
+             "When present, decode q_proj/o_proj are reconstructed from shared low-rank "
+             "group factors plus per-layer residuals instead of per-layer dense q/o loads.",
+    )
+    p.add_argument(
         "--attn-active-heads",
         type=int,
         default=None,
@@ -279,6 +287,7 @@ def main() -> None:
         vram_hot_cache_gb=float(args.vram_hot_cache_gb) if args.vram_hot_cache_gb is not None else None,
         hot_block_threshold=float(args.hot_block_threshold),
         attn_head_importance_path=str(args.attn_head_importance_path) if args.attn_head_importance_path else None,
+        attn_share_path=str(args.attn_share_path) if args.attn_share_path else None,
         attn_active_heads=int(args.attn_active_heads) if args.attn_active_heads is not None else None,
         attn_head_activity_threshold=float(args.attn_head_activity_threshold),
         attn_min_active_heads=int(args.attn_min_active_heads),
