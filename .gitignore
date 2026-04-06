@@ -9,3 +9,6 @@ __pycache__/
 # AI files
 .claude/
 full_replication_file_map.md
+
+# Large results folder
+results/

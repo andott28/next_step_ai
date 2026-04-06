@@ -1140,7 +1140,7 @@ class StreamingLlamaRuntime:
                 # Keep at least 20% VRAM free for transient tensors/kernels.
                 self._vram_hot_cache_margin_bytes = max(
                     self._vram_hot_cache_margin_bytes,
-                    int(float(_vram_total) * 0.20),
+                    int(float(_vram_total) * 0.05),
                 )
             except Exception:
                 pass
@@ -2964,7 +2964,6 @@ class StreamingLlamaRuntime:
             dest.copy_(prepared)
             return prepared
         if self._h2d_stream is not None:
-            self._h2d_stream.wait_stream(torch.cuda.current_stream(self.device))
             with torch.cuda.stream(self._h2d_stream):
                 dest.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
                 self.loader._record_h2d_scratch_use(scratch_key, device=dest.device)
@@ -5123,7 +5122,6 @@ class StreamingLlamaRuntime:
             layer_idx=layer_idx,
             tag="attn_sparse_q_absmax",
         )
-        self._wait_for_h2d_stream()
         q_partial = self._attn_q_head_staging[: K * head_dim * hidden_size].view(K * head_dim, hidden_size)
         _bnb_dequant_impl(
             self._nf4_staging[:n_q], absmax_q_gpu,

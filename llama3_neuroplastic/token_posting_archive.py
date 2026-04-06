@@ -297,12 +297,12 @@ class TokenPostingArchive:
     ) -> None:
         """Write a token into the CPU archive and update posting lists."""
         n = self.archive_count[layer_idx]
-        if n >= self.archive_capacity:
-            return   # archive full — silently drop (oldest-first drop policy)
+        write_pos = n % self.archive_capacity   # circular (FIFO) overwrite
+        self.archive_count[layer_idx] = n + 1   # total-written counter, never capped
 
         # Store exact K/V.
-        self.archive_k_cpu[layer_idx][n].copy_(k_cpu.half())
-        self.archive_v_cpu[layer_idx][n].copy_(v_cpu.half())
+        self.archive_k_cpu[layer_idx][write_pos].copy_(k_cpu.half())
+        self.archive_v_cpu[layer_idx][write_pos].copy_(v_cpu.half())
 
         # Project each KV group's key through the PCA basis and quantize.
         k_f32 = k_cpu.float().numpy()      # [G, D]
@@ -498,6 +498,9 @@ class TokenPostingArchive:
         if not parts_k:
             empty = torch.zeros(0, self.head_dim, dtype=self.dtype, device=self.device)
             return empty, empty
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()   # wait for all non_blocking H2D transfers above
 
         k_all = torch.cat(parts_k, dim=0)    # [T, D]
         v_all = torch.cat(parts_v, dim=0)    # [T, D]
