@@ -8,6 +8,7 @@ if os.getenv("STREAMING_DEBUG_SYNC_CUDA", "").strip().lower() in {"1", "true", "
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -50,6 +51,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run greedy decode with layer-by-layer streamed Llama weights.")
     p.add_argument("--model-name", type=str, required=True, help="HF repo id or local snapshot directory")
     p.add_argument("--prompt", action="append", default=[], help="Prompt to run; may be repeated")
+    p.add_argument(
+        "--prompt-format",
+        type=str,
+        default="raw",
+        choices=["raw", "chat"],
+        help="Prompt encoding mode: raw tokenizer call or tokenizer chat template with generation prompt.",
+    )
     p.add_argument("--max-new-tokens", type=int, default=16)
     p.add_argument("--do-sample", action="store_true")
     p.add_argument("--temperature", type=float, default=1.0)
@@ -191,6 +199,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _make_token_callback(tokenizer: Any, args: Any) -> tuple[Dict[str, bool], Any]:
     state = {"started": False}
+    stream_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+
+    def _safe_piece(text: str) -> str:
+        try:
+            text.encode(stream_encoding)
+            return text
+        except Exception:
+            return text.encode(stream_encoding, errors="replace").decode(stream_encoding, errors="replace")
 
     def _token_callback(next_token: torch.Tensor, _generated: torch.LongTensor) -> None:
         if bool(args.no_stream_output):
@@ -205,6 +221,7 @@ def _make_token_callback(tokenizer: Any, args: Any) -> tuple[Dict[str, bool], An
         )
         if not piece:
             return
+        piece = _safe_piece(piece)
         if not state["started"]:
             print("[stream] ", end="", flush=True)
             state["started"] = True
@@ -222,7 +239,16 @@ def _run_single_prompt(
     prompt_idx: int = 0,
     reuse_session_cache: bool = False,
 ) -> Dict[str, Any]:
-    encoded = tokenizer(prompt, return_tensors="pt")
+    if str(getattr(args, "prompt_format", "raw")) == "chat":
+        encoded = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+    else:
+        encoded = tokenizer(prompt, return_tensors="pt")
     input_ids = encoded["input_ids"]
     stream_state, token_callback = _make_token_callback(tokenizer, args)
 
@@ -242,13 +268,25 @@ def _run_single_prompt(
     elapsed = time.perf_counter() - t0
     if stream_state["started"]:
         print("", flush=True)
-    text = tokenizer.decode(generated[0], skip_special_tokens=True)
+    full_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+    completion_tokens = generated[0, input_ids.shape[-1] :]
+    completion_text = tokenizer.decode(completion_tokens, skip_special_tokens=True)
+    stream_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        full_text.encode(stream_encoding)
+    except Exception:
+        full_text = full_text.encode(stream_encoding, errors="replace").decode(stream_encoding, errors="replace")
+    try:
+        completion_text.encode(stream_encoding)
+    except Exception:
+        completion_text = completion_text.encode(stream_encoding, errors="replace").decode(stream_encoding, errors="replace")
     new_tokens = max(int(generated.shape[-1] - input_ids.shape[-1]), 1)
     row = {
         "prompt_idx": int(prompt_idx),
         "latency_s": float(elapsed),
         "tok_s": float(new_tokens / max(elapsed, 1e-9)),
-        "text": text,
+        "text": full_text,
+        "completion_text": completion_text,
     }
     traffic = runtime.get_last_traffic_report()
     if traffic is not None:
@@ -261,7 +299,7 @@ def _run_single_prompt(
             f"overall={float(overall.get('avg_mb_per_layer', 0.0)):.2f} MB/layer",
             flush=True,
         )
-    print(f"\n[latency {elapsed:.1f}s | {row['tok_s']:.2f} tok/s]\n{text}\n")
+    print(f"\n[latency {elapsed:.1f}s | {row['tok_s']:.2f} tok/s]\n{completion_text}\n")
     return row
 
 
@@ -300,6 +338,11 @@ def main() -> None:
     if int(args.max_runtime_layers) > 0:
         runtime.num_layers = min(int(runtime.num_layers), int(args.max_runtime_layers))
         print(f"[smoke] runtime capped to {int(runtime.num_layers)} layers", flush=True)
+        if int(runtime.num_layers) <= 16:
+            print(
+                "[smoke] coherence warning: <=16-layer cap is for runtime regression only and usually produces low-quality text.",
+                flush=True,
+            )
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(args.model_name), use_fast=True, local_files_only=bool(args.local_files_only)

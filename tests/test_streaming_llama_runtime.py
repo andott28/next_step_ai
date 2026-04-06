@@ -100,6 +100,63 @@ def test_cli_accepts_attention_share_checkpoint_path() -> None:
     assert args.attn_share_path == "results/attn_share_qo.pt"
 
 
+def test_cli_accepts_prompt_format_flag() -> None:
+    parser = cli_mod._build_arg_parser()
+
+    args = parser.parse_args(
+        [
+            "--model-name",
+            "dummy/model",
+            "--prompt",
+            "hello",
+            "--prompt-format",
+            "chat",
+        ]
+    )
+
+    assert args.prompt_format == "chat"
+
+
+def test_run_single_prompt_reports_completion_text_only(monkeypatch) -> None:
+    class _DummyTokenizer:
+        eos_token_id = None
+
+        def __call__(self, prompt, return_tensors="pt"):
+            return {"input_ids": torch.tensor([[10, 11]], dtype=torch.long)}
+
+        def decode(self, tokens, **kwargs):
+            flat = [int(x) for x in torch.as_tensor(tokens).view(-1).tolist()]
+            return " ".join(str(v) for v in flat)
+
+    class _DummyRuntime:
+        def generate(self, **kwargs):
+            return torch.tensor([[10, 11, 42, 43]], dtype=torch.long)
+
+        def get_last_traffic_report(self):
+            return None
+
+    args = SimpleNamespace(
+        no_stream_output=True,
+        max_new_tokens=2,
+        do_sample=False,
+        temperature=1.0,
+        top_k=50,
+        top_p=1.0,
+        prompt_format="raw",
+    )
+
+    row = cli_mod._run_single_prompt(
+        "x",
+        runtime=_DummyRuntime(),
+        tokenizer=_DummyTokenizer(),
+        args=args,
+        prompt_idx=0,
+    )
+
+    assert row["text"] == "10 11 42 43"
+    assert row["completion_text"] == "42 43"
+
+
 def _make_sparse_runtime_stub() -> runtime_mod.StreamingLlamaRuntime:
     runtime = runtime_mod.StreamingLlamaRuntime.__new__(runtime_mod.StreamingLlamaRuntime)
     runtime.device = torch.device("cpu")
