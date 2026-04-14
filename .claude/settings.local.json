@@ -9,7 +9,10 @@
       "Bash(python -c ':*)",
       "Bash(PYTHONFAULTHANDLER=1 python -m llama3_neuroplastic.experiments.run_streaming_inference --model-name \"C:/Users/andre/.cache/huggingface/hub/models--meta-llama--Llama-3.1-405B-Instruct/snapshots/be20571f50d78de33e7f2d6fef8f9c9aeab0deab\" --prompt \"The capital of France is\" --max-new-tokens 8 --sparse-basis-path results/mlp_basis.pt --disable-triton-fused-sparse-mlp)",
       "Bash(PYTHONFAULTHANDLER=1 python -m llama3_neuroplastic.experiments.run_streaming_inference --model-name \"C:\\\\Users\\\\andre\\\\.cache\\\\huggingface\\\\hub\\\\models--unsloth--Meta-Llama-3.1-405B-Instruct-bnb-4bit\\\\snapshots\\\\4efb87ce6435e670c5ed875715f90d2f79df1367\" --prompt \"The capital of France is\" --max-new-tokens 8 --sparse-basis-path results/mlp_basis.pt --disable-triton-fused-sparse-mlp)",
-      "Bash(xargs ls:*)"
+      "Bash(xargs ls:*)",
+      "Bash(./verification_env/Scripts/python.exe -c ':*)",
+      "Bash(.verification_envScriptspython.exe -c ':*)",
+      "Bash(verification_env/Scripts/python.exe -c ':*)"
     ]
   }
 }

@@ -171,14 +171,19 @@ def _make_sparse_runtime_stub() -> runtime_mod.StreamingLlamaRuntime:
     runtime._sparse_block_size = 2
     runtime._sparse_checkpoint_basis_rank = 2
     runtime._sparse_semantic_block_score_normalized = False
-    runtime._sparse_basis_execution = "full_output_latent"
+    runtime._sparse_mlp_execution_request = "output_basis_surrogate"
+    runtime._sparse_basis_execution = "output_basis_surrogate"
+    runtime._sparse_mlp_prefill_mode = "sparse"
+    runtime._traffic_current_phase = "decode"
     runtime._mlp_hot_blocks_by_layer = {}
     runtime._session_sparse_route_layers = set()
     runtime._upper_decode_guard_layers = set()
+    runtime._lm_head_gpu_attempted = False
+    runtime._prefer_gpu_lm_head = False
     return runtime
 
 
-def test_compute_sparse_basis_latent_applies_silu_and_topk_support() -> None:
+def test_compute_sparse_basis_latent_uses_linear_coefficients_and_topk_support() -> None:
     runtime = _make_sparse_runtime_stub()
     runtime._sparse_routing[0] = {
         "enc_w": torch.eye(2, dtype=torch.float32),
@@ -186,10 +191,10 @@ def test_compute_sparse_basis_latent_applies_silu_and_topk_support() -> None:
         "basis_top_k": 1,
     }
 
-    flat_hidden = torch.tensor([[1.0, -2.0]], dtype=torch.float32)
+    flat_hidden = torch.tensor([[2.0, -1.0]], dtype=torch.float32)
     latent = runtime._compute_sparse_basis_latent(flat_hidden, 0)
 
-    expected = torch.tensor([[F.silu(torch.tensor(1.0)), 0.0]], dtype=torch.float32)
+    expected = torch.tensor([[2.0, 0.0]], dtype=torch.float32)
     assert torch.allclose(latent, expected)
 
 
@@ -263,7 +268,7 @@ def test_forward_learned_basis_mlp_applies_bias_only_to_selected_blocks() -> Non
     active_blocks = torch.tensor([[1]], dtype=torch.long)
     out = runtime._forward_learned_basis_mlp(0, hidden, active_blocks)
 
-    latent = F.silu(torch.tensor(2.0))
+    latent = torch.tensor(2.0)
     expected = torch.tensor(
         [[[0.0, 0.0, latent * 3.0 + 30.0, latent * 4.0 + 40.0]]],
         dtype=torch.float32,
@@ -297,7 +302,7 @@ def test_forward_learned_basis_mlp_full_output_reconstructs_all_blocks_from_spar
     hidden = torch.tensor([[[2.0, 0.0, 0.0, 0.0]]], dtype=torch.float32)
     out = runtime._forward_learned_basis_mlp_full_output(0, hidden)
 
-    latent = F.silu(torch.tensor(2.0))
+    latent = torch.tensor(2.0)
     expected = torch.tensor(
         [[[latent * 1.0 + 10.0, latent * 2.0 + 20.0, latent * 3.0 + 30.0, latent * 4.0 + 40.0]]],
         dtype=torch.float32,
@@ -307,7 +312,7 @@ def test_forward_learned_basis_mlp_full_output_reconstructs_all_blocks_from_spar
 
 def test_mlp_forward_dispatch_uses_full_output_basis_for_covered_layers_and_guard_for_others(monkeypatch) -> None:
     runtime = _make_sparse_runtime_stub()
-    runtime._sparse_routing = {2: {"dummy": torch.tensor(1.0)}}
+    runtime._sparse_routing = {2: {"dummy": torch.tensor(1.0), "block_domain": "output"}}
     layer = SimpleNamespace(mlp=object())
     mlp_input = torch.zeros((1, 1, 4), dtype=torch.float32)
     calls = []
@@ -322,6 +327,7 @@ def test_mlp_forward_dispatch_uses_full_output_basis_for_covered_layers_and_guar
 
     monkeypatch.setattr(runtime, "_forward_learned_basis_mlp_full_output", _fake_full_output)
     monkeypatch.setattr(runtime, "_dense_guard_mlp_forward_exact_chunked_4bit", _fake_guard)
+    monkeypatch.setattr(runtime, "_resolve_sparse_mlp_execution_for_routing", lambda layer_idx, routing=None: "output_basis_surrogate")
 
     sparse_out = runtime._mlp_forward_dispatch(2, layer, mlp_input)
     guard_out = runtime._mlp_forward_dispatch(1, layer, mlp_input)
@@ -335,23 +341,25 @@ def test_mlp_forward_dispatch_uses_full_output_basis_for_covered_layers_and_guar
 
 def test_mlp_forward_dispatch_routed_block_mode_keeps_block_router(monkeypatch) -> None:
     runtime = _make_sparse_runtime_stub()
-    runtime._sparse_basis_execution = "routed_blocks"
-    runtime._sparse_routing = {2: {"dummy": torch.tensor(1.0)}}
+    runtime._sparse_mlp_execution_request = "routed_output_blocks"
+    runtime._sparse_basis_execution = "routed_output_blocks"
+    runtime._sparse_routing = {2: {"dummy": torch.tensor(1.0), "block_domain": "output"}}
     layer = SimpleNamespace(mlp=object())
     mlp_input = torch.zeros((1, 1, 4), dtype=torch.float32)
     calls = []
 
+    monkeypatch.setattr(runtime, "_resolve_sparse_mlp_execution_for_routing", lambda layer_idx, routing=None: "routed_output_blocks")
     monkeypatch.setattr(
         runtime,
         "_route_sparse_mlp",
         lambda hidden, layer_idx: torch.tensor([[7]], dtype=torch.long) if int(layer_idx) == 2 else None,
     )
 
-    def _fake_sparse(layer_idx: int, mlp, hidden: torch.Tensor, active_blocks: torch.Tensor) -> torch.Tensor:
+    def _fake_sparse(layer_idx: int, hidden: torch.Tensor, active_blocks: torch.Tensor) -> torch.Tensor:
         calls.append(("routed_blocks", int(layer_idx), active_blocks.clone()))
         return torch.full_like(hidden, 3.0)
 
-    monkeypatch.setattr(runtime, "_sparse_mlp_forward_fast", _fake_sparse)
+    monkeypatch.setattr(runtime, "_forward_learned_basis_mlp", _fake_sparse)
 
     sparse_out = runtime._mlp_forward_dispatch(2, layer, mlp_input)
 
@@ -359,6 +367,34 @@ def test_mlp_forward_dispatch_routed_block_mode_keeps_block_router(monkeypatch) 
     assert calls[0][0] == "routed_blocks"
     assert calls[0][1] == 2
     assert torch.equal(calls[0][2], torch.tensor([[7]], dtype=torch.long))
+
+
+def test_sparse_mlp_forward_fast_accepts_oracle_intermediate_mode(monkeypatch) -> None:
+    runtime = _make_sparse_runtime_stub()
+    runtime._sparse_mlp_execution_request = "exact_intermediate_sparse_oracle"
+    runtime._sparse_basis_execution = "exact_intermediate_sparse_oracle"
+    runtime._sparse_routing = {2: {"block_domain": "intermediate"}}
+    hidden = torch.zeros((1, 1, 4), dtype=torch.float32)
+    active_blocks = torch.tensor([[0, 1]], dtype=torch.long)
+    calls = []
+
+    monkeypatch.setattr(
+        runtime,
+        "_resolve_sparse_mlp_execution_for_routing",
+        lambda layer_idx, routing=None: "exact_intermediate_sparse_oracle",
+    )
+
+    def _fake_sparse(layer_idx, mlp, sparse_hidden, sparse_active_blocks):
+        calls.append((int(layer_idx), sparse_active_blocks.clone()))
+        return torch.full_like(sparse_hidden, 9.0)
+
+    monkeypatch.setattr(runtime, "_sparse_mlp_forward", _fake_sparse)
+
+    out = runtime._sparse_mlp_forward_fast(2, SimpleNamespace(), hidden, active_blocks)
+
+    assert torch.all(out == 9.0)
+    assert calls[0][0] == 2
+    assert torch.equal(calls[0][1], active_blocks)
 
 
 def test_get_attn_active_heads_preserves_importance_ranking_when_trimming() -> None:
@@ -1099,6 +1135,8 @@ def test_generate_skips_extra_forward_token_on_final_step() -> None:
     runtime.device = torch.device("cpu")
     runtime._session_token_ids_cpu = None
     runtime._session_last_logits_cpu = None
+    runtime._lm_head_gpu_attempted = False
+    runtime._prefer_gpu_lm_head = False
     runtime.taylor_layer_set = set()
     runtime._reset_traffic_stats = lambda: None
     runtime._set_traffic_phase = lambda phase: None

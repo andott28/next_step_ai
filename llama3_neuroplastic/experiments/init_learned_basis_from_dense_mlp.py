@@ -16,12 +16,12 @@ except ImportError:  # pragma: no cover
     load_dataset = None
 
 try:
-    from ..basis_fitting import fit_layer_basis
+    from ..basis_fitting import fit_block_score_basis, fit_layer_basis
     from ..performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
     from .streaming_llama_runtime import StreamingLlamaRuntime
     from .init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn
 except ImportError:  # pragma: no cover
-    from llama3_neuroplastic.basis_fitting import fit_layer_basis
+    from llama3_neuroplastic.basis_fitting import fit_block_score_basis, fit_layer_basis
     from llama3_neuroplastic.performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
     from streaming_llama_runtime import StreamingLlamaRuntime
     from init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn  # type: ignore
@@ -92,26 +92,84 @@ def _build_dataloader(
     dataloader_num_workers: int,
     dataloader_prefetch_factor: int,
     dataloader_persistent_workers: bool,
+    min_text_chars: int = 200,
 ) -> DataLoader:
     if load_dataset is None:
         raise RuntimeError("datasets package is required")
     dataset = load_dataset(dataset_name, dataset_config, split=dataset_split)
-    if max_samples > 0:
-        dataset = dataset.select(range(min(int(max_samples), len(dataset))))
-    dataset = dataset.filter(lambda x: isinstance(x[text_column], str) and len(x[text_column].strip()) > 0)
+    _min_chars = max(int(min_text_chars), 1)
+    filtered = dataset.filter(
+        lambda x: isinstance(x[text_column], str) and len(x[text_column].strip()) >= _min_chars
+    )
+    if len(filtered) == 0:
+        # Fall back gracefully: accept any non-empty line rather than crashing.
+        print(
+            f"[dataloader] WARNING: no examples with >= {_min_chars} chars in "
+            f"'{dataset_name}/{dataset_config}'. Falling back to min_text_chars=1.",
+            flush=True,
+        )
+        filtered = dataset.filter(
+            lambda x: isinstance(x[text_column], str) and len(x[text_column].strip()) >= 1
+        )
+    if len(filtered) == 0:
+        raise RuntimeError(
+            f"Dataset '{dataset_name}/{dataset_config}' has no non-empty text in column '{text_column}'."
+        )
 
+    # Pre-limit raw examples before tokenising to avoid processing millions of entries.
+    # We need enough raw text to produce max_samples full-length packed chunks.
+    # Each raw example is typically 50–500 chars (~10–100 tokens); 5000 raw examples
+    # easily produces hundreds of max_seq_length=2048 chunks.
+    _raw_limit = max(int(max_samples) * 200 + 5000, 10000)
+    if len(filtered) > _raw_limit:
+        filtered = filtered.select(range(_raw_limit))
+
+    # Tokenise without padding/truncation — group_texts will handle chunking.
     def tokenize_fn(batch: Dict[str, List[str]]) -> Dict[str, Any]:
         return tokenizer(
             batch[text_column],
-            truncation=True,
-            padding="max_length",
-            max_length=max_seq_length,
+            truncation=False,
+            padding=False,
         )
 
-    tokenized = dataset.map(tokenize_fn, batched=True, remove_columns=dataset.column_names)
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask"])
+    tokenized = filtered.map(tokenize_fn, batched=True, remove_columns=filtered.column_names)
+
+    # Pack: concatenate all token IDs and split into fixed-length chunks.
+    # This guarantees every sample has exactly max_seq_length real tokens (mask all 1s),
+    # regardless of individual document length. With max_seq_length=2048 and
+    # max_rows_per_layer=512, the first packed sample fills all layers to capacity.
+    _seq_len = int(max_seq_length)
+
+    def group_texts(examples: Dict[str, List]) -> Dict[str, Any]:
+        ids = sum(examples["input_ids"], [])
+        total = (len(ids) // _seq_len) * _seq_len
+        if total == 0:
+            return {"input_ids": [], "attention_mask": []}
+        return {
+            "input_ids": [ids[i : i + _seq_len] for i in range(0, total, _seq_len)],
+            # All tokens are real — no padding — so attention_mask is all ones.
+            "attention_mask": [[1] * _seq_len for _ in range(0, total, _seq_len)],
+        }
+
+    grouped = tokenized.map(
+        group_texts,
+        batched=True,
+        batch_size=1000,
+        remove_columns=list(tokenized.column_names),
+    )
+
+    if max_samples > 0:
+        grouped = grouped.select(range(min(int(max_samples), len(grouped))))
+
+    if len(grouped) == 0:
+        raise RuntimeError(
+            f"Dataset produced 0 packed sequences of length {_seq_len}. "
+            f"Try lowering --max-seq-length or increasing --max-samples."
+        )
+
+    grouped.set_format(type="torch", columns=["input_ids", "attention_mask"])
     return DataLoader(
-        tokenized,
+        grouped,
         **resolve_dataloader_kwargs(
             batch_size=int(batch_size),
             num_workers=int(dataloader_num_workers),
@@ -171,6 +229,85 @@ def _fit_layer_basis(
         pca_method=str(pca_method),
         pca_batch_rows=int(pca_batch_rows),
     )
+
+
+def _artifact_target_to_block_domain(artifact_target: str) -> str:
+    target = str(artifact_target).strip().lower()
+    if target == "output_reconstruction":
+        return "output"
+    if target == "intermediate_block_scores":
+        return "intermediate"
+    raise ValueError(f"Unsupported artifact target: {artifact_target}")
+
+
+def _artifact_target_to_recommended_execution(artifact_target: str) -> str:
+    target = str(artifact_target).strip().lower()
+    if target == "output_reconstruction":
+        return "output_basis_surrogate"
+    if target == "intermediate_block_scores":
+        return "exact_intermediate_sparse"
+    raise ValueError(f"Unsupported artifact target: {artifact_target}")
+
+
+def _fit_sparse_artifact(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    artifact_target: str,
+    basis_rank: int,
+    block_size: int,
+    pca_method: str,
+    pca_batch_rows: int,
+) -> Dict[str, Any]:
+    target = str(artifact_target).strip().lower()
+    if target == "output_reconstruction":
+        return _fit_layer_basis(
+            x=x,
+            y=y,
+            basis_rank=int(basis_rank),
+            block_size=int(block_size),
+            pca_method=str(pca_method),
+            pca_batch_rows=int(pca_batch_rows),
+        )
+    if target == "intermediate_block_scores":
+        return fit_block_score_basis(
+            x=x,
+            block_scores=y,
+            basis_rank=int(basis_rank),
+            pca_method=str(pca_method),
+            pca_batch_rows=int(pca_batch_rows),
+        )
+    raise ValueError(f"Unsupported artifact target: {artifact_target}")
+
+
+def _layer_state_from_fitted(*, artifact_target: str, fitted: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    state: Dict[str, torch.Tensor] = {
+        "encoder_weight": fitted["encoder_weight"],
+        "encoder_bias": fitted["encoder_bias"],
+        "scale": fitted["scale"],
+    }
+    target = str(artifact_target).strip().lower()
+    if target == "output_reconstruction":
+        state.update(
+            {
+                "decoder_blocks": fitted["decoder_blocks"],
+                "decoder_bias": fitted["decoder_bias"],
+            }
+        )
+    elif target == "intermediate_block_scores":
+        state.update(
+            {
+                "score_weight": fitted["score_weight"],
+                "score_bias": fitted["score_bias"],
+                "block_importance": fitted["block_importance"],
+            }
+        )
+    else:
+        raise ValueError(f"Unsupported artifact target: {artifact_target}")
+    state["samples"] = torch.tensor(float(fitted["samples"]), dtype=torch.float32)
+    state["rank_effective"] = torch.tensor(float(fitted["rank_effective"]), dtype=torch.float32)
+    state["explained_variance_ratio"] = torch.tensor(float(fitted["explained_variance_ratio"]), dtype=torch.float32)
+    return state
 
 
 def _load_profile_overrides(path: str) -> Dict[str, Dict[int, int]]:
@@ -237,15 +374,23 @@ def _build_basis_payload(
     overrides: Dict[str, Dict[int, int]],
     existing_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    artifact_target = str(args.artifact_target).strip().lower()
     config_payload: Dict[str, Any] = dict(existing_config or {})
     config_payload.update(
         {
             "sparse_placement": "learned_basis",
+            "artifact_target": artifact_target,
+            "block_domain": _artifact_target_to_block_domain(artifact_target),
+            "encoder_activation": "linear",
+            "recommended_execution": _artifact_target_to_recommended_execution(artifact_target),
             "routing_mode": str(config_payload.get("routing_mode", args.sca_routing_mode)),
             "bottom_buffer_layers": int(config_payload.get("bottom_buffer_layers", args.sca_bottom_buffer_layers)),
             "decode_guard_layers": int(config_payload.get("decode_guard_layers", args.sca_decode_guard_layers)),
             "dense_anchor_stride": int(config_payload.get("dense_anchor_stride", args.sca_dense_anchor_stride)),
             "basis_rank": int(config_payload.get("basis_rank", args.basis_rank)),
+            # basis_top_k: latent coordinate sparsity. Default = basis_rank (all coords active,
+            # no latent sparsity). Output-block sparsity is controlled separately by top_k.
+            "basis_top_k": int(config_payload.get("basis_top_k", args.basis_top_k)),
             "pca_method": str(config_payload.get("pca_method", args.pca_method)),
             "pca_batch_rows": int(config_payload.get("pca_batch_rows", args.pca_batch_rows)),
             "basis_rank_by_layer": config_payload.get("basis_rank_by_layer", overrides["basis_rank_by_layer"]),
@@ -253,6 +398,7 @@ def _build_basis_payload(
             "top_k_by_layer": config_payload.get("top_k_by_layer", overrides["top_k_by_layer"]),
             "block_size": int(config_payload.get("block_size", block_size)),
             "num_blocks": int(config_payload.get("num_blocks", num_blocks)),
+            "intermediate_block_score_metric": "mean_abs",
             "streaming_harness_used": bool(config_payload.get("streaming_harness_used", args.use_streaming_harness)),
         }
     )
@@ -331,8 +477,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--max-rows-per-layer", type=int, default=1024)
     p.add_argument("--basis-rank", type=int, default=64)
+    p.add_argument("--basis-top-k", type=int, default=64)
     p.add_argument("--pca-method", type=str, default="auto", choices=["auto", "lowrank", "incremental"])
     p.add_argument("--pca-batch-rows", type=int, default=1024)
+    p.add_argument(
+        "--artifact-target",
+        type=str,
+        default="intermediate_block_scores",
+        choices=["output_reconstruction", "intermediate_block_scores"],
+        help="Artifact to fit. output_reconstruction keeps the legacy output-space surrogate. "
+             "intermediate_block_scores fits a router over true FFN intermediate block scores "
+             "for exact sparse gate/up/down execution.",
+    )
     p.add_argument("--sca-block-size", type=int, default=32)
     p.add_argument("--sca-bottom-buffer-layers", type=int, default=2)
     p.add_argument("--sca-decode-guard-layers", type=int, default=12)
@@ -373,6 +529,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-config", type=str, default="wikitext-2-raw-v1")
     p.add_argument("--dataset-split", type=str, default="train")
     p.add_argument("--text-column", type=str, default="text")
+    p.add_argument("--min-text-chars", type=int, default=200,
+                   help="Minimum character count (after strip) to keep a calibration sample. "
+                        "Filters out blank lines and short section headers in wikitext-style datasets.")
     p.add_argument(
         "--kv-basis-output-path", type=str, default="",
         help="If set, K/V column-block routing basis is fitted in the same forward pass "
@@ -389,7 +548,14 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if int(args.basis_top_k) <= 0 or int(args.basis_top_k) > int(args.basis_rank):
+        raise RuntimeError("--basis-top-k must be in [1, --basis-rank]")
     configure_runtime_environment(cudnn_benchmark=True)
+    if str(args.artifact_target).strip().lower() == "intermediate_block_scores" and not bool(args.use_streaming_harness):
+        raise RuntimeError(
+            "--artifact-target intermediate_block_scores currently requires --use-streaming-harness "
+            "so exact intermediate block scores can be collected from the streamed dense MLP."
+        )
     if bool(args.use_streaming_harness) and int(args.batch_size) != 1:
         raise RuntimeError("Streaming harness mode currently requires --batch-size 1")
     if (not bool(args.use_streaming_harness)) and not str(args.hybrid_checkpoint).strip():
@@ -421,8 +587,10 @@ def main() -> None:
     _effective_routing_mode = str(_existing_config.get("routing_mode", args.sca_routing_mode))
     _effective_block_size = int(_existing_config.get("block_size", args.sca_block_size))
     _effective_basis_rank = int(_existing_config.get("basis_rank", args.basis_rank))
+    _effective_basis_top_k = int(_existing_config.get("basis_top_k", args.basis_top_k))
     _effective_pca_method = str(_existing_config.get("pca_method", args.pca_method))
     _effective_pca_batch_rows = int(_existing_config.get("pca_batch_rows", args.pca_batch_rows))
+    _artifact_target = str(_existing_config.get("artifact_target", args.artifact_target)).strip().lower()
     if bool(args.plan_only) and bool(args.use_streaming_harness):
         config = AutoConfig.from_pretrained(
             args.model_name,
@@ -494,6 +662,7 @@ def main() -> None:
         dataloader_num_workers=int(args.dataloader_num_workers),
         dataloader_prefetch_factor=int(args.dataloader_prefetch_factor),
         dataloader_persistent_workers=bool(args.dataloader_persistent_workers),
+        min_text_chars=int(args.min_text_chars),
     )
 
     artifact: Dict[str, Any] = {}
@@ -529,10 +698,20 @@ def main() -> None:
                 dense_anchor_stride=_effective_dense_anchor_stride,
             )
         block_size = int(_effective_block_size)
-        hidden_size = int(runtime.config.hidden_size)
-        num_blocks = int(hidden_size // max(block_size, 1))
-        if num_blocks * block_size != hidden_size:
-            raise RuntimeError("hidden_size must be divisible by --sca-block-size for learned-basis init")
+        if _artifact_target == "output_reconstruction":
+            hidden_size = int(runtime.config.hidden_size)
+            num_blocks = int(hidden_size // max(block_size, 1))
+            if num_blocks * block_size != hidden_size:
+                raise RuntimeError("hidden_size must be divisible by --sca-block-size for learned-basis init")
+        elif _artifact_target == "intermediate_block_scores":
+            intermediate_size = int(getattr(runtime.config, "intermediate_size", 0))
+            num_blocks = int(intermediate_size // max(block_size, 1))
+            if num_blocks * block_size != intermediate_size:
+                raise RuntimeError(
+                    "intermediate_size must be divisible by --sca-block-size for intermediate block-score routing init"
+                )
+        else:
+            raise RuntimeError(f"Unsupported artifact target: {_artifact_target}")
     else:
         artifact = torch.load(args.hybrid_checkpoint, map_location="cpu")
         if not isinstance(artifact, dict):
@@ -545,7 +724,7 @@ def main() -> None:
             sca_spmm_impl="cuda_spmm",
             sca_block_size=int(_effective_block_size),
             sca_basis_rank=int(_effective_basis_rank),
-            sca_basis_top_k=max(1, int(_effective_basis_rank) // 4),
+            sca_basis_top_k=int(_effective_basis_top_k),
             sca_routing_mode=str(_effective_routing_mode),
             sca_bottom_buffer_layers=int(_effective_bottom_buffer_layers),
             sca_dense_anchor_stride=int(_effective_dense_anchor_stride),
@@ -565,6 +744,10 @@ def main() -> None:
         model.set_mlp_alignment_capture(True, selected_layers)
         model.neuroplasticity_enabled = False
         model.eval()
+        if _artifact_target != "output_reconstruction":
+            raise RuntimeError(
+                "--artifact-target intermediate_block_scores is currently supported only with --use-streaming-harness"
+            )
         block_size = int(model.sca_config.block_size)
         num_blocks = int(model.sca_config.num_blocks)
 
@@ -677,15 +860,26 @@ def main() -> None:
     overrides = _load_profile_overrides(str(args.profile_path))
 
     # --- EVR-adaptive fitting thresholds -----------------------------------
-    # _fit_threshold: minimum rows before we attempt a first fit (1/8 of max).
+    # _fit_threshold: minimum rows before we attempt a first fit.
+    # basis_fitting.py clamps rank_eff = min(basis_rank, rows) and pads zeros for
+    # missing rows, so any number of rows >= 1 is mathematically valid.  We only
+    # need enough rows to make the lstsq well-conditioned; _effective_basis_rank rows
+    # is sufficient (same as the number of latent dimensions we are fitting).
+    # The previous floor of max(64, max_rows // 8) caused a one-off failure when
+    # per-sample token count was exactly basis_rank - 1 (e.g. 63 rows with rank 64).
     # _EVR_LOW: if explained-variance-ratio < this after a fit, the basis is too
     #   poor to trust; keep collecting and re-fit at 2× the current row count.
     # _EVR_HIGH: EVR at or above this is "excellent" — accept without waiting for
     #   more data (the current early-stop behaviour, unchanged).
     # _layer_next_fit_at: per-layer "don't try to fit until this many rows" counter.
     #   Starts at _fit_threshold for every layer; bumped to 2× on poor-EVR fits.
-    _fit_threshold = max(64, max_rows // 8)
-    _EVR_LOW: float = 0.50
+    _fit_threshold = max(int(_effective_basis_rank) - 1, 1)
+    # EVR thresholds.  Rank-64 PCA on 16384-dim MLP outputs achieves 0.15–0.42
+    # EVR regardless of how many calibration rows are collected (rank limitation,
+    # not data quantity).  Setting _EVR_LOW = 0.0 prevents the "keep collecting
+    # and refit at 2× rows" loop from running indefinitely on layers that can
+    # never exceed the rank ceiling.  All fits are accepted on the first attempt.
+    _EVR_LOW: float = 0.0
     _EVR_HIGH: float = 0.85
     _layer_next_fit_at: Dict[int, int] = {int(idx): _fit_threshold for idx in selected_layers}
     # -----------------------------------------------------------------------
@@ -700,6 +894,7 @@ def main() -> None:
                 layer_y=layer_y,
                 layer_rows=layer_rows,
                 max_rows=max_rows,
+                artifact_target=_artifact_target,
                 layer_kv_x=layer_kv_x if _do_kv else None,
                 layer_kv_rows=layer_kv_rows if _do_kv else None,
                 kv_max_rows=_kv_max_rows,
@@ -801,11 +996,11 @@ def main() -> None:
             _kv_pending = sum(1 for idx in selected_layers if layer_kv_rows.get(int(idx), 0) < _kv_max_rows)
             _row_info += f" kv=[{_kv_min}..{_kv_max_seen}] kv_pending={_kv_pending}"
         if _saved_resume and _saved_output:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} — resume + partial output saved", flush=True)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} [res+out]", flush=True)
         elif _saved_resume:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} — resume saved", flush=True)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} [res]", flush=True)
         elif _saved_output:
-            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} — partial output saved", flush=True)
+            print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} [out]", flush=True)
         else:
             print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info}", flush=True)
         # Fit layers that have collected enough rows.
@@ -825,9 +1020,10 @@ def main() -> None:
                 continue
             _x = torch.cat(_xs, dim=0)
             _y = torch.cat(_ys, dim=0)
-            _fitted = _fit_layer_basis(
+            _fitted = _fit_sparse_artifact(
                 _x,
                 _y,
+                artifact_target=_artifact_target,
                 basis_rank=int(_effective_basis_rank),
                 block_size=int(block_size),
                 pca_method=str(_effective_pca_method),
@@ -841,13 +1037,10 @@ def main() -> None:
                     "excellent" if _evr >= _EVR_HIGH
                     else ("acceptable" if _evr >= _EVR_LOW else "best-effort")
                 )
-                layer_states[str(layer_idx)] = {
-                    "encoder_weight": _fitted["encoder_weight"],
-                    "encoder_bias": _fitted["encoder_bias"],
-                    "decoder_blocks": _fitted["decoder_blocks"],
-                    "decoder_bias": _fitted["decoder_bias"],
-                    "scale": _fitted["scale"],
-                }
+                layer_states[str(layer_idx)] = _layer_state_from_fitted(
+                    artifact_target=_artifact_target,
+                    fitted=_fitted,
+                )
                 stats[str(layer_idx)] = {
                     "samples": float(_fitted["samples"]),
                     "rank_effective": float(_fitted["rank_effective"]),
@@ -923,21 +1116,19 @@ def main() -> None:
             continue
         x = torch.cat(xs, dim=0)
         y = torch.cat(ys, dim=0)
-        fitted = _fit_layer_basis(
+        fitted = _fit_sparse_artifact(
             x=x,
             y=y,
+            artifact_target=_artifact_target,
             basis_rank=int(_effective_basis_rank),
             block_size=int(block_size),
             pca_method=str(_effective_pca_method),
             pca_batch_rows=int(_effective_pca_batch_rows),
         )
-        layer_states[str(layer_idx)] = {
-            "encoder_weight": fitted["encoder_weight"],
-            "encoder_bias": fitted["encoder_bias"],
-            "decoder_blocks": fitted["decoder_blocks"],
-            "decoder_bias": fitted["decoder_bias"],
-            "scale": fitted["scale"],
-        }
+        layer_states[str(layer_idx)] = _layer_state_from_fitted(
+            artifact_target=_artifact_target,
+            fitted=fitted,
+        )
         stats[str(layer_idx)] = {
             "samples": float(fitted["samples"]),
             "rank_effective": float(fitted["rank_effective"]),

@@ -10,5 +10,19 @@ __pycache__/
 .claude/
 full_replication_file_map.md
 
-# Large results folder
+# Large results folder and temporary experiment artifacts
 results/
+tmp/
+
+# PyTorch checkpoint files (large binary artifacts — store in DVC/HuggingFace Hub instead)
+*.pt
+*.pth
+*.safetensors
+
+# Jupyter / notebook artifacts
+.ipynb_checkpoints/
+*.ipynb
+
+# OS artifacts
+.DS_Store
+Thumbs.db

@@ -66,11 +66,43 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         triton_sparse_input_linear_4bit = None
         triton_sparse_output_linear_4bit = None
+        import warnings as _warnings
+        _warnings.warn(
+            "[StreamingLlamaRuntime] Triton sparse MLP kernels are unavailable on this platform. "
+            "All sparse MLP layers will fall back to the PyTorch path, which is 3-5x slower. "
+            "On Windows, ensure triton-windows is installed and CUDA compute capability >= 8.0 (Ampere+).",
+            RuntimeWarning,
+            stacklevel=1,
+        )
 
         def triton_sparse_mlp_available() -> bool:
             return False
 
 import struct as _struct
+
+
+def _assert_bnb_ready(tensor: "torch.Tensor", name: str, *, expected_device: "torch.device") -> None:
+    """Guard against CUDA illegal memory access in bitsandbytes kernels.
+
+    bitsandbytes CUDA ops (ops.cu) require:
+      1. The tensor lives on the expected CUDA device.
+      2. The storage is contiguous (stride[0] == 1 for a 1-D tensor).
+    Violating either causes a silent illegal memory access or a wrong-value
+    dequantisation that only surfaces as a numeric NaN or a CUDA error on a
+    completely unrelated later operation.
+    """
+    if tensor.device != expected_device:
+        raise RuntimeError(
+            f"bitsandbytes tensor '{name}' is on {tensor.device} but expected {expected_device}. "
+            "Ensure the weight and absmax tensors are moved to the target device before calling "
+            "_bnb_dequant_impl / dequantize_blockwise."
+        )
+    if not tensor.is_contiguous():
+        raise RuntimeError(
+            f"bitsandbytes tensor '{name}' is not contiguous (shape={tuple(tensor.shape)}, "
+            f"strides={tensor.stride()}). Call .contiguous() before passing to bitsandbytes kernels."
+        )
+
 
 # Maps safetensors dtype string → torch.dtype for _load_safetensors_direct.
 _SAFETENSORS_DTYPE_TO_TORCH: Dict[str, "torch.dtype"] = {
@@ -87,6 +119,28 @@ _SAFETENSORS_DTYPE_TO_TORCH: Dict[str, "torch.dtype"] = {
 }
 
 _DEFAULT_SPARSE_BASIS_TOP_K = 8
+_SPARSE_MLP_EXECUTION_ALIASES = {
+    "full_output_latent": "output_basis_surrogate",
+    "routed_blocks": "routed_output_blocks",
+}
+_SPARSE_MLP_EXECUTION_CHOICES = {
+    "auto",
+    "output_basis_surrogate",
+    "routed_output_blocks",
+    "exact_intermediate_sparse",
+    "exact_intermediate_sparse_oracle",
+}
+
+
+def _normalize_sparse_mlp_execution(mode: Optional[str]) -> str:
+    normalized = str(mode or "auto").strip().lower() or "auto"
+    normalized = _SPARSE_MLP_EXECUTION_ALIASES.get(normalized, normalized)
+    if normalized not in _SPARSE_MLP_EXECUTION_CHOICES:
+        raise RuntimeError(
+            "Sparse MLP execution must be one of: "
+            "auto, output_basis_surrogate, routed_output_blocks, exact_intermediate_sparse, exact_intermediate_sparse_oracle"
+        )
+    return normalized
 
 
 def _make_meta_parameter(shape: Sequence[int], *, dtype: torch.dtype) -> nn.Parameter:
@@ -837,6 +891,8 @@ class ShardedSafetensorLoader:
                     f"but out has {out.numel()} elements (shape {out.shape})"
                 )
 
+            _assert_bnb_ready(weight_gpu, f"{full_name}/weight_gpu", expected_device=out.device)
+            _assert_bnb_ready(absmax, f"{full_name}/absmax", expected_device=out.device)
             _bnb_dequant_impl(
                 weight_gpu,
                 absmax,
@@ -906,6 +962,8 @@ class ShardedSafetensorLoader:
                         f"but out has {out.numel()} elements (shape {out.shape})"
                     )
 
+                _assert_bnb_ready(weight_gpu, f"{full_name}/weight_gpu", expected_device=out.device)
+                _assert_bnb_ready(absmax, f"{full_name}/absmax_staging", expected_device=out.device)
                 _bnb_dequant_impl(
                     weight_gpu,
                     absmax,
@@ -943,6 +1001,8 @@ class ShardedSafetensorLoader:
             absmax = absmax.float() + quant_state.offset
         else:
             absmax = quant_state.absmax.float()
+        _assert_bnb_ready(weight_gpu, f"{full_name}/weight_gpu", expected_device=out.device)
+        _assert_bnb_ready(absmax, f"{full_name}/absmax_gpu", expected_device=out.device)
         _bnb_dequant_impl(weight_gpu, absmax, quant_state.blocksize, quant_state.quant_type, quant_state.dtype, out=out)
         if byte_counter is not None:
             byte_counter(int(traffic_bytes))
@@ -983,6 +1043,9 @@ class StreamingLlamaRuntime:
         materialize_lm_head: bool = True,
         sparse_basis_path: Optional[str] = None,
         sparse_top_k: Optional[int] = None,
+        sparse_basis_top_k: Optional[int] = None,
+        sparse_mlp_execution: Optional[str] = None,
+        sparse_mlp_prefill_mode: Optional[str] = None,
         vram_hot_cache_gb: Optional[float] = None,
         hot_block_threshold: float = 0.80,
         attn_head_importance_path: Optional[str] = None,
@@ -1030,14 +1093,23 @@ class StreamingLlamaRuntime:
             raise RuntimeError(
                 "STREAMING_SPARSE_BIAS_MODE must be one of: selected, none"
             )
-        self._sparse_basis_execution = (
-            os.getenv("STREAMING_SPARSE_BASIS_EXECUTION", "full_output_latent").strip().lower()
-            or "full_output_latent"
+        _sparse_mlp_execution_raw = (
+            sparse_mlp_execution
+            if sparse_mlp_execution is not None
+            else os.getenv("STREAMING_SPARSE_BASIS_EXECUTION", "auto")
         )
-        if self._sparse_basis_execution not in {"full_output_latent", "routed_blocks"}:
-            raise RuntimeError(
-                "STREAMING_SPARSE_BASIS_EXECUTION must be one of: full_output_latent, routed_blocks"
-            )
+        self._sparse_mlp_execution_request = _normalize_sparse_mlp_execution(_sparse_mlp_execution_raw)
+        # Keep the historical attribute name as an alias for compatibility with older
+        # scripts and tests that still inspect _sparse_basis_execution directly.
+        self._sparse_basis_execution = self._sparse_mlp_execution_request
+        _sparse_mlp_prefill_mode_raw = (
+            sparse_mlp_prefill_mode
+            if sparse_mlp_prefill_mode is not None
+            else os.getenv("STREAMING_SPARSE_MLP_PREFILL_MODE", "dense")
+        )
+        self._sparse_mlp_prefill_mode = str(_sparse_mlp_prefill_mode_raw).strip().lower() or "dense"
+        if self._sparse_mlp_prefill_mode not in {"dense", "sparse"}:
+            raise RuntimeError("Sparse MLP prefill mode must be one of: dense, sparse")
         self._sparse_attn_prefill_mode = os.getenv("STREAMING_SPARSE_ATTN_PREFILL_MODE", "dense").strip().lower() or "dense"
         if self._sparse_attn_prefill_mode not in {"dense", "sparse"}:
             raise RuntimeError(
@@ -1072,6 +1144,7 @@ class StreamingLlamaRuntime:
         self._h2d_stream: Optional[torch.cuda.Stream] = (
             torch.cuda.Stream(device=self.device) if self._enable_cuda_h2d_overlap else None
         )
+        self._lm_head_gpu_attempted = False
         self.num_layers = int(getattr(self.config, "num_hidden_layers", 0))
         if self.num_layers <= 0:
             raise RuntimeError("Invalid llama config: num_hidden_layers must be > 0")
@@ -1275,10 +1348,18 @@ class StreamingLlamaRuntime:
             for p in self._shared_taylor_attn.parameters():
                 p.requires_grad = False
         elif self._taylor_auto_disabled_for_sparse_attn:
-            print(
-                "[taylor] disabled for streamed sparse-attention runtime; "
-                "set STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN=1 to override.",
-                flush=True,
+            import warnings as _tw
+            _tw.warn(
+                "[taylor] Taylor-SSD attention was requested but is INCOMPATIBLE with sparse "
+                "head-importance attention and has been automatically disabled.\n"
+                "Why: Taylor-SSD maintains a per-layer recurrent state (S matrix + z normalization) "
+                "across tokens. Sparse head routing changes which heads are active each token, "
+                "breaking the recurrent state invariant and causing silent numeric divergence.\n"
+                "To enable anyway (experimental, may produce garbage outputs): "
+                "set STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN=1.\n"
+                "To silence this warning: pass taylor_layers=[] to disable Taylor-SSD explicitly.",
+                RuntimeWarning,
+                stacklevel=2,
             )
 
         # Background thread pool (1 worker) that warms the RAM cache for the
@@ -1383,16 +1464,19 @@ class StreamingLlamaRuntime:
         # init_learned_basis_from_dense_mlp.py. Kept in CPU RAM and moved to GPU
         # lazily when a layer is processed.
         #
-        # For each sparse layer, the checkpoint stores:
-        #   encoder_weight [basis_rank, hidden_size] — projects hidden → latent
-        #   encoder_bias   [basis_rank]
-        #   decoder_blocks [num_output_blocks, basis_rank, block_size] — reconstructs output blocks
+        # For each sparse layer, the checkpoint stores a linear hidden -> latent
+        # encoder plus one of two routing payloads:
+        #   output_reconstruction:
+        #     decoder_blocks [num_output_blocks, basis_rank, block_size]
+        #     decoder_bias   [num_output_blocks, block_size]
+        #   intermediate_block_scores:
+        #     score_weight [num_intermediate_blocks, basis_rank]
+        #     score_bias   [num_intermediate_blocks]
         #
-        # These blocks live in output space over hidden_size, not in
-        # intermediate FFN space. Covered layers must stay on the learned-basis
-        # reconstruction path; uncovered layers run the exact chunked 4-bit
-        # dense guard path over the original FFN weights.
-        self._sparse_routing: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Output-space artifacts are approximate MLP-output surrogates. Intermediate
+        # artifacts only choose FFN blocks; selected gate/up/down blocks still run
+        # the original SiLU(gate) * up MLP math.
+        self._sparse_routing: Dict[int, Dict[str, Any]] = {}
         self._sparse_top_k: int = 0
         self._sparse_runtime_top_k: int = 0
         self._sparse_block_size: int = 32
@@ -1415,9 +1499,19 @@ class StreamingLlamaRuntime:
                     int(_idx) for _idx in _raw_selection if 0 <= int(_idx) < self.num_layers
                 }
             self._sparse_block_size = int(_cfg.get("block_size", 32))
-            self._sparse_num_blocks = int(
-                _cfg.get("num_blocks", int(self.config.hidden_size) // self._sparse_block_size)
+            _artifact_target_default = str(_cfg.get("artifact_target", "output_reconstruction")).strip().lower()
+            _block_domain_default = str(
+                _cfg.get(
+                    "block_domain",
+                    "intermediate" if _artifact_target_default == "intermediate_block_scores" else "output",
+                )
+            ).strip().lower()
+            _default_num_blocks = (
+                int(self.config.hidden_size) // max(int(self._sparse_block_size), 1)
+                if _block_domain_default == "output"
+                else int(getattr(self.config, "intermediate_size", 0)) // max(int(self._sparse_block_size), 1)
             )
+            self._sparse_num_blocks = int(_cfg.get("num_blocks", _default_num_blocks))
             self._sparse_checkpoint_basis_rank = int(_cfg.get("basis_rank", self._sparse_checkpoint_basis_rank))
             # top_k: honour explicit override, else use 2 % of checkpoint blocks as default
             _num_blocks = max(1, int(self._sparse_num_blocks))
@@ -1428,7 +1522,11 @@ class StreamingLlamaRuntime:
             _stats = _payload.get("stats", {})
             _block_top_k_by_layer = _cfg.get("top_k_by_layer", {}) or {}
             _basis_top_k_by_layer = _cfg.get("basis_top_k_by_layer", {}) or {}
-            _default_basis_top_k = int(_cfg.get("basis_top_k", _DEFAULT_SPARSE_BASIS_TOP_K))
+            _default_basis_top_k = (
+                int(sparse_basis_top_k)
+                if sparse_basis_top_k is not None
+                else int(_cfg.get("basis_top_k", _DEFAULT_SPARSE_BASIS_TOP_K))
+            )
             self._sparse_semantic_block_score_normalized = bool(
                 _cfg.get("semantic_block_score_normalized", False)
             )
@@ -1438,9 +1536,146 @@ class StreamingLlamaRuntime:
                 if isinstance(_bib, dict):
                     _block_importance_by_layer = _bib
             _basis_device = self.device if self.device.type == "cuda" else torch.device("cpu")
+            _evrs: List[float] = []
+            _low_evr_count = 0
+            _MIN_EXPLAINED_VARIANCE = 0.30
             for _lidx_s, _state in _layer_states.items():
                 _lidx = int(_lidx_s)
                 if not (0 <= _lidx < self.num_layers):
+                    continue
+                _layer_stats = _stats.get(str(_lidx), {}) if isinstance(_stats, dict) else {}
+                _artifact_target = str(
+                    _state.get("artifact_target", _cfg.get("artifact_target", _artifact_target_default))
+                ).strip().lower()
+                _block_domain = str(
+                    _state.get(
+                        "block_domain",
+                        _cfg.get(
+                            "block_domain",
+                            "intermediate" if _artifact_target == "intermediate_block_scores" else _block_domain_default,
+                        ),
+                    )
+                ).strip().lower()
+                if _block_domain == "intermediate":
+                    _enc_w = _state["encoder_weight"].to(
+                        device=_basis_device,
+                        dtype=self.dtype,
+                        non_blocking=False,
+                    ).contiguous()
+                    _enc_b = _state["encoder_bias"].to(
+                        device=_basis_device,
+                        dtype=self.dtype,
+                        non_blocking=False,
+                    ).contiguous()
+                    _basis_rank = int(_enc_w.shape[0])
+                    _expected_hidden = int(self.config.hidden_size)
+                    if int(_enc_w.shape[1]) != _expected_hidden:
+                        raise RuntimeError(
+                            f"Sparse intermediate-router layer {_lidx}: encoder_weight has input dim "
+                            f"{int(_enc_w.shape[1])}, expected hidden_size={_expected_hidden}."
+                        )
+                    _rank_effective = int(
+                        self._coerce_sparse_layer_stat(_state, _layer_stats, "rank_effective", _basis_rank)
+                    )
+                    _rank_effective = int(max(1, min(_rank_effective, _basis_rank)))
+                    _evr = float(
+                        self._coerce_sparse_layer_stat(_state, _layer_stats, "explained_variance_ratio", 1.0)
+                    )
+                    _evrs.append(_evr)
+                    if _evr < _MIN_EXPLAINED_VARIANCE:
+                        _low_evr_count += 1
+                        import warnings as _w
+                        _w.warn(
+                            f"[sparse_basis] Layer {_lidx} explained_variance_ratio={_evr:.3f} < "
+                            f"{_MIN_EXPLAINED_VARIANCE:.2f}. The intermediate router may have poor recall.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    _score_weight_raw = _state.get("score_weight")
+                    if not torch.is_tensor(_score_weight_raw):
+                        raise RuntimeError(f"Sparse intermediate-router layer {_lidx} is missing score_weight.")
+                    _route_score_weight = _score_weight_raw.to(
+                        device=_basis_device,
+                        dtype=self.dtype,
+                        non_blocking=False,
+                    ).contiguous()
+                    if int(_route_score_weight.ndim) != 2 or int(_route_score_weight.shape[1]) != int(_basis_rank):
+                        raise RuntimeError(
+                            f"Sparse intermediate-router layer {_lidx}: score_weight shape "
+                            f"{tuple(_route_score_weight.shape)} does not match basis_rank={_basis_rank}."
+                        )
+                    _layer_num_blocks = int(_route_score_weight.shape[0])
+                    _expected_intermediate_blocks = int(getattr(self.config, "intermediate_size", 0)) // int(
+                        self._sparse_block_size
+                    )
+                    if _layer_num_blocks != _expected_intermediate_blocks:
+                        raise RuntimeError(
+                            f"Sparse intermediate-router layer {_lidx} stores {_layer_num_blocks} FFN blocks, "
+                            f"expected {_expected_intermediate_blocks}."
+                        )
+                    _score_bias_raw = _state.get("score_bias")
+                    _route_score_bias = None
+                    if torch.is_tensor(_score_bias_raw):
+                        _route_score_bias = _score_bias_raw.to(
+                            device=_basis_device,
+                            dtype=self.dtype,
+                            non_blocking=False,
+                        ).contiguous().view(-1)
+                        if int(_route_score_bias.numel()) != _layer_num_blocks:
+                            raise RuntimeError(
+                                f"Sparse intermediate-router layer {_lidx}: score_bias has "
+                                f"{int(_route_score_bias.numel())} values, expected {_layer_num_blocks}."
+                            )
+                    _layer_top_k = int(
+                        _block_top_k_by_layer.get(
+                            str(_lidx),
+                            _block_top_k_by_layer.get(_lidx, self._sparse_top_k),
+                        )
+                    )
+                    _layer_top_k = int(max(1, min(_layer_top_k, _layer_num_blocks)))
+                    _basis_top_k = int(
+                        sparse_basis_top_k
+                        if sparse_basis_top_k is not None
+                        else _basis_top_k_by_layer.get(
+                            str(_lidx),
+                            _basis_top_k_by_layer.get(_lidx, _default_basis_top_k),
+                        )
+                    )
+                    _basis_top_k = int(max(1, min(_basis_top_k, _rank_effective)))
+                    _scale = _state.get("scale")
+                    self._sparse_routing[_lidx] = {
+                        "enc_w": _enc_w,
+                        "enc_b": _enc_b,
+                        "dec": None,
+                        "dec_bias": None,
+                        "dec_full_weight": None,
+                        "dec_full_bias": None,
+                        "dec_norm_t": _route_score_weight.transpose(0, 1).abs().contiguous(),
+                        "route_score_weight": _route_score_weight,
+                        "route_score_bias": _route_score_bias,
+                        "scale": float(_scale.item()) if torch.is_tensor(_scale) and int(_scale.numel()) == 1 else 1.0,
+                        "top_k": _layer_top_k,
+                        "basis_top_k": _basis_top_k,
+                        "basis_rank": int(_basis_rank),
+                        "rank_effective": int(_rank_effective),
+                        "artifact_target": _artifact_target,
+                        "block_domain": _block_domain,
+                        "block_size": int(self._sparse_block_size),
+                        "num_blocks": int(_layer_num_blocks),
+                        "explained_variance_ratio": float(_evr),
+                        "samples": float(self._coerce_sparse_layer_stat(_state, _layer_stats, 'samples', -1.0)),
+                        "pca_method": str(self._coerce_sparse_layer_stat(_state, _layer_stats, 'pca_method', 'unknown')),
+                    }
+                    self._sparse_top_k_by_layer[_lidx] = int(_layer_top_k)
+                    self._sparse_basis_top_k_by_layer[_lidx] = int(_basis_top_k)
+                    hot_blocks = self._derive_hot_blocks_for_layer(
+                        layer_state=_state,
+                        layer_stats=_layer_stats,
+                        block_importance_by_layer=_block_importance_by_layer.get(str(_lidx), None),
+                        layer_num_blocks=int(_layer_num_blocks),
+                    )
+                    if hot_blocks is not None and int(hot_blocks.numel()) > 0:
+                        self._mlp_hot_blocks_by_layer[_lidx] = hot_blocks
                     continue
                 _layer_num_blocks = int(_state["decoder_blocks"].shape[0])
                 _expected_output_blocks = int(self.config.hidden_size) // int(self._sparse_block_size)
@@ -1450,7 +1685,46 @@ class StreamingLlamaRuntime:
                         f"expected {_expected_output_blocks}. The learned-basis artifact is defined "
                         "over hidden-size output blocks and cannot be mixed with FFN intermediate blocks."
                     )
+                # Validate encoder weight input dim matches model hidden size.
+                _enc_w_shape = _state["encoder_weight"].shape
+                _expected_hidden = int(self.config.hidden_size)
+                if int(_enc_w_shape[1]) != _expected_hidden:
+                    raise RuntimeError(
+                        f"Sparse basis layer {_lidx}: encoder_weight has input dim {int(_enc_w_shape[1])}, "
+                        f"but model hidden_size={_expected_hidden}. "
+                        "The checkpoint was fitted for a different model or hidden size."
+                    )
+                # Validate decoder block output dim matches block_size * num_blocks.
+                _dec_shape = _state["decoder_blocks"].shape  # (num_blocks, basis_rank, block_size)
+                if int(_dec_shape[1]) != int(_enc_w_shape[0]):
+                    raise RuntimeError(
+                        f"Sparse basis layer {_lidx}: decoder_blocks basis_rank dim={int(_dec_shape[1])} "
+                        f"does not match encoder_weight rank={int(_enc_w_shape[0])}."
+                    )
+                # Warn on low explained variance — indicates a degenerate or underfit basis.
+                _evr = float(
+                    self._coerce_sparse_layer_stat(_state, _layer_stats, "explained_variance_ratio", 1.0)
+                )
+                _evrs.append(_evr)
+                if _evr < _MIN_EXPLAINED_VARIANCE:
+                    _low_evr_count += 1
+                    import warnings as _w
+                    _w.warn(
+                        f"[sparse_basis] Layer {_lidx} explained_variance_ratio={_evr:.3f} < "
+                        f"{_MIN_EXPLAINED_VARIANCE:.2f}. The basis is capturing less than "
+                        f"{_MIN_EXPLAINED_VARIANCE*100:.0f}% of output variance; output quality "
+                        "for this layer may be significantly degraded. Consider re-fitting with "
+                        "more calibration samples (--max-rows-per-layer) or a higher basis_rank.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 _basis_rank = int(_state["encoder_weight"].shape[0])
+                # rank_effective is the number of real (non-padded) basis rows.
+                # Padding rows are all-zero and waste top-K slots; cap to the real rank.
+                _rank_effective = int(
+                    self._coerce_sparse_layer_stat(_state, _layer_stats, "rank_effective", _basis_rank)
+                )
+                _rank_effective = int(max(1, min(_rank_effective, _basis_rank)))
                 _layer_top_k = int(
                     _block_top_k_by_layer.get(
                         str(_lidx),
@@ -1459,12 +1733,15 @@ class StreamingLlamaRuntime:
                 )
                 _layer_top_k = int(max(1, min(_layer_top_k, _layer_num_blocks)))
                 _basis_top_k = int(
-                    _basis_top_k_by_layer.get(
+                    sparse_basis_top_k
+                    if sparse_basis_top_k is not None
+                    else _basis_top_k_by_layer.get(
                         str(_lidx),
                         _basis_top_k_by_layer.get(_lidx, _default_basis_top_k),
                     )
                 )
-                _basis_top_k = int(max(1, min(_basis_top_k, _basis_rank)))
+                # Clamp to rank_effective, not basis_rank, to avoid selecting zero-padded rows.
+                _basis_top_k = int(max(1, min(_basis_top_k, _rank_effective)))
                 _dec = _state["decoder_blocks"].to(
                     device=_basis_device,
                     dtype=self.dtype,
@@ -1483,7 +1760,10 @@ class StreamingLlamaRuntime:
                     _dec_norm_t = F.normalize(_dec_norm_t, p=2.0, dim=-1, eps=1e-6)
                 _dec_full_weight = None
                 _dec_full_bias = None
-                if self._sparse_basis_execution == "full_output_latent":
+                if self._resolve_sparse_mlp_execution_for_routing(
+                    int(_lidx),
+                    routing={"block_domain": "output", "artifact_target": _artifact_target},
+                ) == "output_basis_surrogate":
                     _dec_full_weight = _dec.permute(0, 2, 1).reshape(
                         _layer_num_blocks * int(self._sparse_block_size),
                         _basis_rank,
@@ -1511,24 +1791,51 @@ class StreamingLlamaRuntime:
                     "scale": float(_scale.item()) if torch.is_tensor(_scale) and int(_scale.numel()) == 1 else 1.0,
                     "top_k": _layer_top_k,
                     "basis_top_k": _basis_top_k,
+                    "basis_rank": int(_basis_rank),
+                    "rank_effective": int(_rank_effective),
+                    "artifact_target": _artifact_target,
+                    "block_domain": _block_domain,
+                    "block_size": int(self._sparse_block_size),
+                    "num_blocks": int(_layer_num_blocks),
+                    "explained_variance_ratio": float(_evr),
+                    "samples": float(self._coerce_sparse_layer_stat(_state, _layer_stats, "samples", -1.0)),
+                    "pca_method": str(self._coerce_sparse_layer_stat(_state, _layer_stats, "pca_method", "unknown")),
                 }
                 self._sparse_top_k_by_layer[_lidx] = int(_layer_top_k)
                 self._sparse_basis_top_k_by_layer[_lidx] = int(_basis_top_k)
                 hot_blocks = self._derive_hot_blocks_for_layer(
                     layer_state=_state,
-                    layer_stats=_stats.get(str(_lidx), {}) if isinstance(_stats, dict) else {},
+                    layer_stats=_layer_stats,
                     block_importance_by_layer=_block_importance_by_layer.get(str(_lidx), None),
-                    layer_num_blocks=int(_state["decoder_blocks"].shape[0]),
+                    layer_num_blocks=int(_layer_num_blocks),
                 )
                 if hot_blocks is not None and int(hot_blocks.numel()) > 0:
                     self._mlp_hot_blocks_by_layer[_lidx] = hot_blocks
             _pct = int(round(self._sparse_top_k * 100 / max(_num_blocks, 1)))
             _hot_layers = len(self._mlp_hot_blocks_by_layer)
             _hot_blocks_total = sum(int(v.numel()) for v in self._mlp_hot_blocks_by_layer.values())
-            print(f"[sparse] loaded routing for {len(self._sparse_routing)}/{self.num_layers} layers "
-                  f"| top_k={self._sparse_top_k}/{_num_blocks} blocks ({_pct}%) "
-                  f"| block_size={self._sparse_block_size} "
-                  f"| exec={self._sparse_basis_execution}", flush=True)
+            _summary = self.get_sparse_mlp_summary()
+            print(
+                f"[sparse] loaded routing for {len(self._sparse_routing)}/{self.num_layers} layers "
+                f"| top_k={self._sparse_top_k}/{_num_blocks} blocks ({_pct}%) "
+                f"| block_size={self._sparse_block_size} "
+                f"| exec_request={self._sparse_mlp_execution_request} "
+                f"| prefill={self._sparse_mlp_prefill_mode}",
+                flush=True,
+            )
+            print(
+                f"[sparse] targets={_summary.get('artifact_target_counts', {})} "
+                f"| domains={_summary.get('block_domain_counts', {})} "
+                f"| execution={_summary.get('execution_counts', {})}",
+                flush=True,
+            )
+            if _evrs:
+                print(
+                    f"[sparse] explained_variance min={min(_evrs):.3f} "
+                    f"mean={sum(_evrs) / len(_evrs):.3f} max={max(_evrs):.3f} "
+                    f"| low(<{_MIN_EXPLAINED_VARIANCE:.2f})={_low_evr_count}",
+                    flush=True,
+                )
             if self._sparse_explicit_layer_selection:
                 _upper_guard_start = max(self._sparse_explicit_layer_selection) + 1
                 self._upper_decode_guard_layers = {
@@ -1873,6 +2180,99 @@ class StreamingLlamaRuntime:
                     f"top_k={self._kv_sparse_top_k}, num_col_blocks={self._kv_num_col_blocks}",
                     flush=True,
                 )
+
+    @staticmethod
+    def _coerce_sparse_layer_stat(layer_state: Dict[str, Any], layer_stats: Any, key: str, default: Any) -> Any:
+        if key in layer_state:
+            value = layer_state.get(key)
+            if torch.is_tensor(value):
+                if int(value.numel()) == 1:
+                    return value.detach().to(device=torch.device("cpu")).view(-1)[0].item()
+                return value
+            return value
+        if isinstance(layer_stats, dict) and key in layer_stats:
+            value = layer_stats.get(key)
+            if torch.is_tensor(value):
+                if int(value.numel()) == 1:
+                    return value.detach().to(device=torch.device("cpu")).view(-1)[0].item()
+                return value
+            return value
+        return default
+
+    def _resolve_sparse_mlp_execution_for_routing(
+        self,
+        layer_idx: int,
+        routing: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        routing = self._sparse_routing.get(int(layer_idx)) if routing is None else routing
+        if routing is None:
+            return "dense_guard"
+        requested = _normalize_sparse_mlp_execution(getattr(self, "_sparse_mlp_execution_request", "auto"))
+        if requested != "auto":
+            return requested
+        block_domain = str(routing.get("block_domain", "output")).strip().lower()
+        artifact_target = str(routing.get("artifact_target", "")).strip().lower()
+        if block_domain == "intermediate" or artifact_target == "intermediate_block_scores":
+            return "exact_intermediate_sparse"
+        return "output_basis_surrogate"
+
+    def get_sparse_mlp_layer_info(self, layer_idx: int) -> Optional[Dict[str, Any]]:
+        routing = self._sparse_routing.get(int(layer_idx))
+        if routing is None:
+            return None
+        top_k = int(
+            routing.get(
+                "top_k",
+                self._sparse_runtime_top_k if int(self._sparse_runtime_top_k) > 0 else self._sparse_top_k,
+            )
+        )
+        basis_top_k = int(
+            routing.get(
+                "basis_top_k",
+                self._sparse_basis_top_k_by_layer.get(int(layer_idx), _DEFAULT_SPARSE_BASIS_TOP_K),
+            )
+        )
+        return {
+            "layer_idx": int(layer_idx),
+            "execution": self._resolve_sparse_mlp_execution_for_routing(int(layer_idx), routing=routing),
+            "artifact_target": str(routing.get("artifact_target", "output_reconstruction")),
+            "block_domain": str(routing.get("block_domain", "output")),
+            "block_size": int(routing.get("block_size", self._sparse_block_size)),
+            "num_blocks": int(routing.get("num_blocks", self._sparse_num_blocks)),
+            "top_k": int(top_k),
+            "basis_top_k": int(basis_top_k),
+            "rank_effective": int(routing.get("rank_effective", routing.get("basis_rank", 0))),
+            "explained_variance_ratio": float(routing.get("explained_variance_ratio", 1.0)),
+            "prefill_mode": str(getattr(self, "_sparse_mlp_prefill_mode", "dense")),
+        }
+
+    def get_sparse_mlp_summary(self) -> Dict[str, Any]:
+        execution_counts: Dict[str, int] = defaultdict(int)
+        domain_counts: Dict[str, int] = defaultdict(int)
+        target_counts: Dict[str, int] = defaultdict(int)
+        evrs: List[float] = []
+        for layer_idx, routing in self._sparse_routing.items():
+            execution_counts[self._resolve_sparse_mlp_execution_for_routing(int(layer_idx), routing=routing)] += 1
+            domain_counts[str(routing.get("block_domain", "output"))] += 1
+            target_counts[str(routing.get("artifact_target", "output_reconstruction"))] += 1
+            evr = float(routing.get("explained_variance_ratio", 1.0))
+            evrs.append(evr)
+        summary: Dict[str, Any] = {
+            "layers": int(len(self._sparse_routing)),
+            "execution_request": str(getattr(self, "_sparse_mlp_execution_request", "auto")),
+            "prefill_mode": str(getattr(self, "_sparse_mlp_prefill_mode", "dense")),
+            "execution_counts": dict(execution_counts),
+            "block_domain_counts": dict(domain_counts),
+            "artifact_target_counts": dict(target_counts),
+            "top_k_default": int(self._sparse_top_k),
+        }
+        if evrs:
+            summary["explained_variance"] = {
+                "min": float(min(evrs)),
+                "max": float(max(evrs)),
+                "mean": float(sum(evrs) / len(evrs)),
+            }
+        return summary
 
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
@@ -2421,6 +2821,7 @@ class StreamingLlamaRuntime:
             "lookup_cpu": lookup,
             "packed_cols_gpu": packed_cols_gpu,
             "absmax_cols_gpu": absmax_cols_gpu,
+            "h2d_ready": not bool(self._enable_cuda_h2d_overlap and self._h2d_stream is not None),
         }
         param["vram_hot_down"] = hot_cache
         self._vram_nf4_cache[full_name] = hot_cache
@@ -2430,7 +2831,13 @@ class StreamingLlamaRuntime:
     def _maybe_cache_sparse_param_hot_blocks(self, full_name: str, param: Dict[str, Any]) -> None:
         if full_name in self._vram_nf4_cache:
             return
-        if str(self._traffic_current_phase or "idle") not in {"decode", "prefill"}:
+        traffic_phase = str(self._traffic_current_phase or "idle")
+        if traffic_phase not in {"decode", "prefill"}:
+            return
+        if (
+            traffic_phase == "prefill"
+            and str(getattr(self, "_sparse_mlp_prefill_mode", "dense")) == "dense"
+        ):
             return
         if not self._vram_hot_cache_enabled:
             return
@@ -2480,6 +2887,7 @@ class StreamingLlamaRuntime:
             "lookup_cpu": lookup,
             "packed_blocks_gpu": packed_hot_gpu,
             "absmax_blocks_gpu": absmax_hot_gpu,
+            "h2d_ready": not bool(self._enable_cuda_h2d_overlap and self._h2d_stream is not None),
         }
         param["vram_hot"] = hot_cache
         self._vram_nf4_cache[full_name] = hot_cache
@@ -3158,11 +3566,19 @@ class StreamingLlamaRuntime:
         ordered_blocks: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         def _gather(*, allow_hot_cache: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-            hot_cache = param.get("vram_hot") if allow_hot_cache else None
+            traffic_phase = str(self._traffic_current_phase or "idle")
+            prefill_dense = bool(
+                traffic_phase == "prefill"
+                and str(getattr(self, "_sparse_mlp_prefill_mode", "dense")) == "dense"
+            )
+            hot_cache = param.get("vram_hot") if allow_hot_cache and not prefill_dense else None
             hot_packed = None
             hot_absmax = None
             cold_blocks = ordered_blocks
             if hot_cache is not None:
+                if not bool(hot_cache.get("h2d_ready", True)):
+                    self._wait_for_h2d_stream()
+                    hot_cache["h2d_ready"] = True
                 lookup = hot_cache["lookup_cpu"].index_select(0, ordered_blocks.to(dtype=torch.long))
                 hot_count = 0
                 for idx in range(int(lookup.numel())):
@@ -3234,7 +3650,7 @@ class StreamingLlamaRuntime:
         enc_w = routing["enc_w"]
         enc_b = routing["enc_b"]
         hidden_proj = flat_hidden.to(device=enc_w.device, dtype=enc_w.dtype)
-        latent_dense = F.silu(F.linear(hidden_proj, enc_w, enc_b))
+        latent_dense = F.linear(hidden_proj, enc_w, enc_b)
         latent_dim = int(latent_dense.shape[-1])
         if latent_dim <= 0:
             return latent_dense
@@ -3288,7 +3704,7 @@ class StreamingLlamaRuntime:
             _dec_norm_t = F.normalize(_dec_norm_t, p=2.0, dim=-1, eps=1e-6)
         _dec_full_weight = None
         _dec_full_bias = None
-        if self._sparse_basis_execution == "full_output_latent":
+        if self._resolve_sparse_mlp_execution_for_routing(int(layer_idx), routing={"block_domain": "output"}) == "output_basis_surrogate":
             _dec_full_weight = _dec.permute(0, 2, 1).reshape(
                 _layer_num_blocks * int(self._sparse_block_size),
                 _basis_rank,
@@ -3306,6 +3722,15 @@ class StreamingLlamaRuntime:
             "scale": float(scale),
             "top_k": _layer_top_k,
             "basis_top_k": _basis_top_k,
+            "basis_rank": int(_basis_rank),
+            "rank_effective": int(_basis_rank),
+            "artifact_target": "output_reconstruction",
+            "block_domain": "output",
+            "block_size": int(self._sparse_block_size),
+            "num_blocks": int(_layer_num_blocks),
+            "explained_variance_ratio": 1.0,
+            "samples": -1.0,
+            "pca_method": "runtime_local_fit",
         }
         self._sparse_top_k_by_layer[int(layer_idx)] = int(_layer_top_k)
         self._sparse_basis_top_k_by_layer[int(layer_idx)] = int(_basis_top_k)
@@ -3319,6 +3744,11 @@ class StreamingLlamaRuntime:
         mlp_input: torch.Tensor,
         mlp_out: torch.Tensor,
     ) -> None:
+        if _normalize_sparse_mlp_execution(getattr(self, "_sparse_mlp_execution_request", "auto")) not in {
+            "output_basis_surrogate",
+            "routed_output_blocks",
+        }:
+            return
         if int(layer_idx) in self._sparse_routing:
             return
         if int(layer_idx) not in self._upper_decode_guard_layers:
@@ -3349,7 +3779,7 @@ class StreamingLlamaRuntime:
             decoder_bias=fitted.get("decoder_bias"),
             scale=_scale_value,
             top_k=int(self._sparse_top_k),
-            basis_top_k=int(min(_DEFAULT_SPARSE_BASIS_TOP_K, fit_rank)),
+            basis_top_k=int(fit_rank),
             session_local=True,
         )
 
@@ -3364,11 +3794,19 @@ class StreamingLlamaRuntime:
         if routing is None:
             return None
 
-        dec_norm_t = routing["dec_norm_t"]
-
         flat_hidden = hidden.view(hidden.shape[0] * hidden.shape[1], -1)
         latent = self._compute_sparse_basis_latent(flat_hidden, layer_idx, routing=routing)
-        scores = torch.matmul(latent.abs(), dec_norm_t)
+        route_score_weight = routing.get("route_score_weight")
+        route_score_bias = routing.get("route_score_bias")
+        if torch.is_tensor(route_score_weight):
+            score_weight = route_score_weight.to(device=latent.device, dtype=latent.dtype)
+            score_bias = None
+            if torch.is_tensor(route_score_bias):
+                score_bias = route_score_bias.to(device=latent.device, dtype=latent.dtype)
+            scores = F.linear(latent, score_weight, score_bias).clamp_min(0.0)
+        else:
+            dec_norm_t = routing["dec_norm_t"]
+            scores = torch.matmul(latent.abs(), dec_norm_t)
         k_runtime = int(
             routing.get(
                 "top_k",
@@ -3412,6 +3850,11 @@ class StreamingLlamaRuntime:
         routing = self._sparse_routing.get(layer_idx)
         if routing is None:
             return torch.zeros_like(hidden)
+        if str(routing.get("block_domain", "output")) != "output":
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} uses block_domain={routing.get('block_domain')} and cannot run "
+                "the output-basis surrogate block path."
+            )
 
         dec = routing["dec"]
         dec_bias = routing.get("dec_bias")
@@ -3485,6 +3928,11 @@ class StreamingLlamaRuntime:
         routing = self._sparse_routing.get(layer_idx)
         if routing is None:
             return torch.zeros_like(hidden)
+        if str(routing.get("block_domain", "output")) != "output":
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} uses block_domain={routing.get('block_domain')} and cannot run "
+                "the output-basis surrogate full-output path."
+            )
 
         dec = routing["dec"]
         dec_bias = routing.get("dec_bias")
@@ -3807,15 +4255,29 @@ class StreamingLlamaRuntime:
         active_local = active_local_cpu.to(device=self.device, dtype=torch.int32).contiguous()
         active_dim = num_active_blocks * int(block_size)
         flat_mask = torch.zeros((rows, active_dim), device=self.device, dtype=dtype)
-        row_idx = torch.arange(rows, device=self.device, dtype=torch.long)
+        # Vectorized replacement for the previous Python for-loop over slots.
+        # active_local: [rows, num_slots], values are local block indices in [0, num_active_blocks) or -1.
+        # We scatter 1.0 at every (row, block_start + offset) where block_start = slot_idx * block_size.
         neuron_offsets = torch.arange(int(block_size), device=self.device, dtype=torch.long)
-        for slot in range(int(active_local.shape[1])):
-            slot_idx = active_local[:, slot]
-            valid = slot_idx >= 0
-            if not bool(valid.any()):
-                continue
-            cols = slot_idx[valid].to(dtype=torch.long).unsqueeze(1) * int(block_size) + neuron_offsets.unsqueeze(0)
-            flat_mask[row_idx[valid].unsqueeze(1), cols] = 1
+        # Build a flat valid mask over all (row, slot) pairs.
+        al_long = active_local.long()                                          # [rows, num_slots]
+        valid_mask = al_long >= 0                                              # [rows, num_slots]
+        if bool(valid_mask.any()):
+            row_ids = torch.arange(rows, device=self.device, dtype=torch.long).unsqueeze(1).expand_as(al_long)
+            # Clamp invalid entries to 0 so the arithmetic is safe; we'll zero them out below.
+            slot_safe = al_long.clamp(min=0)                                   # [rows, num_slots]
+            # col_starts: [rows, num_slots, 1], broadcast with neuron_offsets [1, 1, block_size]
+            col_starts = slot_safe.unsqueeze(-1) * int(block_size)             # [rows, num_slots, 1]
+            col_idx = (col_starts + neuron_offsets.view(1, 1, -1))             # [rows, num_slots, block_size]
+            row_idx_exp = row_ids.unsqueeze(-1).expand_as(col_idx)             # [rows, num_slots, block_size]
+            valid_exp = valid_mask.unsqueeze(-1).expand_as(col_idx)            # [rows, num_slots, block_size]
+            flat_mask.scatter_(
+                1,
+                col_idx.reshape(rows, -1),
+                valid_exp.to(dtype=flat_mask.dtype).reshape(rows, -1),
+            )
+            del row_idx_exp, col_idx, col_starts, slot_safe, row_ids, valid_exp
+        del al_long, valid_mask
 
         active_neurons = (
             ordered_blocks.unsqueeze(-1) * int(block_size)
@@ -3832,11 +4294,20 @@ class StreamingLlamaRuntime:
         _oom_retry_depth: int = 0,
     ) -> torch.Tensor:
         if layer_idx in self._sparse_routing:
-            # Learned-basis sparse layers route over output-space blocks from the
-            # checkpoint artifact, so they must stay on the basis decoder path.
-            if str(getattr(self, "_sparse_basis_execution", "full_output_latent")) == "full_output_latent":
+            execution_mode = self._resolve_sparse_mlp_execution_for_routing(int(layer_idx))
+            if execution_mode == "output_basis_surrogate":
                 return self._forward_learned_basis_mlp_full_output(layer_idx, hidden)
-            return self._forward_learned_basis_mlp(layer_idx, hidden, active_blocks)
+            if execution_mode == "routed_output_blocks":
+                return self._forward_learned_basis_mlp(layer_idx, hidden, active_blocks)
+            if execution_mode not in {"exact_intermediate_sparse", "exact_intermediate_sparse_oracle"}:
+                raise RuntimeError(
+                    f"Unsupported sparse MLP execution mode for layer {int(layer_idx)}: {execution_mode}"
+                )
+            if str(self._sparse_routing[int(layer_idx)].get("block_domain", "output")) != "intermediate":
+                raise RuntimeError(
+                    f"Layer {int(layer_idx)} does not provide intermediate FFN routing data required for "
+                    "exact_intermediate_sparse execution."
+                )
 
         gate_proj = getattr(mlp, "gate_proj", None)
         up_proj = getattr(mlp, "up_proj", None)
@@ -3900,9 +4371,16 @@ class StreamingLlamaRuntime:
         gathered_down_packed_gpu = None
         gathered_down_absmax_gpu = None
         if self._triton_fused_sparse_mlp:
-            down_hot_cache = down_param.get("vram_hot_down")
+            _prefill_dense = bool(
+                str(self._traffic_current_phase or "idle") == "prefill"
+                and str(getattr(self, "_sparse_mlp_prefill_mode", "dense")) == "dense"
+            )
+            down_hot_cache = None if _prefill_dense else down_param.get("vram_hot_down")
             if down_hot_cache is not None:
                 try:
+                    if not bool(down_hot_cache.get("h2d_ready", True)):
+                        self._wait_for_h2d_stream()
+                        down_hot_cache["h2d_ready"] = True
                     lookup = down_hot_cache["lookup_cpu"].index_select(0, ordered_blocks.to(dtype=torch.long))
                     hot_count = 0
                     for idx in range(int(lookup.numel())):
@@ -4177,19 +4655,21 @@ class StreamingLlamaRuntime:
             print(f"[sparse] Triton fused 4-bit path failed; falling back to dequant path: {exc}", flush=True)
             self._triton_fused_sparse_mlp = False
             return None
-    def _dense_mlp_forward_streaming_fast(
+    def _dense_mlp_forward_streaming_fast_details(
         self,
         layer_idx: int,
         mlp: nn.Module,
         hidden: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        capture_intermediate_block_scores: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         gate_proj = getattr(mlp, "gate_proj", None)
         up_proj = getattr(mlp, "up_proj", None)
         down_proj = getattr(mlp, "down_proj", None)
         if gate_proj is None or up_proj is None or down_proj is None:
-            return self._dense_mlp_forward_streaming(mlp, hidden)
+            return self._dense_mlp_forward_streaming(mlp, hidden), None
         if not self._ensure_mlp_proj_staging():
-            return torch.zeros_like(hidden)
+            return torch.zeros_like(hidden), None
 
         flat_hidden = hidden.view(-1, hidden.shape[-1])
         prefix = f"model.layers.{int(layer_idx)}.mlp."
@@ -4237,8 +4717,32 @@ class StreamingLlamaRuntime:
         up = _linear_stream(flat_hidden, up_proj, f"{prefix}up_proj.weight")
         act = F.silu(gate) * up
         del gate, up
+        block_scores = None
+        if capture_intermediate_block_scores:
+            intermediate_dim = int(act.shape[-1])
+            block_size = int(self._sparse_block_size)
+            if intermediate_dim % max(block_size, 1) != 0:
+                raise RuntimeError(
+                    f"Layer {int(layer_idx)} intermediate size {intermediate_dim} is not divisible by "
+                    f"sparse block_size {block_size}."
+                )
+            block_scores = act.view(int(act.shape[0]), intermediate_dim // block_size, block_size).abs().mean(dim=-1)
         out = _linear_stream(act, down_proj, f"{prefix}down_proj.weight")
-        return out.view_as(hidden)
+        return out.view_as(hidden), block_scores
+
+    def _dense_mlp_forward_streaming_fast(
+        self,
+        layer_idx: int,
+        mlp: nn.Module,
+        hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        out, _block_scores = self._dense_mlp_forward_streaming_fast_details(
+            layer_idx,
+            mlp,
+            hidden,
+            capture_intermediate_block_scores=False,
+        )
+        return out
 
     def _dense_guard_mlp_forward_exact_chunked_4bit(
         self,
@@ -4439,7 +4943,13 @@ class StreamingLlamaRuntime:
                     .reshape(int(down_param["out_features"]), int(ordered_blocks.numel()), bytes_per_cblk)
                     .contiguous()
                 )
-                down_abs_idx = (ordered_blocks * block_size) // down_quant_block_size
+                # Each quant block covers (down_quant_block_size / block_size) sparse blocks.
+                # down_abs_idx maps sparse block → quant block index; deduplicate so that
+                # each quant block appears exactly once. Without dedup, _bnb_dequant_impl
+                # receives 2× the expected absmax count and reads wrong-row values for half
+                # of the weight rows.
+                down_abs_idx_raw = (ordered_blocks * block_size) // down_quant_block_size
+                down_abs_idx = torch.unique_consecutive(down_abs_idx_raw)
                 gathered_down_absmax_cpu = down_absmax_2d[:, down_abs_idx].contiguous()
                 down_packed_gpu = self._copy_cpu_to_gpu(
                     gathered_down_packed_cpu,
@@ -4504,12 +5014,44 @@ class StreamingLlamaRuntime:
         layer: LlamaDecoderLayer,
         mlp_input: torch.Tensor,
     ) -> torch.Tensor:
+        if (
+            str(self._traffic_current_phase or "idle") == "prefill"
+            and str(getattr(self, "_sparse_mlp_prefill_mode", "dense")) == "dense"
+        ):
+            return self._dense_guard_mlp_forward_exact_chunked_4bit(layer_idx, layer.mlp, mlp_input)
         if layer_idx in self._sparse_routing:
-            if str(getattr(self, "_sparse_basis_execution", "full_output_latent")) == "full_output_latent":
+            execution_mode = self._resolve_sparse_mlp_execution_for_routing(int(layer_idx))
+            if execution_mode == "output_basis_surrogate":
                 return self._forward_learned_basis_mlp_full_output(layer_idx, mlp_input)
-            active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
+            if execution_mode in {"exact_intermediate_sparse", "exact_intermediate_sparse_oracle"} and str(
+                self._sparse_routing[int(layer_idx)].get("block_domain", "output")
+            ) != "intermediate":
+                raise RuntimeError(
+                    f"Layer {int(layer_idx)} does not provide intermediate FFN routing data required for "
+                    f"{execution_mode} execution."
+                )
+                
+            if execution_mode == "exact_intermediate_sparse_oracle":
+                _, block_scores = self._dense_mlp_forward_streaming_fast_details(
+                    layer_idx, layer.mlp, mlp_input, capture_intermediate_block_scores=True
+                )
+                if block_scores is None:
+                    raise RuntimeError("Oracle routing requires dense block scores")
+                k_runtime = int(
+                    self._sparse_routing[int(layer_idx)].get(
+                        "top_k",
+                        self._sparse_runtime_top_k if int(self._sparse_runtime_top_k) > 0 else self._sparse_top_k,
+                    )
+                )
+                k_runtime = max(1, min(k_runtime, int(block_scores.shape[-1])))
+                active_blocks = block_scores.topk(k_runtime, dim=-1).indices
+            else:
+                active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
+
             if active_blocks is None:
                 raise RuntimeError(f"Sparse basis routing disappeared for layer {int(layer_idx)}")
+            if execution_mode == "routed_output_blocks":
+                return self._forward_learned_basis_mlp(layer_idx, mlp_input, active_blocks)
             return self._sparse_mlp_forward_fast(layer_idx, layer.mlp, mlp_input, active_blocks)
         return self._dense_guard_mlp_forward_exact_chunked_4bit(layer_idx, layer.mlp, mlp_input)
 
@@ -5733,6 +6275,27 @@ class StreamingLlamaRuntime:
         )
         position_ids_batch = position_ids_all.unsqueeze(0)
 
+        # Build a [1, 1, seq_len, total_kv_len] causal additive mask for prefill.
+        # transformers 4.40+ eager_attention_forward only applies a mask when
+        # attention_mask is not None — passing None gives full bi-directional
+        # attention which corrupts positions 0..seq_len-2 and, via cross-token
+        # attention in deeper layers, also corrupts position seq_len-1 (the
+        # token whose logit we use to start generation).
+        # For delta prefill (position_offset > 0), the KV cache already holds
+        # position_offset prior positions, so total_kv_len = position_offset + seq_len.
+        # Query at absolute position (position_start + i) may attend to key j iff j <= i + position_start.
+        if seq_len > 1:
+            _min_val = torch.finfo(self.dtype).min
+            total_kv_len = position_start + seq_len
+            q_pos = torch.arange(position_start, position_start + seq_len, device=self.device)  # [seq_len]
+            k_pos = torch.arange(0, total_kv_len, device=self.device)                            # [total_kv_len]
+            # future[i, j] = True if key position j is strictly after query position i
+            future = k_pos.unsqueeze(0) > q_pos.unsqueeze(1)  # [seq_len, total_kv_len]
+            _causal_mask = future.to(dtype=self.dtype) * _min_val
+            _causal_mask = _causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, total_kv_len]
+        else:
+            _causal_mask = None
+
         for layer_idx in range(self.num_layers):
             if self._show_progress and torch.cuda.is_available():
                 alloc_gb = torch.cuda.memory_allocated() / 1e9
@@ -5750,14 +6313,14 @@ class StreamingLlamaRuntime:
                 taylor_attn.layer_idx = layer_idx
             h_norm = layer.input_layernorm(all_hidden)
             _active_kv_blocks_prefill = self._route_kv_blocks(h_norm, layer_idx)
-            if _active_kv_blocks_prefill is not None:
+            _allow_sparse_kv_prefill = self._sparse_kv_prefill_mode != "dense"
+            if _active_kv_blocks_prefill is not None and _allow_sparse_kv_prefill:
                 self._populate_sparse_kv_skeleton(layer_idx, _active_kv_blocks_prefill, layer)
             rope_all = self.rotary_emb(all_hidden, position_ids_batch)
 
             if use_taylor:
                 attn_out, _, present = taylor_attn(
                     hidden_states=h_norm,
-                    position_ids=position_ids_batch,
                     position_embeddings=rope_all,
                     past_key_value=self._taylor_caches[layer_idx],
                     use_cache=True,
@@ -5767,7 +6330,7 @@ class StreamingLlamaRuntime:
                 attn_out, _ = layer.self_attn(
                     hidden_states=h_norm,
                     position_embeddings=rope_all,
-                    attention_mask=None,
+                    attention_mask=_causal_mask,
                     past_key_values=self._dense_cache,
                     cache_position=position_ids_all.view(-1),
                 )
@@ -6028,6 +6591,12 @@ class StreamingLlamaRuntime:
             if logits is None:
                 raise RuntimeError("No prompt tokens were provided")
 
+            # Pre-warm the lm_head on GPU before the decode loop begins.
+            # Without this, the first decode token triggers a surprise 4+ GB H2D
+            # transfer (lm_head is 16384×128256×2 bytes ≈ 4.2 GB for 405B) that
+            # is not reflected in prefill traffic stats and stalls token 1.
+            self._materialize_lm_head_on_gpu()
+
             self._set_traffic_phase("decode")
             for _step_idx in range(int(max_new_tokens)):
                 next_token = self._sample_next_token(
@@ -6067,6 +6636,7 @@ class StreamingLlamaRuntime:
         layer_y: Dict[int, List[torch.Tensor]],
         layer_rows: Dict[int, int],
         max_rows: int,
+        artifact_target: str = "output_reconstruction",
         # Optional KV co-collection: if provided, h_norm (input_layernorm output)
         # is captured into layer_kv_x during the same forward pass, at zero extra cost.
         layer_kv_x: Optional[Dict[int, List[torch.Tensor]]] = None,
@@ -6087,17 +6657,50 @@ class StreamingLlamaRuntime:
                 "pre-allocated buffers before collecting."
             )
 
-        valid_len = int(attention_mask[0].sum().item()) if attention_mask is not None else int(input_ids.shape[1])
+        if attention_mask is not None:
+            valid_len = int(attention_mask[0].sum().item())
+            # Support both right-padding and left-padding (e.g. UnSloth tokenisers
+            # default to padding_side='left').  Locate the first real token position
+            # so we never embed pad tokens as calibration data.
+            _nonzero = (attention_mask[0] > 0).nonzero(as_tuple=False)
+            _pad_offset = int(_nonzero[0].item()) if _nonzero.numel() > 0 else 0
+        else:
+            valid_len = int(input_ids.shape[1])
+            _pad_offset = 0
         self.reset_caches()
         with torch.no_grad():
             selected_set = {int(idx) for idx in selected_layers}
-            all_hidden = self._embed_tokens_cpu(input_ids[:, :valid_len]).to(device=self.device, dtype=self.dtype)
+            _real_ids = input_ids[:, _pad_offset : _pad_offset + valid_len]
+            all_hidden = self._embed_tokens_cpu(_real_ids).to(device=self.device, dtype=self.dtype)
             next_hidden = torch.empty_like(all_hidden)
-            attn_hidden = torch.empty_like(all_hidden)
-            position_ids = torch.arange(valid_len, device=self.device, dtype=torch.long)
             printed_progress = False
 
-            for layer_idx in range(self.num_layers):
+            # Build position ids and rope for the full sequence — same as _forward_prefill.
+            _seq_len = int(_real_ids.shape[1])
+            _position_ids_all = torch.arange(_seq_len, device=self.device, dtype=torch.long)
+            _position_ids_batch = _position_ids_all.unsqueeze(0)
+            # Causal attention mask: same logic as _forward_prefill.
+            if _seq_len > 1:
+                _coll_min_val = torch.finfo(self.dtype).min
+                _coll_k_pos = torch.arange(_seq_len, device=self.device)
+                _coll_q_pos = torch.arange(_seq_len, device=self.device)
+                _coll_future = _coll_k_pos.unsqueeze(0) > _coll_q_pos.unsqueeze(1)
+                _coll_causal_mask = _coll_future.to(dtype=self.dtype) * _coll_min_val
+                _coll_causal_mask = _coll_causal_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                _coll_causal_mask = None
+            _tqdm = None
+            import sys
+            if 'tqdm' in sys.modules:
+                from tqdm import tqdm as _tqdm
+
+            _layer_iter = range(self.num_layers)
+            _tqdm_bar = None
+            if _tqdm is not None:
+                _tqdm_bar = _tqdm(_layer_iter, desc="Layers", leave=True, dynamic_ncols=True)
+                _layer_iter = _tqdm_bar
+
+            for layer_idx in _layer_iter:
                 pending_mlp = [idx for idx in selected_layers if int(layer_rows[int(idx)]) < int(max_rows)]
                 _kv_max = int(kv_max_rows or max_rows)
                 pending_kv: List[int] = (
@@ -6110,48 +6713,71 @@ class StreamingLlamaRuntime:
                 # Keep processing layers as long as either MLP or KV data is still needed.
                 pending_layers = sorted(set(int(i) for i in pending_mlp) | set(int(i) for i in pending_kv))
                 if not pending_layers:
+                    if _tqdm_bar is not None: _tqdm_bar.close()
                     break
                 if int(layer_idx) > int(max(pending_layers)):
+                    if _tqdm_bar is not None: _tqdm_bar.close()
                     break
                 rows_done = sum(1 for idx in selected_layers if int(layer_rows[int(idx)]) >= int(max_rows))
-                printed_progress = True
-                status = (
-                    f"[collect] layer {layer_idx+1}/{self.num_layers} "
-                    f"({rows_done}/{len(selected_layers)} mlp done,"
-                    f" {len(pending_mlp)} mlp / {len(pending_kv)} kv pending)"
-                )
-                print(status.ljust(120), end="\r", flush=True)
+                printed_progress = False
+                if _tqdm_bar is not None:
+                    _tqdm_bar.set_postfix_str(f"{rows_done} fit, {len(pending_mlp)}mlp/{len(pending_kv)}kv pend")
+                else:
+                    printed_progress = _resolve_show_progress_default()
+                    if printed_progress:
+                        status = (
+                            f"[collect] layer {layer_idx+1}/{self.num_layers} "
+                            f"({rows_done}/{len(selected_layers)} mlp done,"
+                            f" {len(pending_mlp)} mlp / {len(pending_kv)} kv pending)"
+                        )
+                        print(status.ljust(120), end="\r", flush=True)
                 layer = self._load_layer(layer_idx)
 
-                for pos in range(valid_len):
-                    h = all_hidden[:, pos : pos + 1, :]
-                    position_ids_tok = position_ids[pos : pos + 1].unsqueeze(0)
-                    rope_tok = self.rotary_emb(h, position_ids_tok)
-                    h_norm = layer.input_layernorm(h)
+                # Run attention so that mlp_input matches the inference distribution.
+                h_norm = layer.input_layernorm(all_hidden)
+                _rope = self.rotary_emb(all_hidden, _position_ids_batch)
+                try:
                     attn_out, _ = layer.self_attn(
                         hidden_states=h_norm,
-                        position_embeddings=rope_tok,
-                        attention_mask=None,
+                        position_embeddings=_rope,
+                        attention_mask=_coll_causal_mask,
                         past_key_values=None,
+                        cache_position=_position_ids_all,
                     )
-                    attn_hidden[:, pos : pos + 1, :] = h + attn_out
+                    all_hidden = all_hidden + attn_out
+                except Exception:
+                    # Fallback: skip attention for this layer if it fails
+                    # (e.g. cache API mismatch). mlp_input will be slightly off
+                    # but the MLP calibration is still far better than no attention.
+                    pass
 
-                mlp_input = layer.post_attention_layernorm(attn_hidden)
-                mlp_out = self._dense_mlp_forward_streaming_fast(layer_idx, layer.mlp, mlp_input)
+                mlp_input = layer.post_attention_layernorm(all_hidden)
+                mlp_out, block_scores = self._dense_mlp_forward_streaming_fast_details(
+                    layer_idx,
+                    layer.mlp,
+                    mlp_input,
+                    capture_intermediate_block_scores=str(artifact_target).strip().lower() == "intermediate_block_scores",
+                )
 
                 if int(layer_idx) in selected_set:
                     remain = int(max_rows) - int(layer_rows[int(layer_idx)])
                     if remain > 0:
-                        x = mlp_input.reshape(-1, mlp_input.shape[-1]).float()
-                        y = mlp_out.reshape(-1, mlp_out.shape[-1]).float()
+                        x = mlp_input.reshape(-1, mlp_input.shape[-1]).half()
+                        if str(artifact_target).strip().lower() == "intermediate_block_scores":
+                            if block_scores is None:
+                                raise RuntimeError(
+                                    "collect_dense_mlp_rows requested intermediate_block_scores but no scores were captured."
+                                )
+                            y = block_scores.reshape(-1, block_scores.shape[-1]).half()
+                        else:
+                            y = mlp_out.reshape(-1, mlp_out.shape[-1]).half()
                         take = min(int(remain), int(x.shape[0]))
                         if take > 0:
                             layer_x[int(layer_idx)].append(x[:take].detach().cpu())
                             layer_y[int(layer_idx)].append(y[:take].detach().cpu())
                             layer_rows[int(layer_idx)] += int(take)
 
-                # KV co-collection: re-apply input_layernorm to the layer's input
-                # (now in next_hidden after the swap) to get h_norm for all tokens at once.
+                # KV co-collection: input_layernorm of the pre-MLP hidden state.
                 if (
                     layer_kv_x is not None
                     and layer_kv_rows is not None
@@ -6159,15 +6785,14 @@ class StreamingLlamaRuntime:
                 ):
                     _kv_remain = int(kv_max_rows or max_rows) - int(layer_kv_rows.get(int(layer_idx), 0))
                     if _kv_remain > 0:
-                        # all_hidden is still the pre-attention layer input (swap is below).
-                        _h_norm_all = layer.input_layernorm(all_hidden[:, :valid_len, :])
+                        _h_norm_all = layer.input_layernorm(all_hidden)
                         _kv_x = _h_norm_all.reshape(-1, _h_norm_all.shape[-1]).float()
                         _kv_take = min(_kv_remain, int(_kv_x.shape[0]))
                         if _kv_take > 0:
                             layer_kv_x[int(layer_idx)].append(_kv_x[:_kv_take].detach().cpu())
                             layer_kv_rows[int(layer_idx)] = layer_kv_rows.get(int(layer_idx), 0) + _kv_take
 
-                next_hidden.copy_(attn_hidden + mlp_out)
+                next_hidden.copy_(all_hidden + mlp_out)
                 all_hidden, next_hidden = next_hidden, all_hidden
                 self._release_modules(layer)
             if printed_progress:

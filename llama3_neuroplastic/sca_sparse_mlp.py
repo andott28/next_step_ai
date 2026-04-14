@@ -269,7 +269,7 @@ class SparseLlamaMLP(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         rows = int(hidden_states.shape[0] * hidden_states.shape[1])
         flat_hidden = hidden_states.reshape(rows, self.hidden_size)
-        latent_dense = F.silu(self.sparse_basis_encoder(flat_hidden.to(dtype=self.sparse_basis_encoder.weight.dtype)))
+        latent_dense = self.sparse_basis_encoder(flat_hidden.to(dtype=self.sparse_basis_encoder.weight.dtype))
         effective_rank = int(min(max(self._effective_basis_rank(), 1), latent_dense.shape[-1]))
         return latent_dense[:, :effective_rank], effective_rank
 

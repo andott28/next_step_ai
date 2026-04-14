@@ -103,13 +103,41 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Path to learned-basis checkpoint (.pt) from init_learned_basis_from_dense_mlp.py. "
-             "Enables sparse MLP execution (~2%% of neurons active per layer).",
+             "Enables sparse MLP routing for output-surrogate or exact intermediate-block execution.",
     )
     p.add_argument(
         "--sparse-top-k",
         type=int,
         default=None,
         help="Override number of active MLP blocks per token (default: 2%% of blocks from checkpoint config).",
+    )
+    p.add_argument(
+        "--sparse-basis-top-k",
+        type=int,
+        default=None,
+        help="Override latent basis support at runtime. Applies to both surrogate and router artifacts.",
+    )
+    p.add_argument(
+        "--sparse-mlp-execution",
+        type=str,
+        default=None,
+        choices=[
+            "auto",
+            "output_basis_surrogate",
+            "routed_output_blocks",
+            "exact_intermediate_sparse",
+            "exact_intermediate_sparse_oracle",
+        ],
+        help="Sparse MLP execution mode. auto selects exact_intermediate_sparse for intermediate-router artifacts "
+             "and output_basis_surrogate for legacy output-space surrogate artifacts. "
+             "exact_intermediate_sparse_oracle uses dense intermediate block scores as a diagnostic upper bound.",
+    )
+    p.add_argument(
+        "--sparse-mlp-prefill-mode",
+        type=str,
+        default="dense",
+        choices=["dense", "sparse"],
+        help="Whether prompt prefill uses dense MLPs or sparse MLP execution on covered layers.",
     )
     p.add_argument(
         "--vram-hot-cache-gb",
@@ -311,7 +339,7 @@ def main() -> None:
     runtime = StreamingLlamaRuntime(
         model_name_or_path=str(args.model_name),
         device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        dtype=torch.float16,
+        dtype=torch.bfloat16,  # Llama 3.1 activations overflow float16 (max 65504)
         taylor_layers=taylor_layers,
         taylor_feature_map=str(args.taylor_feature_map),
         taylor_local_window=int(args.taylor_local_window),
@@ -322,6 +350,9 @@ def main() -> None:
         ram_cache_pinned=False if bool(args.no_ram_cache_pinned) else None,
         sparse_basis_path=str(args.sparse_basis_path) if args.sparse_basis_path else None,
         sparse_top_k=int(args.sparse_top_k) if args.sparse_top_k is not None else None,
+        sparse_basis_top_k=int(args.sparse_basis_top_k) if args.sparse_basis_top_k is not None else None,
+        sparse_mlp_execution=str(args.sparse_mlp_execution) if args.sparse_mlp_execution else None,
+        sparse_mlp_prefill_mode=str(args.sparse_mlp_prefill_mode),
         vram_hot_cache_gb=float(args.vram_hot_cache_gb) if args.vram_hot_cache_gb is not None else None,
         hot_block_threshold=float(args.hot_block_threshold),
         attn_head_importance_path=str(args.attn_head_importance_path) if args.attn_head_importance_path else None,
