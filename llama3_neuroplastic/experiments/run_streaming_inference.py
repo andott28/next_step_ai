@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 from __future__ import annotations
 
 import os
@@ -11,40 +10,21 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 from transformers import AutoTokenizer
 
+from llama3_neuroplastic.layer_selection import parse_layer_selection
+
 try:
     from .streaming_llama_runtime import StreamingLlamaRuntime
-except ImportError:  # pragma: no cover
+except ImportError:
     from streaming_llama_runtime import StreamingLlamaRuntime
 
 
-def _parse_layer_selection(spec: str | None) -> Optional[List[int]]:
-    if spec is None:
-        return None
-    stripped = str(spec).strip()
-    if stripped == "" or stripped.lower() == "all":
-        return None
-    if stripped.lower() in {"none", "off", "disable", "disabled"}:
-        return []
-    out: set[int] = set()
-    for part in stripped.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_s, end_s = token.split("-", 1)
-            start = int(start_s)
-            end = int(end_s)
-            if end < start:
-                raise ValueError(f"Invalid layer range: {token}")
-            out.update(range(start, end + 1))
-        else:
-            out.add(int(token))
-    return sorted(out)
+def _parse_layer_selection(spec: str | None) -> list[int] | None:
+    return parse_layer_selection(spec, all_as_none=True, allow_none_token=True)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -121,23 +101,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--sparse-mlp-execution",
         type=str,
         default=None,
-        choices=[
-            "auto",
-            "output_basis_surrogate",
-            "routed_output_blocks",
-            "exact_intermediate_sparse",
-            "exact_intermediate_sparse_oracle",
-        ],
-        help="Sparse MLP execution mode. auto selects exact_intermediate_sparse for intermediate-router artifacts "
-             "and output_basis_surrogate for legacy output-space surrogate artifacts. "
-             "exact_intermediate_sparse_oracle uses dense intermediate block scores as a diagnostic upper bound.",
+        choices=["auto", "exact_intermediate_sparse"],
+        help="Sparse MLP execution mode. auto selects exact_intermediate_sparse for intermediate-router artifacts.",
     )
     p.add_argument(
         "--sparse-mlp-prefill-mode",
         type=str,
         default="dense",
-        choices=["dense", "sparse"],
-        help="Whether prompt prefill uses dense MLPs or sparse MLP execution on covered layers.",
+        choices=["dense", "sparse", "hot_cache"],
+        help="Whether prompt prefill uses dense MLPs, sparse MLP, or VRAM hot-cache blocks.",
+    )
+    p.add_argument(
+        "--sparse-mlp-prefill-top-k",
+        type=int,
+        default=None,
+        help="Optional prompt-prefill-only MLP block count. Decode still uses --sparse-top-k.",
     )
     p.add_argument(
         "--vram-hot-cache-gb",
@@ -150,6 +128,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.80,
         help="Layer-local score threshold for selecting deterministic hot MLP blocks for VRAM cache.",
+    )
+    p.add_argument(
+        "--pre-warm",
+        action="store_true",
+        default=False,
+        help=(
+            "Load VRAM hot-cache at startup before first inference (paid once; persists across all queries). "
+            "Automatically sets --sparse-mlp-prefill-mode hot_cache so prefill MLP reads come from VRAM "
+            "instead of SSD, reducing per-query prefill I/O to attention weights only (~34 GB vs ~199 GB)."
+        ),
+    )
+    p.add_argument(
+        "--calibrate-hot-cache",
+        action="store_true",
+        default=False,
+        help=(
+            "After the initial VRAM hot-cache pre-warm, run a short prompt-based routing pass, "
+            "replace MLP hot blocks with live-route top hits, and rebuild the VRAM hot cache."
+        ),
+    )
+    p.add_argument(
+        "--hot-cache-calibration-tokens",
+        type=int,
+        default=64,
+        help="Maximum prompt tokens to use for live-route hot-cache calibration.",
+    )
+    p.add_argument(
+        "--hot-cache-calibration-prompt",
+        type=str,
+        default="",
+        help="Optional prompt used only for hot-cache calibration. Defaults to the first --prompt.",
     )
     p.add_argument(
         "--attn-head-importance-path",
@@ -192,6 +201,27 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Upper bound for dynamic active attention heads (default: same as active-head default).",
     )
     p.add_argument(
+        "--sparse-attn-prefill-mode",
+        type=str,
+        default="dense",
+        choices=["dense", "sparse"],
+        help="Whether prompt prefill uses dense or sparse attention Q/O projection loading.",
+    )
+    p.add_argument(
+        "--sparse-kv-prefill-mode",
+        type=str,
+        default="dense",
+        choices=["dense", "sparse"],
+        help="Whether prompt prefill uses dense or sparse K/V projection loading.",
+    )
+    p.add_argument(
+        "--attn-share-prefill-mode",
+        type=str,
+        default="dense",
+        choices=["dense", "shared"],
+        help="Whether prompt prefill uses dense attention or cross-layer shared attention reconstruction.",
+    )
+    p.add_argument(
         "--disable-triton-fused-sparse-mlp",
         action="store_true",
         default=False,
@@ -225,7 +255,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _make_token_callback(tokenizer: Any, args: Any) -> tuple[Dict[str, bool], Any]:
+def _make_token_callback(tokenizer: Any, args: Any) -> tuple[dict[str, bool], Any]:
     state = {"started": False}
     stream_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
 
@@ -261,12 +291,12 @@ def _make_token_callback(tokenizer: Any, args: Any) -> tuple[Dict[str, bool], An
 def _run_single_prompt(
     prompt: str,
     *,
-    runtime: "StreamingLlamaRuntime",
+    runtime: StreamingLlamaRuntime,
     tokenizer: Any,
     args: Any,
     prompt_idx: int = 0,
     reuse_session_cache: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if str(getattr(args, "prompt_format", "raw")) == "chat":
         encoded = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
@@ -309,10 +339,26 @@ def _run_single_prompt(
     except Exception:
         completion_text = completion_text.encode(stream_encoding, errors="replace").decode(stream_encoding, errors="replace")
     new_tokens = max(int(generated.shape[-1] - input_ids.shape[-1]), 1)
+    first_decode_t = getattr(runtime, "_first_decode_t", None)
+    decode_done_t = getattr(runtime, "_decode_done_t", None)
+    if first_decode_t is not None and decode_done_t is not None and float(decode_done_t) >= float(first_decode_t):
+        prefill_elapsed = max(float(first_decode_t) - float(t0), 0.0)
+        decode_elapsed = max(float(decode_done_t) - float(first_decode_t), 1e-9)
+    else:
+        prefill_elapsed = 0.0
+        decode_elapsed = max(float(elapsed), 1e-9)
+    total_tok_s = float(new_tokens / max(elapsed, 1e-9))
+    decode_tok_s = float(new_tokens / max(decode_elapsed, 1e-9))
+    prefill_tok_s = float(int(input_ids.shape[-1]) / max(prefill_elapsed, 1e-9)) if prefill_elapsed > 0.0 else 0.0
     row = {
         "prompt_idx": int(prompt_idx),
         "latency_s": float(elapsed),
-        "tok_s": float(new_tokens / max(elapsed, 1e-9)),
+        "prefill_latency_s": float(prefill_elapsed),
+        "decode_latency_s": float(decode_elapsed),
+        "tok_s": decode_tok_s,
+        "decode_tok_s": decode_tok_s,
+        "total_tok_s": total_tok_s,
+        "prefill_tok_s": prefill_tok_s,
         "text": full_text,
         "completion_text": completion_text,
     }
@@ -327,19 +373,31 @@ def _run_single_prompt(
             f"overall={float(overall.get('avg_mb_per_layer', 0.0)):.2f} MB/layer",
             flush=True,
         )
-    print(f"\n[latency {elapsed:.1f}s | {row['tok_s']:.2f} tok/s]\n{completion_text}\n")
+    print(
+        f"\n[latency total={elapsed:.1f}s prefill={prefill_elapsed:.1f}s "
+        f"decode={decode_elapsed:.3f}s | {row['tok_s']:.2f} tok/s "
+        f"| total={total_tok_s:.4f} tok/s]\n{completion_text}\n"
+    )
     return row
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+    if bool(args.pre_warm):
+        args.sparse_mlp_prefill_mode = "hot_cache"
     prompts = list(args.prompt) if args.prompt else []
     taylor_layers = _parse_layer_selection(args.taylor_layers)
+    runtime_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    runtime_dtype = torch.bfloat16
+    if runtime_device.type == "cuda":
+        major, _minor = torch.cuda.get_device_capability(runtime_device)
+        if int(major) < 8:
+            runtime_dtype = torch.float16
 
     runtime = StreamingLlamaRuntime(
         model_name_or_path=str(args.model_name),
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        dtype=torch.bfloat16,  # Llama 3.1 activations overflow float16 (max 65504)
+        device=runtime_device,
+        dtype=runtime_dtype,
         taylor_layers=taylor_layers,
         taylor_feature_map=str(args.taylor_feature_map),
         taylor_local_window=int(args.taylor_local_window),
@@ -353,6 +411,11 @@ def main() -> None:
         sparse_basis_top_k=int(args.sparse_basis_top_k) if args.sparse_basis_top_k is not None else None,
         sparse_mlp_execution=str(args.sparse_mlp_execution) if args.sparse_mlp_execution else None,
         sparse_mlp_prefill_mode=str(args.sparse_mlp_prefill_mode),
+        sparse_mlp_prefill_top_k=(
+            int(args.sparse_mlp_prefill_top_k)
+            if args.sparse_mlp_prefill_top_k is not None
+            else None
+        ),
         vram_hot_cache_gb=float(args.vram_hot_cache_gb) if args.vram_hot_cache_gb is not None else None,
         hot_block_threshold=float(args.hot_block_threshold),
         attn_head_importance_path=str(args.attn_head_importance_path) if args.attn_head_importance_path else None,
@@ -361,6 +424,9 @@ def main() -> None:
         attn_head_activity_threshold=float(args.attn_head_activity_threshold),
         attn_min_active_heads=int(args.attn_min_active_heads),
         attn_max_active_heads=int(args.attn_max_active_heads) if args.attn_max_active_heads is not None else None,
+        sparse_attn_prefill_mode=str(args.sparse_attn_prefill_mode),
+        sparse_kv_prefill_mode=str(args.sparse_kv_prefill_mode),
+        attn_share_prefill_mode=str(args.attn_share_prefill_mode),
         enable_triton_fused_sparse_mlp=not bool(args.disable_triton_fused_sparse_mlp),
         enable_cuda_h2d_overlap=not bool(args.disable_cuda_h2d_overlap),
         kv_basis_path=str(args.kv_basis_path) if args.kv_basis_path else None,
@@ -381,10 +447,35 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    rows: List[Dict[str, Any]] = []
+    if bool(args.pre_warm):
+        import time as _prewarm_time
+        _t0 = _prewarm_time.perf_counter()
+        runtime.pre_warm_vram_hot_cache()
+        if bool(args.calibrate_hot_cache):
+            calibration_prompt = str(args.hot_cache_calibration_prompt or (prompts[0] if prompts else "")).strip()
+            if not calibration_prompt:
+                calibration_prompt = "Answer with one word. What is the capital of France?"
+            if str(getattr(args, "prompt_format", "raw")) == "chat":
+                calibration_encoded = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": calibration_prompt}],
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    return_tensors="pt",
+                    return_dict=True,
+                )
+            else:
+                calibration_encoded = tokenizer(calibration_prompt, return_tensors="pt")
+            runtime.calibrate_vram_hot_cache(
+                calibration_encoded["input_ids"],
+                max_tokens=int(args.hot_cache_calibration_tokens),
+                rebuild_cache=True,
+            )
+        print(f"[pre-warm] startup completed in {_prewarm_time.perf_counter() - _t0:.1f}s", flush=True)
+
+    rows: list[dict[str, Any]] = []
 
     if prompts:
-        # Scripted mode: run the given --prompt args and exit.
+
         for idx, prompt in enumerate(prompts):
             rows.append(_run_single_prompt(prompt, runtime=runtime, tokenizer=tokenizer, args=args, prompt_idx=idx))
     else:

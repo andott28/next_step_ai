@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """token_posting_archive.py
 
 CPU-side sparse token index for long-range sparse attention retrieval.
@@ -20,15 +18,13 @@ No SGD, no fine-tuning.  The PCA basis is fitted offline by
 ``init_attn_token_posting_basis.py`` (post-RoPE keys, per (layer, KV group)).
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 import torch
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _try_pin(t: torch.Tensor) -> torch.Tensor:
     try:
@@ -37,9 +33,9 @@ def _try_pin(t: torch.Tensor) -> torch.Tensor:
         return t
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main class
-# ─────────────────────────────────────────────────────────────────────────────
+
+
+
 
 class TokenPostingArchive:
     """Sparse token posting index for long-range streaming attention.
@@ -79,7 +75,7 @@ class TokenPostingArchive:
     def __init__(
         self,
         *,
-        retrieval_layers: List[int],
+        retrieval_layers: list[int],
         num_kv_groups: int,
         head_dim: int,
         basis_rank: int,
@@ -105,52 +101,52 @@ class TokenPostingArchive:
         self.device = device
         self.dtype = dtype
 
-        # ── Basis / IDF (numpy float32, loaded from checkpoint) ──────────────
-        # basis[l][g]    : ndarray [rank, head_dim]  — U^T so projection = basis @ key
-        # idf[l][g]      : ndarray [rank]
-        # key_mean[l][g] : ndarray [head_dim]  (centering before projection)
-        self.basis: Dict[int, List[Optional[np.ndarray]]] = {}
-        self.idf: Dict[int, List[Optional[np.ndarray]]] = {}
-        self.key_mean: Dict[int, List[Optional[np.ndarray]]] = {}
 
-        # ── Sink buffers (GPU) ────────────────────────────────────────────────
-        self.sink_k: Dict[int, torch.Tensor] = {}     # [num_sinks, G, D]
-        self.sink_v: Dict[int, torch.Tensor] = {}
-        self.sink_count: Dict[int, int] = {}
 
-        # ── Ring buffers (GPU, circular) ──────────────────────────────────────
-        self.ring_k: Dict[int, torch.Tensor] = {}     # [ring_size, G, D]
-        self.ring_v: Dict[int, torch.Tensor] = {}
-        self.ring_head: Dict[int, int] = {}            # next write slot (0..ring_size-1)
-        self.ring_count: Dict[int, int] = {}           # valid entries (0..ring_size)
 
-        # ── Archive (CPU pinned, indexed) ─────────────────────────────────────
-        self.archive_k_cpu: Dict[int, torch.Tensor] = {}  # [cap, G, D] FP16
-        self.archive_v_cpu: Dict[int, torch.Tensor] = {}
-        self.archive_count: Dict[int, int] = {}
 
-        # ── Posting lists ─────────────────────────────────────────────────────
-        # _post_tok[l][g][r]   : list of int   — archive indices
-        # _post_coeff[l][g][r] : list of int   — Q8 latent coefficients (int8 range)
-        # _post_scale[l][g][r] : list of float — per-token latent max_abs scale
-        self._post_tok: Dict[int, List[List[List[int]]]] = {}
-        self._post_coeff: Dict[int, List[List[List[int]]]] = {}
-        self._post_scale: Dict[int, List[List[List[float]]]] = {}
+        self.basis: dict[int, list[np.ndarray | None]] = {}
+        self.idf: dict[int, list[np.ndarray | None]] = {}
+        self.key_mean: dict[int, list[np.ndarray | None]] = {}
 
-        # ── Score / stamp scratch (CPU, per step) ────────────────────────────
-        # score_buf[l][g] : float32 ndarray [archive_capacity]
-        # stamp_buf[l][g] : int32  ndarray [archive_capacity]  (-1 = never touched)
-        self._score_buf: Dict[int, List[np.ndarray]] = {}
-        self._stamp_buf: Dict[int, List[np.ndarray]] = {}
 
-        # Global decode step counter used to avoid clearing score/stamp buffers.
+        self.sink_k: dict[int, torch.Tensor] = {}
+        self.sink_v: dict[int, torch.Tensor] = {}
+        self.sink_count: dict[int, int] = {}
+
+
+        self.ring_k: dict[int, torch.Tensor] = {}
+        self.ring_v: dict[int, torch.Tensor] = {}
+        self.ring_head: dict[int, int] = {}
+        self.ring_count: dict[int, int] = {}
+
+
+        self.archive_k_cpu: dict[int, torch.Tensor] = {}
+        self.archive_v_cpu: dict[int, torch.Tensor] = {}
+        self.archive_count: dict[int, int] = {}
+
+
+
+
+
+        self._post_tok: dict[int, list[list[list[int]]]] = {}
+        self._post_coeff: dict[int, list[list[list[int]]]] = {}
+        self._post_scale: dict[int, list[list[list[float]]]] = {}
+
+
+
+
+        self._score_buf: dict[int, list[np.ndarray]] = {}
+        self._stamp_buf: dict[int, list[np.ndarray]] = {}
+
+
         self.step: int = 0
 
         self._init_buffers()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Initialisation
-    # ─────────────────────────────────────────────────────────────────────────
+
+
+
 
     def _init_buffers(self) -> None:
         G = self.num_kv_groups
@@ -160,36 +156,36 @@ class TokenPostingArchive:
         NS = self.num_sinks
         AC = self.archive_capacity
 
-        for l in self.retrieval_layers:
-            # Basis placeholders
-            self.basis[l] = [None] * G
-            self.idf[l] = [None] * G
-            self.key_mean[l] = [None] * G
+        for layer_idx in self.retrieval_layers:
 
-            # Sinks (GPU)
-            self.sink_k[l] = torch.zeros(NS, G, D, dtype=self.dtype, device=self.device)
-            self.sink_v[l] = torch.zeros(NS, G, D, dtype=self.dtype, device=self.device)
-            self.sink_count[l] = 0
+            self.basis[layer_idx] = [None] * G
+            self.idf[layer_idx] = [None] * G
+            self.key_mean[layer_idx] = [None] * G
 
-            # Ring (GPU)
-            self.ring_k[l] = torch.zeros(W, G, D, dtype=self.dtype, device=self.device)
-            self.ring_v[l] = torch.zeros(W, G, D, dtype=self.dtype, device=self.device)
-            self.ring_head[l] = 0
-            self.ring_count[l] = 0
 
-            # Archive (CPU pinned)
-            self.archive_k_cpu[l] = _try_pin(torch.zeros(AC, G, D, dtype=torch.float16))
-            self.archive_v_cpu[l] = _try_pin(torch.zeros(AC, G, D, dtype=torch.float16))
-            self.archive_count[l] = 0
+            self.sink_k[layer_idx] = torch.zeros(NS, G, D, dtype=self.dtype, device=self.device)
+            self.sink_v[layer_idx] = torch.zeros(NS, G, D, dtype=self.dtype, device=self.device)
+            self.sink_count[layer_idx] = 0
 
-            # Posting lists
-            self._post_tok[l] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_coeff[l] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_scale[l] = [[[] for _ in range(R)] for _ in range(G)]
 
-            # Scratch buffers
-            self._score_buf[l] = [np.zeros(AC, dtype=np.float32) for _ in range(G)]
-            self._stamp_buf[l] = [np.full(AC, -1, dtype=np.int32) for _ in range(G)]
+            self.ring_k[layer_idx] = torch.zeros(W, G, D, dtype=self.dtype, device=self.device)
+            self.ring_v[layer_idx] = torch.zeros(W, G, D, dtype=self.dtype, device=self.device)
+            self.ring_head[layer_idx] = 0
+            self.ring_count[layer_idx] = 0
+
+
+            self.archive_k_cpu[layer_idx] = _try_pin(torch.zeros(AC, G, D, dtype=torch.float16))
+            self.archive_v_cpu[layer_idx] = _try_pin(torch.zeros(AC, G, D, dtype=torch.float16))
+            self.archive_count[layer_idx] = 0
+
+
+            self._post_tok[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+            self._post_coeff[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+            self._post_scale[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+
+
+            self._score_buf[layer_idx] = [np.zeros(AC, dtype=np.float32) for _ in range(G)]
+            self._stamp_buf[layer_idx] = [np.full(AC, -1, dtype=np.int32) for _ in range(G)]
 
     def load_basis(
         self,
@@ -197,7 +193,7 @@ class TokenPostingArchive:
         group_idx: int,
         basis: np.ndarray,
         idf: np.ndarray,
-        key_mean: Optional[np.ndarray] = None,
+        key_mean: np.ndarray | None = None,
     ) -> None:
         """Set the PCA basis for one (layer, kv_group).
 
@@ -223,30 +219,29 @@ class TokenPostingArchive:
         """Reset all buffers.  Call at the start of each generation session."""
         G = self.num_kv_groups
         R = self.basis_rank
-        AC = self.archive_capacity
-        for l in self.retrieval_layers:
-            self.sink_count[l] = 0
-            self.ring_head[l] = 0
-            self.ring_count[l] = 0
-            self.archive_count[l] = 0
-            self._post_tok[l] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_coeff[l] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_scale[l] = [[[] for _ in range(R)] for _ in range(G)]
+        for layer_idx in self.retrieval_layers:
+            self.sink_count[layer_idx] = 0
+            self.ring_head[layer_idx] = 0
+            self.ring_count[layer_idx] = 0
+            self.archive_count[layer_idx] = 0
+            self._post_tok[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+            self._post_coeff[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+            self._post_scale[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
             for g in range(G):
-                self._stamp_buf[l][g].fill(-1)
-                self._score_buf[l][g].fill(0.0)
+                self._stamp_buf[layer_idx][g].fill(-1)
+                self._score_buf[layer_idx][g].fill(0.0)
         self.step = 0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Token ingestion
-    # ─────────────────────────────────────────────────────────────────────────
+
+
+
 
     def append_token(
         self,
         layer_idx: int,
         seq_pos: int,
-        k_cpu: torch.Tensor,    # [G, D] FP16 CPU
-        v_cpu: torch.Tensor,    # [G, D] FP16 CPU
+        k_cpu: torch.Tensor,
+        v_cpu: torch.Tensor,
     ) -> None:
         """Ingest one (K, V) pair into the appropriate tier.
 
@@ -256,7 +251,7 @@ class TokenPostingArchive:
           ring full                      → evict oldest ring slot to CPU archive
                                            then write new token into the freed ring slot
         """
-        # ── Sink tier ────────────────────────────────────────────────────────
+
         sc = self.sink_count[layer_idx]
         if sc < self.num_sinks:
             self.sink_k[layer_idx][sc] = k_cpu.to(
@@ -268,17 +263,17 @@ class TokenPostingArchive:
             self.sink_count[layer_idx] = sc + 1
             return
 
-        # ── Ring tier ─────────────────────────────────────────────────────────
+
         ring_full = self.ring_count[layer_idx] >= self.ring_size
         evict_slot = self.ring_head[layer_idx]
 
         if ring_full:
-            # Evict oldest ring entry to CPU archive before overwriting.
-            evict_k = self.ring_k[layer_idx][evict_slot].cpu()    # [G, D]
+
+            evict_k = self.ring_k[layer_idx][evict_slot].cpu()
             evict_v = self.ring_v[layer_idx][evict_slot].cpu()
             self._archive_token(layer_idx, evict_k, evict_v)
 
-        # Write new token into the ring slot.
+
         self.ring_k[layer_idx][evict_slot] = k_cpu.to(
             device=self.device, dtype=self.dtype, non_blocking=True
         )
@@ -292,39 +287,39 @@ class TokenPostingArchive:
     def _archive_token(
         self,
         layer_idx: int,
-        k_cpu: torch.Tensor,    # [G, D] FP16 CPU
+        k_cpu: torch.Tensor,
         v_cpu: torch.Tensor,
     ) -> None:
         """Write a token into the CPU archive and update posting lists."""
         n = self.archive_count[layer_idx]
-        write_pos = n % self.archive_capacity   # circular (FIFO) overwrite
-        self.archive_count[layer_idx] = n + 1   # total-written counter, never capped
+        write_pos = n % self.archive_capacity
+        self.archive_count[layer_idx] = n + 1
 
-        # Store exact K/V.
+
         self.archive_k_cpu[layer_idx][write_pos].copy_(k_cpu.half())
         self.archive_v_cpu[layer_idx][write_pos].copy_(v_cpu.half())
 
-        # Project each KV group's key through the PCA basis and quantize.
-        k_f32 = k_cpu.float().numpy()      # [G, D]
+
+        k_f32 = k_cpu.float().numpy()
         G = self.num_kv_groups
         R = self.basis_rank
 
         for g in range(G):
-            basis_g = self.basis[layer_idx][g]    # [R, D] or None
+            basis_g = self.basis[layer_idx][g]
             if basis_g is None:
                 continue
-            mean_g = self.key_mean[layer_idx][g]  # [D]
-            k_g = k_f32[g] - mean_g               # [D] centred
-            alpha = basis_g @ k_g                 # [R] latent coefficients
+            mean_g = self.key_mean[layer_idx][g]
+            k_g = k_f32[g] - mean_g
+            alpha = basis_g @ k_g
 
-            # Q8 quantise: pack into [-127, 127]
+
             max_abs = float(np.abs(alpha).max())
             if max_abs > 1e-8:
                 alpha_q8 = np.round(alpha * (127.0 / max_abs)).clip(-127, 127).astype(np.int8)
             else:
                 alpha_q8 = np.zeros(R, dtype=np.int8)
 
-            # Append only the top-k magnitude coordinates to keep index lean.
+
             top_k = min(self.token_topk, R)
             top_coords = np.argpartition(np.abs(alpha), -top_k)[-top_k:]
             for r in top_coords.tolist():
@@ -336,17 +331,17 @@ class TokenPostingArchive:
 
         self.archive_count[layer_idx] = n + 1
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Archive probing
-    # ─────────────────────────────────────────────────────────────────────────
+
+
+
 
     def _probe(
         self,
         layer_idx: int,
         group_idx: int,
-        beta: np.ndarray,    # [rank] float32 — IDF-weighted query latent
+        beta: np.ndarray,
         step: int,
-    ) -> List[int]:
+    ) -> list[int]:
         """Accumulate approximate archive scores for candidate tokens.
 
         Uses stamp/score arrays to avoid clearing O(archive_capacity) memory
@@ -355,16 +350,16 @@ class TokenPostingArchive:
 
         The scores are written into ``self._score_buf[layer_idx][group_idx]``.
         """
-        idf = self.idf[layer_idx][group_idx]    # [R]
-        weighted = beta * idf                   # [R]
+        idf = self.idf[layer_idx][group_idx]
+        weighted = beta * idf
 
         r_query = min(self.r_query, int(self.basis_rank))
-        # Pick the r_query highest-magnitude weighted coordinates.
+
         top_r = np.argpartition(np.abs(weighted), -r_query)[-r_query:]
 
         score_buf = self._score_buf[layer_idx][group_idx]
         stamp_buf = self._stamp_buf[layer_idx][group_idx]
-        touched: List[int] = []
+        touched: list[int] = []
 
         for r in top_r.tolist():
             beta_r = float(weighted[r])
@@ -385,9 +380,9 @@ class TokenPostingArchive:
         self,
         layer_idx: int,
         group_idx: int,
-        q_cpu: np.ndarray,    # [head_dim] float32 — representative query
+        q_cpu: np.ndarray,
         step: int,
-        M: Optional[int] = None,
+        M: int | None = None,
     ) -> np.ndarray:
         """Return up to M archive indices most relevant to ``q_cpu``."""
         if M is None:
@@ -401,8 +396,8 @@ class TokenPostingArchive:
             return np.arange(min(M, n_arch), dtype=np.int32)
 
         mean_g = self.key_mean[layer_idx][group_idx]
-        q_centred = q_cpu - mean_g              # [D]
-        beta = basis_g @ q_centred             # [R]
+        q_centred = q_cpu - mean_g
+        beta = basis_g @ q_centred
 
         touched = self._probe(layer_idx, group_idx, beta, step)
         if not touched:
@@ -414,25 +409,25 @@ class TokenPostingArchive:
         if len(touched_arr) <= M:
             return touched_arr[order]
 
-        # Pick top-M by accumulated score.
+
         best_local = np.argpartition(scores, -M)[-M:]
         selected = touched_arr[best_local]
         selected_scores = scores[best_local]
         selected_order = np.argsort(selected_scores)[::-1]
         return selected[selected_order]
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Shortlist assembly (main per-step call)
-    # ─────────────────────────────────────────────────────────────────────────
+
+
+
 
     def fetch_shortlist_kv(
         self,
         layer_idx: int,
         group_idx: int,
-        q_rep_gpu: torch.Tensor,    # [head_dim] GPU FP16 — representative query
+        q_rep_gpu: torch.Tensor,
         step: int,
-        M: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        M: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Assemble the full shortlist K, V for one (layer, group, step).
 
         Returns
@@ -444,30 +439,30 @@ class TokenPostingArchive:
         Always includes current-step ring and sink tokens (exact local window).
         """
         g = group_idx
-        parts_k: List[torch.Tensor] = []
-        parts_v: List[torch.Tensor] = []
+        parts_k: list[torch.Tensor] = []
+        parts_v: list[torch.Tensor] = []
 
-        # ── Sink tier (always exact, GPU) ─────────────────────────────────────
+
         sc = self.sink_count[layer_idx]
         if sc > 0:
-            parts_k.append(self.sink_k[layer_idx][:sc, g, :])    # [sc, D]
+            parts_k.append(self.sink_k[layer_idx][:sc, g, :])
             parts_v.append(self.sink_v[layer_idx][:sc, g, :])
 
-        # ── Archive candidates (posting probe → H2D) ──────────────────────────
+
         q_cpu = q_rep_gpu.float().cpu().numpy()
         if q_cpu.ndim == 1:
             cand_ids = self.select_candidates(layer_idx, g, q_cpu, step, M)
         else:
-            # Union per-head probes so one head's query does not suppress another.
-            # Use disjoint stamp ids per query probe to avoid score-buffer collisions.
-            score_best: Dict[int, float] = {}
+
+
+            score_best: dict[int, float] = {}
             base_step = int(step) * 1024
             for qi in range(int(q_cpu.shape[0])):
                 local_ids = self.select_candidates(layer_idx, g, q_cpu[qi], base_step + qi, M)
                 if local_ids.size == 0:
                     continue
                 local_scores = self._score_buf[layer_idx][g][local_ids]
-                for idx, score in zip(local_ids.tolist(), local_scores.tolist()):
+                for idx, score in zip(local_ids.tolist(), local_scores.tolist(), strict=False):
                     prev = score_best.get(int(idx))
                     if prev is None or float(score) > prev:
                         score_best[int(idx)] = float(score)
@@ -477,21 +472,21 @@ class TokenPostingArchive:
             else:
                 cand_ids = np.empty(0, dtype=np.int32)
         if len(cand_ids) > 0:
-            # Slice pinned CPU tensors and async-copy to GPU.
-            k_arch_cpu = self.archive_k_cpu[layer_idx][cand_ids, g, :]    # [C, D]
+
+            k_arch_cpu = self.archive_k_cpu[layer_idx][cand_ids, g, :]
             v_arch_cpu = self.archive_v_cpu[layer_idx][cand_ids, g, :]
             parts_k.append(k_arch_cpu.to(device=self.device, non_blocking=True))
             parts_v.append(v_arch_cpu.to(device=self.device, non_blocking=True))
 
-        # ── Ring tier (always exact, GPU) ─────────────────────────────────────
+
         rc = self.ring_count[layer_idx]
         if rc > 0:
             if rc < self.ring_size:
                 parts_k.append(self.ring_k[layer_idx][:rc, g, :])
                 parts_v.append(self.ring_v[layer_idx][:rc, g, :])
             else:
-                # Full ring: all ring_size slots are valid.
-                # Order does not matter for attention.
+
+
                 parts_k.append(self.ring_k[layer_idx][:, g, :])
                 parts_v.append(self.ring_v[layer_idx][:, g, :])
 
@@ -500,15 +495,15 @@ class TokenPostingArchive:
             return empty, empty
 
         if self.device.type == "cuda":
-            torch.cuda.synchronize()   # wait for all non_blocking H2D transfers above
+            torch.cuda.synchronize()
 
-        k_all = torch.cat(parts_k, dim=0)    # [T, D]
-        v_all = torch.cat(parts_v, dim=0)    # [T, D]
+        k_all = torch.cat(parts_k, dim=0)
+        v_all = torch.cat(parts_v, dim=0)
         return k_all, v_all
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Warm-up from DynamicCache (call once after prefill)
-    # ─────────────────────────────────────────────────────────────────────────
+
+
+
 
     def warm_up_from_dense_cache(
         self,
@@ -526,28 +521,28 @@ class TokenPostingArchive:
         if hasattr(dense_cache, "key_cache") and hasattr(dense_cache, "value_cache"):
             kc = dense_cache.key_cache
             vc = dense_cache.value_cache
-            for l in self.retrieval_layers:
-                if l >= len(kc) or kc[l] is None:
+            for layer_idx in self.retrieval_layers:
+                if layer_idx >= len(kc) or kc[layer_idx] is None:
                     continue
-                T = int(kc[l].shape[2])
+                T = int(kc[layer_idx].shape[2])
                 T = min(T, int(seq_len))
-                # Shape: [1, G, T, D]  →  [T, G, D]
-                k_seq = kc[l][0].permute(1, 0, 2).contiguous().cpu()    # [T, G, D]
-                v_seq = vc[l][0].permute(1, 0, 2).contiguous().cpu()    # [T, G, D]
+
+                k_seq = kc[layer_idx][0].permute(1, 0, 2).contiguous().cpu()
+                v_seq = vc[layer_idx][0].permute(1, 0, 2).contiguous().cpu()
                 for t in range(T):
-                    self.append_token(l, t, k_seq[t], v_seq[t])
+                    self.append_token(layer_idx, t, k_seq[t], v_seq[t])
             return
 
-        # Newer transformers DynamicCache APIs may hide storage internals and only
-        # expose legacy conversion.
+
+
         if hasattr(dense_cache, "to_legacy_cache"):
             legacy = dense_cache.to_legacy_cache()
             if legacy is None:
                 return
-            for l in self.retrieval_layers:
-                if l >= len(legacy):
+            for layer_idx in self.retrieval_layers:
+                if layer_idx >= len(legacy):
                     continue
-                layer_cache = legacy[l]
+                layer_cache = legacy[layer_idx]
                 if not isinstance(layer_cache, (tuple, list)) or len(layer_cache) < 2:
                     continue
                 k_layer = layer_cache[0]
@@ -562,7 +557,7 @@ class TokenPostingArchive:
                 k_seq = k_layer[0].permute(1, 0, 2).contiguous().cpu()
                 v_seq = v_layer[0].permute(1, 0, 2).contiguous().cpu()
                 for t in range(T):
-                    self.append_token(l, t, k_seq[t], v_seq[t])
+                    self.append_token(layer_idx, t, k_seq[t], v_seq[t])
             return
 
         raise RuntimeError(

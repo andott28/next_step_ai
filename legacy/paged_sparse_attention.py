@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
 
@@ -12,7 +13,7 @@ def page_for_token(token_index: int, page_size_tokens: int) -> int:
     return int(token_index) // int(page_size_tokens)
 
 
-def page_token_span(page_index: int, page_size_tokens: int) -> Tuple[int, int]:
+def page_token_span(page_index: int, page_size_tokens: int) -> tuple[int, int]:
     if page_size_tokens <= 0:
         raise ValueError("page_size_tokens must be > 0")
     start = int(page_index) * int(page_size_tokens)
@@ -34,8 +35,8 @@ class SparseAttentionConfig:
     sink_tokens: int = 8
     page_size_tokens: int = 256
     retrieval_top_k_pages: int = 8
-    retrieval_head_group_ids: Tuple[int, ...] = (0,)
-    retrieval_start_layer: Optional[int] = None
+    retrieval_head_group_ids: tuple[int, ...] = (0,)
+    retrieval_start_layer: int | None = None
     archive_cpu_dtype: str = "int4"
     hot_archive_gpu_pages: int = 0
     disable_ssd_fetch_in_decode: bool = True
@@ -58,12 +59,12 @@ class SparseAttentionConfig:
 @dataclass
 class SparseAttentionStepStats:
     step_index: int
-    selected_pages_by_layer: Dict[int, List[int]] = field(default_factory=dict)
+    selected_pages_by_layer: dict[int, list[int]] = field(default_factory=dict)
     bytes_cpu_to_gpu: int = 0
     archive_tokens: int = 0
     fallback_triggered: bool = False
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "step_index": int(self.step_index),
             "selected_pages_by_layer": {str(k): [int(x) for x in v] for k, v in self.selected_pages_by_layer.items()},
@@ -73,7 +74,7 @@ class SparseAttentionStepStats:
         }
 
 
-def _quantize_to_int4(x: torch.Tensor) -> Dict[str, Any]:
+def _quantize_to_int4(x: torch.Tensor) -> dict[str, Any]:
     flat = x.reshape(-1).float()
     max_abs = float(flat.abs().max().item()) if flat.numel() > 0 else 1.0
     scale = max(max_abs / 7.0, 1e-8)
@@ -93,7 +94,7 @@ def _quantize_to_int4(x: torch.Tensor) -> Dict[str, Any]:
     }
 
 
-def _dequantize_from_int4(payload: Dict[str, Any], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+def _dequantize_from_int4(payload: dict[str, Any], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     packed = payload["packed"].to(device=device)
     scale = float(payload["scale"])
     numel = int(payload["numel"])
@@ -109,11 +110,11 @@ def _dequantize_from_int4(payload: Dict[str, Any], device: torch.device, dtype: 
 
 @dataclass
 class _HeadArchiveState:
-    key_pages: List[Any] = field(default_factory=list)
-    value_pages: List[Any] = field(default_factory=list)
-    summary_pages: List[torch.Tensor] = field(default_factory=list)
-    current_key_tokens: List[torch.Tensor] = field(default_factory=list)
-    current_value_tokens: List[torch.Tensor] = field(default_factory=list)
+    key_pages: list[Any] = field(default_factory=list)
+    value_pages: list[Any] = field(default_factory=list)
+    summary_pages: list[torch.Tensor] = field(default_factory=list)
+    current_key_tokens: list[torch.Tensor] = field(default_factory=list)
+    current_value_tokens: list[torch.Tensor] = field(default_factory=list)
     total_tokens: int = 0
 
 
@@ -121,7 +122,7 @@ class LongRangePageArchive:
     def __init__(self, config: SparseAttentionConfig, head_dim: int) -> None:
         self.config = config
         self.head_dim = int(head_dim)
-        self._layers: Dict[int, Dict[int, _HeadArchiveState]] = {}
+        self._layers: dict[int, dict[int, _HeadArchiveState]] = {}
 
     def reset(self) -> None:
         self._layers.clear()
@@ -218,13 +219,13 @@ class LongRangePageArchive:
         page_indices: Sequence[int],
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
         state = self._head_state(layer_idx=layer_idx, head_idx=head_idx)
         if not page_indices:
             empty = torch.empty((0, self.head_dim), device=device, dtype=dtype)
             return empty, empty, 0
-        keys: List[torch.Tensor] = []
-        values: List[torch.Tensor] = []
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
         bytes_copied = 0
         for idx in page_indices:
             i = int(idx)
@@ -250,12 +251,12 @@ class LongRangePageArchive:
 
 class LongRangeSummaryTable:
     def __init__(self) -> None:
-        self._cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._cache: dict[tuple[int, int], torch.Tensor] = {}
 
     def update(self, layer_idx: int, head_idx: int, summaries: torch.Tensor) -> None:
         self._cache[(int(layer_idx), int(head_idx))] = summaries.detach()
 
-    def get(self, layer_idx: int, head_idx: int) -> Optional[torch.Tensor]:
+    def get(self, layer_idx: int, head_idx: int) -> torch.Tensor | None:
         return self._cache.get((int(layer_idx), int(head_idx)))
 
     def reset(self) -> None:
@@ -275,7 +276,7 @@ class TwoStagePageRetriever:
         query_vec: torch.Tensor,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[List[int], torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor, int]:
         summaries = self.table.get(layer_idx=layer_idx, head_idx=head_idx)
         if summaries is None or summaries.numel() == 0:
             empty = torch.empty((0, int(query_vec.numel())), device=device, dtype=dtype)
@@ -308,7 +309,7 @@ class SparseAttentionRuntime:
         self.archive = LongRangePageArchive(config=config, head_dim=self.head_dim)
         self.summary_table = LongRangeSummaryTable()
         self.retriever = TwoStagePageRetriever(config=config, archive=self.archive, table=self.summary_table)
-        self._steps: List[SparseAttentionStepStats] = []
+        self._steps: list[SparseAttentionStepStats] = []
         self._step_counter = 0
 
     def reset(self) -> None:
@@ -328,7 +329,7 @@ class SparseAttentionRuntime:
     def _head_uses_retrieval(self, kv_head_idx: int) -> bool:
         return int(kv_head_idx) in set(int(x) for x in self.config.retrieval_head_group_ids)
 
-    def _local_keep_positions(self, total_tokens: int) -> List[int]:
+    def _local_keep_positions(self, total_tokens: int) -> list[int]:
         if total_tokens <= 0:
             return []
         sink = min(int(self.config.sink_tokens), total_tokens)
@@ -337,7 +338,7 @@ class SparseAttentionRuntime:
         keep.update(range(start, total_tokens))
         return sorted(int(x) for x in keep)
 
-    def _strict_validate(self, sparse_mlp_diagnostics: Optional[Dict[str, Any]]) -> None:
+    def _strict_validate(self, sparse_mlp_diagnostics: dict[str, Any] | None) -> None:
         if not self.config.strict_fully_sparse:
             return
         if not self.config.disable_ssd_fetch_in_decode:
@@ -354,12 +355,12 @@ class SparseAttentionRuntime:
     def update_and_compress_cache(
         self,
         legacy_cache: Sequence[Sequence[Any]],
-        sparse_mlp_diagnostics: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Tuple[tuple, ...], SparseAttentionStepStats]:
+        sparse_mlp_diagnostics: dict[str, Any] | None = None,
+    ) -> tuple[tuple[tuple, ...], SparseAttentionStepStats]:
         self._strict_validate(sparse_mlp_diagnostics=sparse_mlp_diagnostics)
         step = SparseAttentionStepStats(step_index=int(self._step_counter))
         self._step_counter += 1
-        compressed_layers: List[tuple] = []
+        compressed_layers: list[tuple] = []
 
         for layer_idx, layer_cache in enumerate(legacy_cache):
             layer_tuple = tuple(layer_cache)
@@ -378,7 +379,7 @@ class SparseAttentionRuntime:
                 compressed_layers.append(layer_tuple)
                 continue
 
-            # Bootstrap from full cache once; afterwards append only newest token.
+
             layer_needs_bootstrap = int(seq_len) > 1 and self.archive.num_pages(layer_idx=layer_idx, head_idx=0) == 0
             if layer_needs_bootstrap:
                 seq_k = key_states[0]
@@ -397,7 +398,7 @@ class SparseAttentionRuntime:
                     self.summary_table.update(layer_idx=layer_idx, head_idx=h, summaries=summaries)
 
             keep_positions = set(self._local_keep_positions(total_tokens=int(seq_len)))
-            selected_pages_layer: List[int] = []
+            selected_pages_layer: list[int] = []
             retrieval_needed = int(seq_len) > int(self.config.local_window_tokens + self.config.sink_tokens)
             if self._layer_uses_retrieval(layer_idx) and retrieval_needed:
                 for h in range(int(kv_heads)):
@@ -434,7 +435,7 @@ class SparseAttentionRuntime:
         self._steps.append(step)
         return tuple(compressed_layers), step
 
-    def diagnostics(self) -> Dict[str, Any]:
+    def diagnostics(self) -> dict[str, Any]:
         total_bytes = sum(int(s.bytes_cpu_to_gpu) for s in self._steps)
         total_pages = sum(sum(len(v) for v in s.selected_pages_by_layer.values()) for s in self._steps)
         steps = len(self._steps)

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """init_attn_token_posting_basis.py
 
 Offline calibration script: fit a per-(layer, KV-group) PCA basis over
@@ -28,19 +26,14 @@ Usage
         --device cuda
 """
 
+from __future__ import annotations
+
 import argparse
-import sys
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import torch
-
-
-# ---------------------------------------------------------------------------
-# Imports with fallback paths
-# ---------------------------------------------------------------------------
 
 try:
     from .streaming_llama_runtime import StreamingLlamaRuntime
@@ -48,7 +41,7 @@ except ImportError:
     try:
         from llama3_neuroplastic.experiments.streaming_llama_runtime import StreamingLlamaRuntime
     except ImportError:
-        from streaming_llama_runtime import StreamingLlamaRuntime  # type: ignore
+        from streaming_llama_runtime import StreamingLlamaRuntime
 
 try:
     from transformers.cache_utils import DynamicCache
@@ -56,9 +49,9 @@ except Exception:
     DynamicCache = None
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+
+
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -94,15 +87,15 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Layer selection
-# ---------------------------------------------------------------------------
+
+
+
 
 def _parse_retrieval_layers(
     explicit: str,
     retrieval_start_layer: int,
     total_layers: int,
-) -> List[int]:
+) -> list[int]:
     if explicit.strip():
         out: set = set()
         for part in explicit.split(","):
@@ -118,9 +111,9 @@ def _parse_retrieval_layers(
     return list(range(int(retrieval_start_layer), int(total_layers)))
 
 
-# ---------------------------------------------------------------------------
-# Calibration text
-# ---------------------------------------------------------------------------
+
+
+
 
 _FALLBACK_CALIBRATION_TEXT = (
     "The transformer architecture processes sequences of tokens through "
@@ -142,41 +135,36 @@ _FALLBACK_CALIBRATION_TEXT = (
 )
 
 
-def _load_calibration_texts(path: str) -> List[str]:
+def _load_calibration_texts(path: str) -> list[str]:
     if path.strip():
         raw = Path(path).read_text(encoding="utf-8")
         paragraphs = [p.strip() for p in raw.split("\n\n") if p.strip()]
         return paragraphs if paragraphs else [raw]
-    # Repeat fallback a few times to get more calibration data.
+
     return [_FALLBACK_CALIBRATION_TEXT] * 4
 
 
-# ---------------------------------------------------------------------------
-# Key collection
-# ---------------------------------------------------------------------------
+
+
+
 
 def _collect_keys(
     runtime: StreamingLlamaRuntime,
-    texts: List[str],
-    retrieval_layers: List[int],
+    texts: list[str],
+    retrieval_layers: list[int],
     *,
     max_rows: int,
     max_seq_len: int,
-) -> Dict[int, torch.Tensor]:
+) -> dict[int, torch.Tensor]:
     """Return a dict layer_idx → [N, G, D] float32 tensor of post-RoPE keys.
 
-    We run each text through ``_forward_prefill`` (which populates
-    ``runtime._dense_cache`` with exact post-RoPE keys), then read the cache.
+    We run each text through the maintained prefill façade, which populates
+    ``runtime._dense_cache`` with exact post-RoPE keys, then read the cache.
     """
-    G = int(getattr(runtime.config, "num_key_value_heads", 8))
-    D = int(getattr(runtime.config, "head_dim", 128))
+    key_banks: dict[int, list[torch.Tensor]] = {layer_idx: [] for layer_idx in retrieval_layers}
+    rows_collected: dict[int, int] = {layer_idx: 0 for layer_idx in retrieval_layers}
 
-    # Accumulators: layer_idx → list of [T, G, D] tensors
-    key_banks: Dict[int, List[torch.Tensor]] = {l: [] for l in retrieval_layers}
-    rows_collected: Dict[int, int] = {l: 0 for l in retrieval_layers}
-    selected_set = set(retrieval_layers)
 
-    # Try to load a tokeniser from the snapshot.
     tok = None
     try:
         from transformers import AutoTokenizer
@@ -189,11 +177,11 @@ def _collect_keys(
         pass
 
     for seq_idx, text in enumerate(texts):
-        # Check early termination.
-        if all(rows_collected[l] >= max_rows for l in retrieval_layers):
+
+        if all(rows_collected[layer_idx] >= max_rows for layer_idx in retrieval_layers):
             break
 
-        # Tokenise.
+
         try:
             if tok is not None:
                 token_ids = tok(
@@ -202,7 +190,7 @@ def _collect_keys(
                     truncation=True,
                     max_length=int(max_seq_len),
                     padding=False,
-                )["input_ids"]    # [1, T]
+                )["input_ids"]
             else:
                 raise ValueError("no tokenizer")
         except Exception:
@@ -219,59 +207,59 @@ def _collect_keys(
             flush=True,
         )
 
-        # Full prefill: populates runtime._dense_cache for all layers.
+
         with torch.no_grad():
             runtime.reset_caches()
             token_ids_gpu = token_ids.to(device=runtime.device)
-            _ = runtime._forward_prefill(token_ids_gpu)
+            runtime.begin_traffic_phase("prefill")
+            runtime.prefill_logits(token_ids_gpu)
 
-        # Read post-RoPE keys for each retrieval layer from the dense cache.
+
         dense_cache = runtime._dense_cache
         if dense_cache is None:
             print("[posting_basis] DynamicCache not available — skipping", flush=True)
             continue
 
-        T = int(token_ids.shape[1])
-        for l in retrieval_layers:
-            if rows_collected[l] >= max_rows:
+        for layer_idx in retrieval_layers:
+            if rows_collected[layer_idx] >= max_rows:
                 continue
             kc = dense_cache.key_cache
-            if l >= len(kc) or kc[l] is None:
+            if layer_idx >= len(kc) or kc[layer_idx] is None:
                 continue
-            # key_cache[l]: [1, G, T, D]  (post-RoPE, exact)
-            k_seq = kc[l][0].permute(1, 0, 2).contiguous().cpu().float()    # [T, G, D]
-            remain = max_rows - rows_collected[l]
+
+            k_seq = kc[layer_idx][0].permute(1, 0, 2).contiguous().cpu().float()
+            remain = max_rows - rows_collected[layer_idx]
             take = min(int(k_seq.shape[0]), remain)
-            key_banks[l].append(k_seq[:take])
-            rows_collected[l] += take
+            key_banks[layer_idx].append(k_seq[:take])
+            rows_collected[layer_idx] += take
 
         print(
-            f"[posting_basis] collected: " +
-            ", ".join(f"l{l}:{rows_collected[l]}" for l in retrieval_layers[:4]) +
+            "[posting_basis] collected: " +
+            ", ".join(f"l{layer_idx}:{rows_collected[layer_idx]}" for layer_idx in retrieval_layers[:4]) +
             (" ..." if len(retrieval_layers) > 4 else ""),
             flush=True,
         )
 
-    # Concatenate per layer.
-    result: Dict[int, torch.Tensor] = {}
-    for l in retrieval_layers:
-        chunks = key_banks[l]
+
+    result: dict[int, torch.Tensor] = {}
+    for layer_idx in retrieval_layers:
+        chunks = key_banks[layer_idx]
         if chunks:
-            result[l] = torch.cat(chunks, dim=0)    # [N, G, D]
+            result[layer_idx] = torch.cat(chunks, dim=0)
     return result
 
 
-# ---------------------------------------------------------------------------
-# PCA per (layer, KV group)
-# ---------------------------------------------------------------------------
+
+
+
 
 def _fit_group_basis(
-    keys: np.ndarray,    # [N, D] float32
+    keys: np.ndarray,
     *,
     rank: int,
     pca_method: str,
     idf_threshold: float,
-) -> Dict[str, np.ndarray]:
+) -> dict[str, np.ndarray]:
     """Fit PCA basis for one KV group and compute IDF weights.
 
     Returns
@@ -284,14 +272,14 @@ def _fit_group_basis(
     N, D = keys.shape
     rank_eff = int(min(rank, N, D))
 
-    key_mean = keys.mean(axis=0)           # [D]
-    keys_c = keys - key_mean               # [N, D] centred
+    key_mean = keys.mean(axis=0)
+    keys_c = keys - key_mean
 
-    # PCA via torch.pca_lowrank (SVD-based, fast for rank << D).
+
     keys_t = torch.from_numpy(keys_c)
     method = str(pca_method).strip().lower()
     if method == "auto":
-        method = "incremental" if N >= max(4096, rank_eff * 8) else "lowrank"
+        method = "incremental" if max(4096, rank_eff * 8) <= N else "lowrank"
 
     if method == "incremental":
         try:
@@ -301,26 +289,26 @@ def _fit_group_basis(
                 chunk = keys_c[start : start + max(rank_eff * 4, 512)]
                 if int(chunk.shape[0]) >= rank_eff:
                     ipca.partial_fit(chunk)
-            V = torch.from_numpy(ipca.components_.copy())    # [rank_eff, D]
+            V = torch.from_numpy(ipca.components_.copy())
         except Exception:
             method = "lowrank"
     if method == "lowrank":
         _u, _s, V = torch.pca_lowrank(keys_t, q=rank_eff, center=False, niter=2)
-        V = V.t()[:rank_eff]    # [rank_eff, D]
+        V = V.t()[:rank_eff]
 
-    # Pad to requested rank if needed.
+
     if rank_eff < rank:
         pad = torch.zeros(rank - rank_eff, D, dtype=V.dtype)
-        V = torch.cat([V, pad], dim=0)    # [rank, D]
+        V = torch.cat([V, pad], dim=0)
 
-    basis = V.numpy().astype(np.float32)    # [rank, D]  orthonormal rows
+    basis = V.numpy().astype(np.float32)
 
-    # Project all calibration keys into latent space: [N, rank]
-    alpha = keys_c @ basis.T    # [N, rank]
 
-    # IDF: log((1 + N) / (1 + df_r)) where df_r = tokens with |alpha_r| > threshold.
-    df = (np.abs(alpha) > float(idf_threshold)).sum(axis=0).astype(np.float32)    # [rank]
-    idf = np.log((1.0 + float(N)) / (1.0 + df)).astype(np.float32)    # [rank]
+    alpha = keys_c @ basis.T
+
+
+    df = (np.abs(alpha) > float(idf_threshold)).sum(axis=0).astype(np.float32)
+    idf = np.log((1.0 + float(N)) / (1.0 + df)).astype(np.float32)
 
     return {
         "basis": basis,
@@ -329,9 +317,9 @@ def _fit_group_basis(
     }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
+
+
 
 def main() -> None:
     args = _parse_args()
@@ -343,7 +331,7 @@ def main() -> None:
     print(f"[posting_basis] model={args.model_path}", flush=True)
     print(f"[posting_basis] output={args.output_path}", flush=True)
 
-    # Build runtime with DynamicCache enabled (materialize_lm_head not needed).
+
     runtime = StreamingLlamaRuntime(
         model_name_or_path=str(args.model_path),
         device=device,
@@ -369,11 +357,11 @@ def main() -> None:
         flush=True,
     )
 
-    # Load calibration texts.
+
     texts = _load_calibration_texts(str(args.calibration_text))
     print(f"[posting_basis] {len(texts)} calibration sequence(s)", flush=True)
 
-    # Collect post-RoPE keys.
+
     print("[posting_basis] collecting post-RoPE keys via dense prefill ...", flush=True)
     key_data = _collect_keys(
         runtime,
@@ -384,24 +372,24 @@ def main() -> None:
     )
     print(f"[posting_basis] collected keys for {len(key_data)} layer(s)", flush=True)
 
-    # Fit PCA per (layer, KV group).
-    layer_states: Dict[str, Any] = {}
 
-    for l in retrieval_layers:
-        keys_lgd = key_data.get(l)
+    layer_states: dict[str, Any] = {}
+
+    for layer_idx in retrieval_layers:
+        keys_lgd = key_data.get(layer_idx)
         if keys_lgd is None:
-            print(f"[posting_basis] layer {l}: no data — skipping", flush=True)
+            print(f"[posting_basis] layer {layer_idx}: no data — skipping", flush=True)
             continue
 
         N = int(keys_lgd.shape[0])
-        print(f"[posting_basis] layer {l}: fitting PCA on {N}×{G}×{D} keys ...", flush=True)
+        print(f"[posting_basis] layer {layer_idx}: fitting PCA on {N}×{G}×{D} keys ...", flush=True)
 
-        group_bases: List[np.ndarray] = []
-        idf_weights: List[np.ndarray] = []
-        key_means: List[np.ndarray] = []
+        group_bases: list[np.ndarray] = []
+        idf_weights: list[np.ndarray] = []
+        key_means: list[np.ndarray] = []
 
         for g in range(G):
-            keys_g = keys_lgd[:, g, :].numpy()    # [N, D]
+            keys_g = keys_lgd[:, g, :].numpy()
             result = _fit_group_basis(
                 keys_g,
                 rank=int(args.basis_rank),
@@ -412,15 +400,15 @@ def main() -> None:
             idf_weights.append(result["idf"])
             key_means.append(result["key_mean"])
 
-        layer_states[str(l)] = {
-            "group_bases": group_bases,     # list of G arrays, each [rank, D]
-            "idf_weights": idf_weights,     # list of G arrays, each [rank]
-            "key_means": key_means,         # list of G arrays, each [D]
+        layer_states[str(layer_idx)] = {
+            "group_bases": group_bases,
+            "idf_weights": idf_weights,
+            "key_means": key_means,
         }
-        print(f"[posting_basis] layer {l}: done", flush=True)
+        print(f"[posting_basis] layer {layer_idx}: done", flush=True)
 
-    # Build and save checkpoint.
-    config_payload: Dict[str, Any] = {
+
+    config_payload: dict[str, Any] = {
         "basis_rank": int(args.basis_rank),
         "num_kv_groups": G,
         "head_dim": D,

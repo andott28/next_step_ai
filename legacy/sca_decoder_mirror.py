@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 try:
     from .sca_sparse_adapter import SCABlockSparseAdapter
     from .sca_sparse_config import SCASparseConfig, build_block_centers
-except ImportError:  # pragma: no cover
+except ImportError:
     from sca_sparse_adapter import SCABlockSparseAdapter
     from sca_sparse_config import SCASparseConfig, build_block_centers
 
@@ -26,11 +26,11 @@ class DecoderMirrorConfig:
     sigma: float
     route_prior_scale_init: float
     residual_scale_init: float
-    source_layer_indices: List[int]
+    source_layer_indices: list[int]
     enabled: bool = True
     route_conditioned: bool = True
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -42,11 +42,11 @@ class DecoderMirrorDiagnostics:
     route_prior_nonzero_fraction: float
     route_prior_missing: bool
     mean_route_prior_entropy: float
-    source_layers_used: List[int]
+    source_layers_used: list[int]
     residual_scale: float
     route_prior_scale: float
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -97,12 +97,12 @@ class SparseDecoderMirrorSCA(nn.Module):
         block_centers = build_block_centers(adapter_config).float()
         self.register_buffer("block_centers", block_centers, persistent=True)
 
-        self._last_diagnostics: Optional[DecoderMirrorDiagnostics] = None
-        self._last_delta_norm_ratio_term: Optional[torch.Tensor] = None
-        self._last_route_prior: Optional[torch.Tensor] = None
-        self._last_active_idx: Optional[torch.Tensor] = None
+        self._last_diagnostics: DecoderMirrorDiagnostics | None = None
+        self._last_delta_norm_ratio_term: torch.Tensor | None = None
+        self._last_route_prior: torch.Tensor | None = None
+        self._last_active_idx: torch.Tensor | None = None
 
-    def get_last_diagnostics(self) -> Dict[str, Any]:
+    def get_last_diagnostics(self) -> dict[str, Any]:
         if self._last_diagnostics is None:
             return {
                 "mean_active_blocks": 0.0,
@@ -117,10 +117,10 @@ class SparseDecoderMirrorSCA(nn.Module):
             }
         return self._last_diagnostics.to_dict()
 
-    def get_last_delta_norm_ratio_term(self) -> Optional[torch.Tensor]:
+    def get_last_delta_norm_ratio_term(self) -> torch.Tensor | None:
         return self._last_delta_norm_ratio_term
 
-    def get_last_active_idx(self) -> Optional[torch.Tensor]:
+    def get_last_active_idx(self) -> torch.Tensor | None:
         return self._last_active_idx
 
     def _spatial_scores(self, flat_hidden: torch.Tensor) -> torch.Tensor:
@@ -138,10 +138,10 @@ class SparseDecoderMirrorSCA(nn.Module):
 
     def _normalize_route_prior(
         self,
-        route_prior: Optional[torch.Tensor],
+        route_prior: torch.Tensor | None,
         rows: int,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, bool, float]:
+    ) -> tuple[torch.Tensor, bool, float]:
         if route_prior is None or route_prior.numel() == 0:
             return torch.zeros((rows, self.num_blocks), device=device, dtype=torch.float32), True, 0.0
         prior = route_prior.reshape(rows, self.num_blocks).to(device=device, dtype=torch.float32)
@@ -153,9 +153,9 @@ class SparseDecoderMirrorSCA(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        route_prior: Optional[torch.Tensor] = None,
-        source_layers_used: Optional[List[int]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        route_prior: torch.Tensor | None = None,
+        source_layers_used: list[int] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         batch_size, seq_len, hidden_size = hidden_states.shape
         if hidden_size != self.hidden_size:
             raise RuntimeError(

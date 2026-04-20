@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import ast
 import math
 import os
 import re
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 
 import torch
-
 
 _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -18,8 +17,8 @@ def _clamp_int(value: int, lo: int, hi: int) -> int:
 
 
 def _estimate_tokens_from_text(text: str) -> int:
-    # Conservative approximation that does not depend on a tokenizer.
-    # 4 chars/token is close enough for chunk budgeting.
+
+
     return max(1, int(math.ceil(len(text) / 4.0)))
 
 
@@ -36,7 +35,7 @@ def token_to_page_index(token_index: int, page_size_tokens: int) -> int:
     return int(token_index) // int(page_size_tokens)
 
 
-def page_index_to_token_span(page_index: int, page_size_tokens: int) -> Tuple[int, int]:
+def page_index_to_token_span(page_index: int, page_size_tokens: int) -> tuple[int, int]:
     if page_size_tokens <= 0:
         raise ValueError("page_size_tokens must be > 0")
     start = int(page_index) * int(page_size_tokens)
@@ -193,16 +192,16 @@ class TierLayerSelection:
     seq_len_before: int
     sink_positions: torch.Tensor
     local_positions: torch.Tensor
-    global_positions: Optional[torch.Tensor]
+    global_positions: torch.Tensor | None
     retained_positions: torch.Tensor
     uses_global: bool
 
 
 @dataclass
 class TierCacheMetadata:
-    layers: List[TierLayerSelection] = field(default_factory=list)
+    layers: list[TierLayerSelection] = field(default_factory=list)
 
-    def get_layer(self, layer_idx: int) -> Optional[TierLayerSelection]:
+    def get_layer(self, layer_idx: int) -> TierLayerSelection | None:
         if layer_idx < 0 or layer_idx >= len(self.layers):
             return None
         return self.layers[layer_idx]
@@ -284,8 +283,8 @@ class TieredContextPolicy:
         self,
         layer_idx: int,
         kv_length: int,
-        num_attention_heads: Optional[int] = None,
-        device: Optional[torch.device] = None,
+        num_attention_heads: int | None = None,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         h = int(num_attention_heads) if num_attention_heads is not None else self.num_attention_heads
         device = device if device is not None else torch.device("cpu")
@@ -326,12 +325,12 @@ class TieredAttentionMaskBundle:
     def build_layer_mask(
         self,
         layer_idx: int,
-        base_mask: Optional[torch.Tensor],
+        base_mask: torch.Tensor | None,
         kv_length: int,
         num_attention_heads: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         if kv_length <= 0:
             return base_mask
 
@@ -367,8 +366,8 @@ class TieredCacheCompressor:
     def compress_legacy_cache(
         self,
         legacy_cache: Sequence[Sequence[object]],
-    ) -> Tuple[Tuple[tuple, ...], TierCacheMetadata]:
-        compressed_layers: List[tuple] = []
+    ) -> tuple[tuple[tuple, ...], TierCacheMetadata]:
+        compressed_layers: list[tuple] = []
         metadata = TierCacheMetadata()
 
         for layer_idx, layer_cache in enumerate(legacy_cache):
@@ -422,10 +421,7 @@ class TieredCacheCompressor:
                 new_k = torch.index_select(key_states, dim=-2, index=keep)
                 new_v = torch.index_select(value_states, dim=-2, index=keep)
 
-            if len(layer_tuple) == 2:
-                compressed = (new_k, new_v)
-            else:
-                compressed = (new_k, new_v, *layer_tuple[2:])
+            compressed = (new_k, new_v) if len(layer_tuple) == 2 else (new_k, new_v, *layer_tuple[2:])
             compressed_layers.append(compressed)
             metadata.layers.append(select)
 
@@ -436,7 +432,7 @@ class TieredCacheCompressor:
 class RollingSummarySnapshot:
     total_tokens: int
     summary_text: str
-    summary_token_ids: Optional[torch.Tensor]
+    summary_token_ids: torch.Tensor | None
 
 
 class RollingSummaryManager:
@@ -450,7 +446,7 @@ class RollingSummaryManager:
         self.total_tokens = 0
         self.last_summary_at = 0
         self.summary_text = ""
-        self.summary_token_ids: Optional[torch.Tensor] = None
+        self.summary_token_ids: torch.Tensor | None = None
         self.pending_refresh = False
 
     def observe(self, total_tokens: int) -> bool:
@@ -464,7 +460,7 @@ class RollingSummaryManager:
             return True
         return False
 
-    def update_summary(self, summary_text: str, summary_token_ids: Optional[torch.Tensor] = None) -> None:
+    def update_summary(self, summary_text: str, summary_token_ids: torch.Tensor | None = None) -> None:
         self.summary_text = str(summary_text)
         self.summary_token_ids = summary_token_ids.detach().clone() if summary_token_ids is not None else None
         self.last_summary_at = int(self.total_tokens)
@@ -487,9 +483,9 @@ class RepoChunk:
     end_line: int
     text: str
     token_estimate: int
-    symbols: Tuple[str, ...]
-    imports: Tuple[str, ...]
-    terms: Dict[str, int]
+    symbols: tuple[str, ...]
+    imports: tuple[str, ...]
+    terms: dict[str, int]
 
 
 class CodeRepoMemoryIndex:
@@ -502,7 +498,7 @@ class CodeRepoMemoryIndex:
         self.root_dir = os.path.abspath(root_dir)
         self.chunk_min_tokens = int(chunk_min_tokens)
         self.chunk_max_tokens = int(chunk_max_tokens)
-        self.chunks: List[RepoChunk] = []
+        self.chunks: list[RepoChunk] = []
 
     def _iter_files(self) -> Iterable[str]:
         for root, dirs, files in os.walk(self.root_dir):
@@ -512,16 +508,16 @@ class CodeRepoMemoryIndex:
                     yield os.path.join(root, fn)
 
     @staticmethod
-    def _term_histogram(text: str) -> Dict[str, int]:
-        terms: Dict[str, int] = {}
+    def _term_histogram(text: str) -> dict[str, int]:
+        terms: dict[str, int] = {}
         for term in _TOKEN_RE.findall(text.lower()):
             terms[term] = terms.get(term, 0) + 1
         return terms
 
     @staticmethod
-    def _python_symbols_and_imports(text: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
-        symbols: List[str] = []
-        imports: List[str] = []
+    def _python_symbols_and_imports(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        symbols: list[str] = []
+        imports: list[str] = []
         try:
             tree = ast.parse(text)
         except Exception:
@@ -542,12 +538,12 @@ class CodeRepoMemoryIndex:
         self,
         path: str,
         text: str,
-    ) -> List[RepoChunk]:
+    ) -> list[RepoChunk]:
         lines = text.splitlines()
         if not lines:
             return []
 
-        chunks: List[RepoChunk] = []
+        chunks: list[RepoChunk] = []
         start = 0
         current_chars = 0
         chunk_idx = 0
@@ -613,11 +609,11 @@ class CodeRepoMemoryIndex:
         self.chunks = []
         for path in self._iter_files():
             try:
-                with open(path, "r", encoding="utf-8") as f:
+                with open(path, encoding="utf-8") as f:
                     text = f.read()
             except UnicodeDecodeError:
                 try:
-                    with open(path, "r", encoding="latin-1") as f:
+                    with open(path, encoding="latin-1") as f:
                         text = f.read()
                 except Exception:
                     continue
@@ -627,7 +623,7 @@ class CodeRepoMemoryIndex:
         return len(self.chunks)
 
     @staticmethod
-    def _score_terms(query_terms: Dict[str, int], chunk_terms: Dict[str, int]) -> float:
+    def _score_terms(query_terms: dict[str, int], chunk_terms: dict[str, int]) -> float:
         if not query_terms or not chunk_terms:
             return 0.0
         score = 0.0
@@ -643,7 +639,7 @@ class CodeRepoMemoryIndex:
             return 0.0
         return score / norm
 
-    def retrieve(self, query: str, top_k: int = 8, min_k: Optional[int] = None, max_k: Optional[int] = None) -> List[RepoChunk]:
+    def retrieve(self, query: str, top_k: int = 8, min_k: int | None = None, max_k: int | None = None) -> list[RepoChunk]:
         if not self.chunks:
             return []
         q_terms = self._term_histogram(query)
@@ -651,7 +647,7 @@ class CodeRepoMemoryIndex:
         k_hi = int(max_k) if max_k is not None else len(self.chunks)
         k = _clamp_int(int(top_k), k_lo, k_hi)
 
-        scored: List[Tuple[float, RepoChunk]] = []
+        scored: list[tuple[float, RepoChunk]] = []
         for chunk in self.chunks:
             score = self._score_terms(q_terms, chunk.terms)
             if score <= 0:
@@ -669,10 +665,10 @@ def apply_retrieved_chunks_to_prompt(
     if prompt_ids.dim() != 2:
         raise ValueError("prompt_ids must have shape [batch, seq]")
     if prompt_ids.shape[0] != 1:
-        # Keep behavior simple and deterministic for now.
+
         return prompt_ids
 
-    additions: List[torch.Tensor] = []
+    additions: list[torch.Tensor] = []
     for chunk in retrieved_chunk_ids:
         if chunk is None:
             continue

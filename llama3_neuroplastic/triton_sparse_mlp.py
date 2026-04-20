@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 import torch
 
@@ -135,9 +134,7 @@ def _should_use_fused_input_kernel(
             return False
         if top_k > 8:
             return False
-        if out_features < 1024:
-            return False
-        return True
+        return not out_features < 1024
 
     return top_k <= 16 or (rows >= 4 and block_size <= 256)
 
@@ -162,7 +159,7 @@ def materialize_linear_bias(
     *,
     device: torch.device,
     dtype: torch.dtype,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     bias = getattr(linear, "bias", None)
     if bias is None:
         return None
@@ -178,9 +175,7 @@ def linear_has_4bit_weight(linear: torch.nn.Module) -> bool:
         return False
     if getattr(quant_state, "shape", None) is None:
         return False
-    if int(getattr(quant_state, "blocksize", 0)) <= 0:
-        return False
-    return True
+    return not int(getattr(quant_state, "blocksize", 0)) <= 0
 
 
 def materialize_linear_4bit_params(
@@ -216,7 +211,7 @@ def materialize_linear_4bit_params(
 
 
 def _dequantize_4bit_weight_for_backward(
-    quant_weight_ref: Optional[torch.Tensor],
+    quant_weight_ref: torch.Tensor | None,
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -630,7 +625,7 @@ class _SparseInputLinearFn(torch.autograd.Function):
         x_flat: torch.Tensor,
         active_idx: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
+        bias: torch.Tensor | None,
         block_size: int,
     ) -> torch.Tensor:
         if (not _TRITON_AVAILABLE) or x_flat.device.type != "cuda":
@@ -663,7 +658,8 @@ class _SparseInputLinearFn(torch.autograd.Function):
                 out.zero_()
         elif use_fused:
             topk_max = _next_power_of_two(top_k)
-            grid = lambda META: (rows, triton.cdiv(out_features, META['BLOCK_OUT']))
+            def grid(META):
+                return (rows, triton.cdiv(out_features, META['BLOCK_OUT']))
             _sparse_input_linear_tiled_kernel[grid](
                 x_flat,
                 active_idx,
@@ -727,7 +723,7 @@ class _SparseOutputLinearFn(torch.autograd.Function):
         x_flat: torch.Tensor,
         active_idx: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
+        bias: torch.Tensor | None,
         flat_mask: torch.Tensor,
         block_size: int,
     ) -> torch.Tensor:
@@ -740,7 +736,8 @@ class _SparseOutputLinearFn(torch.autograd.Function):
         out = torch.zeros((rows, hidden_size), device=x_flat.device, dtype=x_flat.dtype)
 
         if rows > 0 and top_k > 0:
-            grid = lambda META: (rows * top_k, triton.cdiv(block_size, META['BLOCK_OUT']))
+            def grid(META):
+                return (rows * top_k, triton.cdiv(block_size, META['BLOCK_OUT']))
             _sparse_output_linear_kernel[grid](
                 x_flat,
                 active_idx,
@@ -777,9 +774,9 @@ class _SparseOutputLinearFn(torch.autograd.Function):
 def triton_sparse_input_linear(
     x_flat: torch.Tensor,
     active_idx: torch.Tensor,
-    linear: Optional[torch.nn.Module] = None,
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    linear: torch.nn.Module | None = None,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
     *,
     block_size: int,
 ) -> torch.Tensor:
@@ -807,9 +804,9 @@ def triton_sparse_output_linear(
     x_flat: torch.Tensor,
     active_idx: torch.Tensor,
     flat_mask: torch.Tensor,
-    linear: Optional[torch.nn.Module] = None,
-    weight: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    linear: torch.nn.Module | None = None,
+    weight: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
     *,
     block_size: int,
 ) -> torch.Tensor:
@@ -846,9 +843,9 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
         out_features: int,
         in_features: int,
         quant_block_size: int,
-        bias: Optional[torch.Tensor],
+        bias: torch.Tensor | None,
         block_size: int,
-        quant_weight_ref: Optional[torch.Tensor],
+        quant_weight_ref: torch.Tensor | None,
     ) -> torch.Tensor:
         if (not _TRITON_AVAILABLE) or x_flat.device.type != "cuda":
             raise RuntimeError("4-bit Triton sparse input kernel requires Triton on CUDA")
@@ -879,7 +876,8 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
                 out.zero_()
         elif use_fused:
             topk_max = _next_power_of_two(top_k)
-            grid = lambda META: (rows, triton.cdiv(int(out_features), META['BLOCK_OUT']))
+            def grid(META):
+                return (rows, triton.cdiv(int(out_features), META['BLOCK_OUT']))
             _sparse_input_linear_4bit_tiled_kernel[grid](
                 x_flat,
                 active_idx,
@@ -959,9 +957,9 @@ class _SparseOutputLinear4bitFn(torch.autograd.Function):
         code: torch.Tensor,
         input_dim: int,
         quant_block_size: int,
-        bias: Optional[torch.Tensor],
+        bias: torch.Tensor | None,
         block_size: int,
-        quant_weight_ref: Optional[torch.Tensor],
+        quant_weight_ref: torch.Tensor | None,
     ) -> torch.Tensor:
         if (not _TRITON_AVAILABLE) or x_flat.device.type != "cuda":
             raise RuntimeError("4-bit Triton sparse output kernel requires Triton on CUDA")
@@ -972,7 +970,8 @@ class _SparseOutputLinear4bitFn(torch.autograd.Function):
         out = torch.zeros((rows, hidden_size), device=x_flat.device, dtype=x_flat.dtype)
 
         if rows > 0 and top_k > 0:
-            grid = lambda META: (rows * top_k, triton.cdiv(int(block_size), META['BLOCK_OUT']))
+            def grid(META):
+                return (rows * top_k, triton.cdiv(int(block_size), META['BLOCK_OUT']))
             _sparse_output_linear_4bit_kernel[grid](
                 x_flat,
                 active_idx,
@@ -1022,9 +1021,9 @@ def triton_sparse_input_linear_4bit(
     out_features: int,
     in_features: int,
     quant_block_size: int,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     block_size: int,
-    quant_weight_ref: Optional[torch.Tensor] = None,
+    quant_weight_ref: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_flat = _prepare_activation_tensor(x_flat)
     active_idx = _prepare_active_idx(active_idx, device=x_flat.device)
@@ -1059,9 +1058,9 @@ def triton_sparse_output_linear_4bit(
     code: torch.Tensor,
     input_dim: int,
     quant_block_size: int,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     block_size: int,
-    quant_weight_ref: Optional[torch.Tensor] = None,
+    quant_weight_ref: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_flat = _prepare_activation_tensor(x_flat)
     active_idx = _prepare_active_idx(active_idx, device=x_flat.device)

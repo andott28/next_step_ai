@@ -4,15 +4,15 @@ import argparse
 import gc
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import torch
 from transformers import AutoTokenizer
 
 try:
     from .streaming_llama_runtime import StreamingLlamaRuntime
-except ImportError:  # pragma: no cover
-    from streaming_llama_runtime import StreamingLlamaRuntime  # type: ignore
+except ImportError:
+    from streaming_llama_runtime import StreamingLlamaRuntime
 
 
 def _parse_device(device_name: str) -> torch.device:
@@ -76,7 +76,7 @@ def _run_once(
     args: argparse.Namespace,
     tokenizer: Any,
     sparse: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     runtime = StreamingLlamaRuntime(
         model_name_or_path=str(args.model_name),
         device=_parse_device(str(args.device)),
@@ -133,7 +133,7 @@ def main() -> int:
     sparse = _run_once(args=args, tokenizer=tokenizer, sparse=True)
     identical = dense["generated_ids"] == sparse["generated_ids"]
     completion_identical = dense["completion_ids"] == sparse["completion_ids"]
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "model_name": str(args.model_name),
         "prompt": str(args.prompt),
         "max_new_tokens": int(args.max_new_tokens),

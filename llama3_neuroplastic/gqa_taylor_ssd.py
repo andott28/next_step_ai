@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -243,7 +243,7 @@ class HybridSoftmaxLinearAttention(nn.Module):
 
     def prepare_cache(
         self,
-        cache: Optional[TaylorSSDLayerCache],
+        cache: TaylorSSDLayerCache | None,
         *,
         batch_size: int,
         device: torch.device,
@@ -305,8 +305,8 @@ class HybridSoftmaxLinearAttention(nn.Module):
         self,
         state: TaylorSSDLayerCache,
         *,
-        evicted_k: Optional[torch.Tensor],
-        evicted_v: Optional[torch.Tensor],
+        evicted_k: torch.Tensor | None,
+        evicted_v: torch.Tensor | None,
     ) -> None:
         if self._state_decay_scalar < 1.0:
             state.state_S *= self._state_decay_scalar
@@ -372,8 +372,8 @@ class HybridSoftmaxLinearAttention(nn.Module):
         state: TaylorSSDLayerCache,
     ) -> tuple[torch.Tensor, TaylorSSDLayerCache]:
         slot = int(state.cache_pos)
-        evicted_k: Optional[torch.Tensor] = None
-        evicted_v: Optional[torch.Tensor] = None
+        evicted_k: torch.Tensor | None = None
+        evicted_v: torch.Tensor | None = None
         if state.seen_tokens >= self.local_window:
             evicted_k = state.local_k[:, :, slot, :]
             evicted_v = state.local_v[:, :, slot, :]
@@ -403,7 +403,7 @@ class HybridSoftmaxLinearAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        cache: Optional[TaylorSSDLayerCache],
+        cache: TaylorSSDLayerCache | None,
     ) -> tuple[torch.Tensor, TaylorSSDLayerCache]:
         state = self.prepare_cache(cache, batch_size=q.shape[0], device=q.device, dtype=q.dtype)
         return self._step_with_state(q, k, v, state)
@@ -414,7 +414,7 @@ class HybridSoftmaxLinearAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         *,
-        cache: Optional[TaylorSSDLayerCache],
+        cache: TaylorSSDLayerCache | None,
     ) -> tuple[torch.Tensor, TaylorSSDLayerCache]:
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError(
@@ -441,7 +441,7 @@ class GQATaylorSSDSelfAttention(nn.Module):
         k_proj: nn.Module,
         v_proj: nn.Module,
         o_proj: nn.Module,
-        rotary_emb: Optional[nn.Module],
+        rotary_emb: nn.Module | None,
         layout: GQATaylorLayout,
         config: TaylorSSDConfig,
         layer_idx: int,
@@ -460,7 +460,7 @@ class GQATaylorSSDSelfAttention(nn.Module):
         head_map = torch.arange(layout.num_attention_heads, dtype=torch.long) // layout.query_heads_per_group
         self.register_buffer("query_to_kv", head_map, persistent=False)
         self.backend = HybridSoftmaxLinearAttention(layout=layout, config=config)
-        self._runtime_cache: Optional[TaylorSSDLayerCache] = None
+        self._runtime_cache: TaylorSSDLayerCache | None = None
 
     @classmethod
     def from_llama_attention(
@@ -476,7 +476,7 @@ class GQATaylorSSDSelfAttention(nn.Module):
         state_decay: float = 1.0,
         local_window: int = 64,
         feature_dim: int = 64,
-    ) -> "GQATaylorSSDSelfAttention":
+    ) -> GQATaylorSSDSelfAttention:
         q_out = int(getattr(getattr(source_attn, "q_proj", None), "out_features", 0))
         k_out = int(getattr(getattr(source_attn, "k_proj", None), "out_features", 0))
         configured_attention_heads = int(
@@ -549,13 +549,17 @@ class GQATaylorSSDSelfAttention(nn.Module):
     def _resolve_rope(
         self,
         *,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        position_ids: Optional[torch.LongTensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        position_ids: torch.LongTensor | None,
         value_states: torch.Tensor,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        if isinstance(position_embeddings, tuple) and len(position_embeddings) == 2:
-            if torch.is_tensor(position_embeddings[0]) and torch.is_tensor(position_embeddings[1]):
-                return position_embeddings
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            isinstance(position_embeddings, tuple)
+            and len(position_embeddings) == 2
+            and torch.is_tensor(position_embeddings[0])
+            and torch.is_tensor(position_embeddings[1])
+        ):
+            return position_embeddings
         if self.rotary_emb is None:
             return None
         try:
@@ -576,8 +580,8 @@ class GQATaylorSSDSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        position_ids: Optional[torch.LongTensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        position_ids: torch.LongTensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.ndim != 3:
             raise ValueError(f"Expected hidden_states [B,T,H], got {tuple(hidden_states.shape)}")
@@ -616,9 +620,9 @@ class GQATaylorSSDSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        position_ids: Optional[torch.LongTensor],
-        cache: Optional[TaylorSSDLayerCache],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        position_ids: torch.LongTensor | None,
+        cache: TaylorSSDLayerCache | None,
     ) -> tuple[torch.Tensor, TaylorSSDLayerCache]:
         q_states, k_states, v_states = self._project_qkv(
             hidden_states,
@@ -635,9 +639,9 @@ class GQATaylorSSDSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        position_ids: Optional[torch.LongTensor],
-        cache: Optional[TaylorSSDLayerCache],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None,
+        position_ids: torch.LongTensor | None,
+        cache: TaylorSSDLayerCache | None,
     ) -> tuple[torch.Tensor, TaylorSSDLayerCache]:
         q_states, k_states, v_states = self._project_qkv(
             hidden_states,
@@ -658,13 +662,13 @@ class GQATaylorSSDSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Any | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> Any:
         del attention_mask, cache_position

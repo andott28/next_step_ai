@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """init_kv_basis.py
 Calibration script to fit a learned routing basis for K/V column-block sparse
 inference.  Mirrors the structure of init_learned_basis_from_dense_mlp.py but
@@ -21,13 +19,16 @@ Usage example:
         --device cuda
 """
 
+from __future__ import annotations
+
 import argparse
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
+
+from llama3_neuroplastic.layer_selection import parse_layer_selection
 
 try:
     from ..basis_fitting import fit_layer_basis
@@ -37,13 +38,13 @@ except ImportError:
         from llama3_neuroplastic.basis_fitting import fit_layer_basis
         from llama3_neuroplastic.experiments.streaming_llama_runtime import StreamingLlamaRuntime
     except ImportError:
-        from basis_fitting import fit_layer_basis  # type: ignore
-        from streaming_llama_runtime import StreamingLlamaRuntime  # type: ignore
+        from basis_fitting import fit_layer_basis
+        from streaming_llama_runtime import StreamingLlamaRuntime
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+
+
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -76,30 +77,17 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Layer selection
-# ---------------------------------------------------------------------------
-
-def _parse_layer_selection(spec: str, total_layers: int) -> List[int]:
-    spec = spec.strip()
-    if spec == "" or spec.lower() == "all":
-        return list(range(total_layers))
-    out: set[int] = set()
-    for part in spec.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if "-" in token:
-            s, e = token.split("-", 1)
-            out.update(range(int(s), int(e) + 1))
-        else:
-            out.add(int(token))
-    return sorted(v for v in out if 0 <= v < total_layers)
 
 
-# ---------------------------------------------------------------------------
-# Calibration text
-# ---------------------------------------------------------------------------
+
+
+def _parse_layer_selection(spec: str, total_layers: int) -> list[int]:
+    return parse_layer_selection(spec, total_layers=int(total_layers)) or []
+
+
+
+
+
 
 _FALLBACK_CALIBRATION_TEXT = (
     "The transformer architecture has become the dominant paradigm for large "
@@ -116,26 +104,26 @@ _FALLBACK_CALIBRATION_TEXT = (
 )
 
 
-def _load_calibration_texts(path: str) -> List[str]:
+def _load_calibration_texts(path: str) -> list[str]:
     if path.strip():
         text = Path(path).read_text(encoding="utf-8")
-        # Split on double-newline paragraph boundaries
+
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         return paragraphs if paragraphs else [text]
     return [_FALLBACK_CALIBRATION_TEXT]
 
 
-# ---------------------------------------------------------------------------
-# Hook-based data collection
-# ---------------------------------------------------------------------------
+
+
+
 
 def _collect_kv_rows(
     runtime: StreamingLlamaRuntime,
-    texts: List[str],
-    selected_layers: List[int],
+    texts: list[str],
+    selected_layers: list[int],
     *,
     max_rows: int,
-) -> Dict[int, Dict[str, torch.Tensor]]:
+) -> dict[int, dict[str, torch.Tensor]]:
     """Collect (x_post_layernorm, k_out, v_out) triples for each selected layer.
 
     We intercept:
@@ -147,25 +135,25 @@ def _collect_kv_rows(
     The streaming runtime reuses a single LlamaDecoderLayer skeleton, so we
     register hooks, run the forward, then immediately remove them.
     """
-    # Pre-build tokenizer-style integer token ids from text (character-level fallback
-    # that avoids a hard dependency on a loaded tokenizer here — the runtime already
-    # consumed the tokenizer during init).  We use the runtime's embed_tokens lookup.
+
+
+
     device = runtime.device
     dtype = runtime.dtype
 
-    # Buffer: layer_idx → {"x": List[Tensor], "k": List[Tensor], "v": List[Tensor]}
-    buffers: Dict[int, Dict[str, List[torch.Tensor]]] = {
+
+    buffers: dict[int, dict[str, list[torch.Tensor]]] = {
         li: {"x": [], "k": [], "v": []} for li in selected_layers
     }
-    rows_collected: Dict[int, int] = {li: 0 for li in selected_layers}
+    rows_collected: dict[int, int] = {li: 0 for li in selected_layers}
 
     selected_set = set(selected_layers)
 
     for text in texts:
-        # Encode text with a fallback approach using the runtime's embed weight shape
-        # to infer vocab size, and the runtime loader to get a simple token sequence.
-        # If the runtime has a tokenizer we use it; otherwise we use a simple ASCII
-        # byte encoding as a stand-in for calibration purposes.
+
+
+
+
         try:
             from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(
@@ -179,9 +167,9 @@ def _collect_kv_rows(
                 truncation=True,
                 max_length=256,
                 padding=False,
-            )["input_ids"]  # [1, seq_len]
+            )["input_ids"]
         except Exception:
-            # Crude fallback: ASCII byte values mod vocab_size
+
             vocab_size = int(runtime._embed_weight_cpu.shape[0])
             raw = [ord(c) % vocab_size for c in text[:256]]
             token_ids = torch.tensor([raw], dtype=torch.long)
@@ -191,26 +179,25 @@ def _collect_kv_rows(
 
         token_ids = token_ids.to(device=torch.device("cpu"))
 
-        # Run layer-by-layer with hooks
-        import torch.no_grad as _no_grad  # noqa
+
 
         with torch.no_grad():
             hidden = runtime._embed_tokens_cpu(token_ids).to(device=device, dtype=dtype)
             position_ids = torch.arange(int(token_ids.shape[1]), device=device, dtype=torch.long)
 
             for layer_idx in range(runtime.num_layers):
-                # Check if we still need data for any selected layer at or above this index
+
                 pending = [li for li in selected_layers if rows_collected[li] < max_rows]
                 if not pending:
                     break
 
                 layer = runtime._load_layer(layer_idx)
 
-                h_norm_captures: List[torch.Tensor] = []
-                k_out_captures: List[torch.Tensor] = []
-                v_out_captures: List[torch.Tensor] = []
+                h_norm_captures: list[torch.Tensor] = []
+                k_out_captures: list[torch.Tensor] = []
+                v_out_captures: list[torch.Tensor] = []
 
-                hooks: List[Any] = []
+                hooks: list[Any] = []
 
                 if layer_idx in selected_set and rows_collected[layer_idx] < max_rows:
                     def _hook_ln(module: nn.Module, inp: Any, out: torch.Tensor,
@@ -231,7 +218,7 @@ def _collect_kv_rows(
                     if hasattr(layer.self_attn, "v_proj"):
                         hooks.append(layer.self_attn.v_proj.register_forward_hook(_hook_v))
 
-                # Run attention token-by-token (mirrors _forward_prefill)
+
                 seq_len = int(hidden.shape[1])
                 next_hidden = torch.empty_like(hidden)
                 for pos in range(seq_len):
@@ -257,7 +244,7 @@ def _collect_kv_rows(
 
                 hidden, next_hidden = next_hidden, hidden
 
-                # MLP residual
+
                 residual = hidden
                 mlp_input = layer.post_attention_layernorm(hidden)
                 try:
@@ -266,14 +253,14 @@ def _collect_kv_rows(
                     mlp_out = torch.zeros_like(mlp_input)
                 hidden = residual + mlp_out
 
-                # Remove hooks
+
                 for h_handle in hooks:
                     h_handle.remove()
                 hooks.clear()
 
-                # Store captured activations
+
                 if layer_idx in selected_set and h_norm_captures and k_out_captures and v_out_captures:
-                    # Concatenate all positions: [seq_len, hidden_size]
+
                     x_cat = torch.cat(h_norm_captures, dim=1).reshape(-1, h_norm_captures[0].shape[-1]).float()
                     k_cat = torch.cat(k_out_captures, dim=1).reshape(-1, k_out_captures[0].shape[-1]).float()
                     v_cat = torch.cat(v_out_captures, dim=1).reshape(-1, v_out_captures[0].shape[-1]).float()
@@ -286,12 +273,12 @@ def _collect_kv_rows(
                         buffers[layer_idx]["v"].append(v_cat[:take])
                         rows_collected[layer_idx] += take
 
-        # Check if all layers saturated
+
         if all(rows_collected[li] >= max_rows for li in selected_layers):
             break
 
-    # Concatenate buffers
-    result: Dict[int, Dict[str, torch.Tensor]] = {}
+
+    result: dict[int, dict[str, torch.Tensor]] = {}
     for li in selected_layers:
         buf = buffers[li]
         if buf["x"] and buf["k"] and buf["v"]:
@@ -303,9 +290,9 @@ def _collect_kv_rows(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Basis fitting for K/V column blocks
-# ---------------------------------------------------------------------------
+
+
+
 
 def _fit_kv_basis(
     x: torch.Tensor,
@@ -316,7 +303,7 @@ def _fit_kv_basis(
     hidden_size: int,
     pca_method: str = "auto",
     pca_batch_rows: int = 1024,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Fit routing basis for one K or V projection.
 
     Target: column-block norms of x (the input to W_K or W_V).
@@ -336,38 +323,38 @@ def _fit_kv_basis(
     num_col_blocks = hidden_size // block_size
     N = int(x.shape[0])
 
-    x_f = x.float()  # [N, hidden_size]
+    x_f = x.float()
 
-    # Compute column-block norms as regression target: [N, num_col_blocks]
-    x_blocks = x_f.reshape(N, num_col_blocks, block_size)           # [N, B, S]
-    block_norms = x_blocks.norm(dim=-1)                              # [N, B]
 
-    # Mean block norm across calibration data → block importance
-    block_importance = block_norms.mean(dim=0)  # [B]
+    x_blocks = x_f.reshape(N, num_col_blocks, block_size)
+    block_norms = x_blocks.norm(dim=-1)
 
-    # Fit encoder (x → latent) and decoder (latent → block_norms) via fit_layer_basis.
-    # We treat x as input and block_norms as target, reusing the MLP basis machinery.
+
+    block_importance = block_norms.mean(dim=0)
+
+
+
     layer_result = fit_layer_basis(
         x=x_f,
         y=block_norms,
         basis_rank=int(basis_rank),
-        block_size=1,               # block_norms is [N, B] — each "block" is 1-dim
+        block_size=1,
         pca_method=pca_method,
         pca_batch_rows=int(pca_batch_rows),
     )
 
-    # Rebuild decoder in the shape expected by _route_kv_blocks:
-    #   dec_norm_t: [basis_rank, num_col_blocks]
-    enc_w = layer_result["encoder_weight"]    # [basis_rank, hidden_size]
-    enc_b = layer_result["encoder_bias"]      # [basis_rank]
-    # decoder_blocks: [num_col_blocks, basis_rank, 1] since block_size=1 above
-    dec_raw = layer_result["decoder_blocks"]  # [B, R, 1]
-    dec_flat = dec_raw.squeeze(-1)            # [B, R]  == [num_col_blocks, basis_rank]
+
+
+    enc_w = layer_result["encoder_weight"]
+    enc_b = layer_result["encoder_bias"]
+
+    dec_raw = layer_result["decoder_blocks"]
+    dec_flat = dec_raw.squeeze(-1)
     dec_norm_t = dec_flat.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    dec_normalised = dec_flat / dec_norm_t    # [B, R]
-    # Reshape to [B, R, 1] to keep checkpoint schema consistent, decoder_bias = [B, 1]
-    decoder_blocks = dec_flat.unsqueeze(-1).contiguous()  # [B, R, 1]
-    decoder_bias = layer_result["decoder_bias"]           # [B, 1]
+    dec_flat / dec_norm_t
+
+    decoder_blocks = dec_flat.unsqueeze(-1).contiguous()
+    decoder_bias = layer_result["decoder_bias"]
 
     return {
         "encoder_weight": enc_w.contiguous(),
@@ -379,14 +366,14 @@ def _fit_kv_basis(
     }
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
+
+
 
 def main() -> None:
     args = _parse_args()
 
-    # Resolve device
+
     if args.device.strip():
         device = torch.device(args.device.strip())
     else:
@@ -397,7 +384,7 @@ def main() -> None:
     print(f"[kv_basis] output={args.output_path}", flush=True)
     print(f"[kv_basis] basis_rank={args.basis_rank}  block_size={args.block_size}  top_k={args.top_k}", flush=True)
 
-    # Build the streaming runtime (CPU-only attn, no MLP staging needed)
+
     runtime = StreamingLlamaRuntime(
         model_name_or_path=str(args.model_path),
         device=device,
@@ -421,11 +408,11 @@ def main() -> None:
     print(f"[kv_basis] hidden_size={hidden_size}  kv_hidden={kv_hidden}  "
           f"num_col_blocks={num_col_blocks}", flush=True)
 
-    # Load calibration texts
+
     texts = _load_calibration_texts(str(args.calibration_text))
     print(f"[kv_basis] {len(texts)} calibration document(s)", flush=True)
 
-    # Collect activations
+
     print("[kv_basis] collecting K/V activations...", flush=True)
     collected = _collect_kv_rows(
         runtime,
@@ -435,16 +422,16 @@ def main() -> None:
     )
     print(f"[kv_basis] collected data for {len(collected)} layer(s)", flush=True)
 
-    # Fit basis per layer
-    layer_states: Dict[str, Any] = {}
+
+    layer_states: dict[str, Any] = {}
     for layer_idx in selected_layers:
         data = collected.get(layer_idx)
         if data is None:
             print(f"[kv_basis] layer {layer_idx}: no data collected — skipping", flush=True)
             continue
-        x = data["x"]    # [N, hidden_size]
-        k = data["k"]    # [N, kv_hidden]
-        v = data["v"]    # [N, kv_hidden]
+        x = data["x"]
+        k = data["k"]
+        data["v"]
         N = int(x.shape[0])
         print(f"[kv_basis] layer {layer_idx}: fitting basis on {N} rows...", flush=True)
 
@@ -456,7 +443,7 @@ def main() -> None:
             pca_method=str(args.pca_method),
             pca_batch_rows=int(args.pca_batch_rows),
         )
-        # For now, use shared K routing (separate_k_v_routing=False means same routing for K and V)
+
         layer_states[str(layer_idx)] = {
             "encoder_weight":    k_state["encoder_weight"],
             "encoder_bias":      k_state["encoder_bias"],
@@ -471,7 +458,7 @@ def main() -> None:
             flush=True,
         )
 
-    # Build checkpoint
+
     config_payload = {
         "hidden_size": hidden_size,
         "kv_hidden": kv_hidden,

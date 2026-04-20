@@ -21,7 +21,6 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = [
-    # Windows: triton-windows; Linux: triton (bundled with torch)
     "triton-windows>=3.0; sys_platform == 'win32'",
 ]
 eval = [
@@ -30,6 +29,7 @@ eval = [
 dev = [
     "pytest>=7",
     "pytest-cov",
+    "ruff>=0.4",
 ]
 
 [project.scripts]
@@ -37,6 +37,9 @@ stream-llama = "llama3_neuroplastic.experiments.run_streaming_inference:main"
 fit-basis    = "llama3_neuroplastic.experiments.init_learned_basis_from_dense_mlp:main"
 eval-ppl     = "llama3_neuroplastic.experiments.eval_perplexity:main"
 benchmark    = "llama3_neuroplastic.experiments.benchmark:main"
+fit-kv-basis = "llama3_neuroplastic.experiments.init_kv_basis:main"
+fit-attn-share = "llama3_neuroplastic.experiments.init_attn_share:main"
+fit-token-posting = "llama3_neuroplastic.experiments.init_attn_token_posting_basis:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -44,3 +47,11 @@ include = ["llama3_neuroplastic*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]

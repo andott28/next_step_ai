@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -38,10 +39,10 @@ except ImportError:
 @dataclass
 class SparseRouteSelection:
     active_idx: torch.Tensor
-    score_weights: Optional[torch.Tensor] = None
-    latent_idx: Optional[torch.Tensor] = None
-    latent_weights: Optional[torch.Tensor] = None
-    block_scores: Optional[torch.Tensor] = None
+    score_weights: torch.Tensor | None = None
+    latent_idx: torch.Tensor | None = None
+    latent_weights: torch.Tensor | None = None
+    block_scores: torch.Tensor | None = None
 
 
 @dataclass
@@ -65,7 +66,7 @@ class SparseLlamaMLP(nn.Module):
         layer_idx: int,
         route_fn: Callable[[torch.Tensor, int], SparseRouteSelection],
         enabled_fn: Callable[[int], bool],
-        output_scale_fn: Optional[Callable[[int, torch.device, torch.dtype], torch.Tensor]] = None,
+        output_scale_fn: Callable[[int, torch.device, torch.dtype], torch.Tensor] | None = None,
     ) -> None:
         super().__init__()
         self.base_mlp = base_mlp
@@ -79,16 +80,16 @@ class SparseLlamaMLP(nn.Module):
         self.block_size = int(config.block_size)
         self.num_blocks = int(config.num_blocks)
         self._triton_linear_cache: dict[str, dict[str, object]] = {}
-        self._last_diagnostics: Optional[SparseMLPDiagnostics] = None
-        self._block_bank: Optional[Dict[str, Any]] = None
+        self._last_diagnostics: SparseMLPDiagnostics | None = None
+        self._block_bank: dict[str, Any] | None = None
         self.capture_alignment: bool = False
-        self._last_alignment: Optional[Dict[str, torch.Tensor]] = None
+        self._last_alignment: dict[str, torch.Tensor] | None = None
         self._last_fallback_triggered: bool = False
         self._fallback_total_steps: int = 0
         self._fallback_triggered_steps: int = 0
         self.capture_route_snapshot: bool = False
-        self._last_route_snapshot: Optional[Dict[str, torch.Tensor]] = None
-        self._last_learned_basis_stats: Optional[Dict[str, Any]] = None
+        self._last_route_snapshot: dict[str, torch.Tensor] | None = None
+        self._last_learned_basis_stats: dict[str, Any] | None = None
         self.curriculum_enabled: bool = False
         self.curriculum_alpha: float = 1.0
         self.block_banking_enabled: bool = False
@@ -127,13 +128,13 @@ class SparseLlamaMLP(nn.Module):
             ("sparse_basis_scale", self.sparse_basis_scale),
         ]
 
-    def export_sparse_recalibration_state(self) -> Dict[str, torch.Tensor]:
+    def export_sparse_recalibration_state(self) -> dict[str, torch.Tensor]:
         return {
             name: param.detach().cpu()
             for name, param in self.iter_sparse_basis_parameters()
         }
 
-    def load_sparse_recalibration_state(self, payload: Dict[str, torch.Tensor], strict: bool = True) -> Dict[str, int]:
+    def load_sparse_recalibration_state(self, payload: dict[str, torch.Tensor], strict: bool = True) -> dict[str, int]:
         loaded = 0
         missing = 0
         for name, param in self.iter_sparse_basis_parameters():
@@ -151,7 +152,7 @@ class SparseLlamaMLP(nn.Module):
             loaded += 1
         return {"loaded_items": int(loaded), "missing_items": int(missing)}
 
-    def initialize_sparse_basis_from_dense_init(self, payload: Dict[str, torch.Tensor], strict: bool = True) -> Dict[str, int]:
+    def initialize_sparse_basis_from_dense_init(self, payload: dict[str, torch.Tensor], strict: bool = True) -> dict[str, int]:
         expected = {
             "encoder_weight": self.sparse_basis_encoder.weight,
             "encoder_bias": self.sparse_basis_encoder.bias,
@@ -191,7 +192,7 @@ class SparseLlamaMLP(nn.Module):
             self.sparse_output_compensation_bias.zero_()
         return {"loaded_items": int(loaded), "missing_items": int(missing)}
 
-    def get_last_learned_basis_stats(self) -> Optional[Dict[str, float]]:
+    def get_last_learned_basis_stats(self) -> dict[str, float] | None:
         if self._last_learned_basis_stats is None:
             return None
         return {
@@ -200,10 +201,10 @@ class SparseLlamaMLP(nn.Module):
             if not str(key).startswith("_") and not torch.is_tensor(value)
         }
 
-    def get_last_learned_basis_regularizer_tensors(self) -> Optional[Dict[str, torch.Tensor]]:
+    def get_last_learned_basis_regularizer_tensors(self) -> dict[str, torch.Tensor] | None:
         if self._last_learned_basis_stats is None:
             return None
-        out: Dict[str, torch.Tensor] = {}
+        out: dict[str, torch.Tensor] = {}
         for key, value in self._last_learned_basis_stats.items():
             if torch.is_tensor(value):
                 out[str(key)] = value
@@ -277,7 +278,7 @@ class SparseLlamaMLP(nn.Module):
         self,
         latent_dense: torch.Tensor,
         *,
-        preset_idx: Optional[torch.Tensor] = None,
+        preset_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = int(latent_dense.shape[0])
         effective_top_k = int(min(max(self._effective_basis_top_k(), 1), latent_dense.shape[-1]))
@@ -389,7 +390,7 @@ class SparseLlamaMLP(nn.Module):
             return out * scale
         return out * scale.reshape(1, 1, 1)
 
-    def _apply_curriculum_blend(self, out: torch.Tensor, dense_ref: Optional[torch.Tensor]) -> torch.Tensor:
+    def _apply_curriculum_blend(self, out: torch.Tensor, dense_ref: torch.Tensor | None) -> torch.Tensor:
         if dense_ref is None or not self.curriculum_enabled:
             return out
         alpha = float(max(0.0, min(1.0, self.curriculum_alpha)))
@@ -399,13 +400,13 @@ class SparseLlamaMLP(nn.Module):
         return (dense * (1.0 - alpha)) + (out * alpha)
 
     @staticmethod
-    def _storage_ptr(param: Optional[torch.Tensor]) -> int:
+    def _storage_ptr(param: torch.Tensor | None) -> int:
         if torch.is_tensor(param):
             return int(param.data_ptr())
         return -1
 
     @staticmethod
-    def _storage_version(param: Optional[torch.Tensor]) -> int:
+    def _storage_version(param: torch.Tensor | None) -> int:
         if torch.is_tensor(param):
             return int(getattr(param, "_version", 0))
         return -1
@@ -426,7 +427,7 @@ class SparseLlamaMLP(nn.Module):
         linear: nn.Module,
         target_device: torch.device,
         target_weight_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         weight = getattr(linear, "weight", None)
         bias = getattr(linear, "bias", None)
         weight_ptr = self._storage_ptr(weight)
@@ -474,7 +475,7 @@ class SparseLlamaMLP(nn.Module):
         linear: nn.Module,
         target_device: torch.device,
         target_bias_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, str, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, str, torch.Tensor | None]:
         weight = getattr(linear, "weight", None)
         bias = getattr(linear, "bias", None)
         quant_state = getattr(weight, "quant_state", None)
@@ -552,7 +553,7 @@ class SparseLlamaMLP(nn.Module):
     def _build_feature_mask(
         self,
         active_idx: torch.Tensor,
-        score_weights: Optional[torch.Tensor],
+        score_weights: torch.Tensor | None,
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
@@ -662,7 +663,7 @@ class SparseLlamaMLP(nn.Module):
             estimated_bytes_fetched_per_token=est_bytes_per_token,
         )
 
-    def get_last_diagnostics(self) -> Optional[SparseMLPDiagnostics]:
+    def get_last_diagnostics(self) -> SparseMLPDiagnostics | None:
         return self._last_diagnostics
 
     def set_alignment_capture(self, enabled: bool) -> None:
@@ -671,7 +672,7 @@ class SparseLlamaMLP(nn.Module):
             self._last_alignment = None
             self._last_fallback_triggered = False
 
-    def get_last_alignment(self) -> Optional[Dict[str, torch.Tensor]]:
+    def get_last_alignment(self) -> dict[str, torch.Tensor] | None:
         return self._last_alignment
 
     def set_route_capture(self, enabled: bool) -> None:
@@ -705,7 +706,7 @@ class SparseLlamaMLP(nn.Module):
             self._block_low_usage_votes.zero_()
             self._block_banked_until.zero_()
 
-    def get_block_banking_stats(self) -> Dict[str, float]:
+    def get_block_banking_stats(self) -> dict[str, float]:
         banked = (self._block_banked_until > int(self._bank_step)).float()
         return {
             "bank_step": float(self._bank_step),
@@ -714,10 +715,10 @@ class SparseLlamaMLP(nn.Module):
             "usage_ema_max": float(self._block_usage_ema.max().detach().cpu().item()) if self._block_usage_ema.numel() > 0 else 0.0,
         }
 
-    def get_last_route_snapshot(self) -> Optional[Dict[str, torch.Tensor]]:
+    def get_last_route_snapshot(self) -> dict[str, torch.Tensor] | None:
         return self._last_route_snapshot
 
-    def get_fallback_stats(self) -> Dict[str, float]:
+    def get_fallback_stats(self) -> dict[str, float]:
         total = int(self._fallback_total_steps)
         triggered = int(self._fallback_triggered_steps)
         return {
@@ -733,7 +734,7 @@ class SparseLlamaMLP(nn.Module):
     def clear_block_bank(self) -> None:
         self._block_bank = None
 
-    def load_block_bank(self, payload: Dict[str, Any], strict: bool = True) -> None:
+    def load_block_bank(self, payload: dict[str, Any], strict: bool = True) -> None:
         gate_blocks = payload.get("gate_proj_blocks")
         up_blocks = payload.get("up_proj_blocks")
         down_blocks = payload.get("down_proj_blocks")
@@ -869,7 +870,7 @@ class SparseLlamaMLP(nn.Module):
         x_flat: torch.Tensor,
         linear: nn.Module,
         active_idx: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         rows = int(x_flat.shape[0])
         input_dim = int(x_flat.shape[1])
@@ -922,7 +923,7 @@ class SparseLlamaMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         flat_hidden = hidden_states.reshape(-1, self.hidden_size)
         gate = self.base_mlp.gate_proj(flat_hidden)
@@ -938,7 +939,7 @@ class SparseLlamaMLP(nn.Module):
         intermediate_size: int,
         device: torch.device,
         dtype: torch.dtype,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if intermediate_size % self.num_blocks != 0:
             raise RuntimeError("intermediate_size must be divisible by num_blocks for intermediate_group placement")
@@ -963,7 +964,7 @@ class SparseLlamaMLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         flat_hidden = hidden_states.reshape(-1, self.hidden_size)
         gate = self.base_mlp.gate_proj(flat_hidden)
@@ -1245,7 +1246,7 @@ class SparseLlamaMLP(nn.Module):
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
         feature_mask: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         flat_hidden = hidden_states.reshape(-1, self.hidden_size)
         flat_mask = feature_mask.reshape(-1, self.hidden_size)
@@ -1263,7 +1264,7 @@ class SparseLlamaMLP(nn.Module):
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
         feature_mask: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         flat_hidden = hidden_states.reshape(-1, self.hidden_size)
         flat_mask = feature_mask.reshape(-1, self.hidden_size)
@@ -1337,7 +1338,7 @@ class SparseLlamaMLP(nn.Module):
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
         feature_mask: torch.Tensor,
-        score_weights: Optional[torch.Tensor] = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self._block_bank is None:
             raise RuntimeError("Sparse block bank is not loaded")
@@ -1420,8 +1421,8 @@ class SparseLlamaMLP(nn.Module):
         active_idx: torch.Tensor,
         feature_mask: torch.Tensor,
     ) -> torch.Tensor:
-        # Prefer the dequantized dense Triton path for inference stability on 4-bit weights.
-        # It avoids numerically fragile direct 4-bit sparse kernels while keeping sparse routing.
+
+
         if self._can_use_torch_block_sparse() or self._can_use_triton_4bit():
             return self._forward_triton_sparse_dense(hidden_states, active_idx, feature_mask)
         return self._forward_triton_sparse_4bit(hidden_states, active_idx, feature_mask)
@@ -1599,7 +1600,7 @@ class SparseLlamaMLP(nn.Module):
                 self._fallback_triggered_steps += 1
 
         capture = bool(self.capture_alignment)
-        dense_ref: Optional[torch.Tensor] = None
+        dense_ref: torch.Tensor | None = None
         need_dense_blend = bool(self.curriculum_enabled and float(self.curriculum_alpha) < 1.0)
         if capture or need_dense_blend:
             with torch.no_grad():
@@ -1612,8 +1613,8 @@ class SparseLlamaMLP(nn.Module):
 
         def _record_alignment(
             sparse_out: torch.Tensor,
-            feature_mask: Optional[torch.Tensor],
-            route: Optional[SparseRouteSelection],
+            feature_mask: torch.Tensor | None,
+            route: SparseRouteSelection | None,
             fallback_triggered: bool,
         ) -> None:
             if dense_ref is None:
@@ -1682,7 +1683,7 @@ class SparseLlamaMLP(nn.Module):
             out = self.base_mlp(hidden_states)
             out = self._apply_output_scale(out)
             out = self._apply_curriculum_blend(out, dense_ref)
-            # Decode-guard/buffer-disabled layers are intentional dense path, not sparse fallback.
+
             _record_alignment(out, None, None, fallback_triggered=False)
             return out
 
@@ -1749,18 +1750,21 @@ class SparseLlamaMLP(nn.Module):
             if route.block_scores is not None:
                 self._last_route_snapshot["block_scores"] = route.block_scores.detach().to(dtype=torch.float32)
         self._update_diagnostics(active_idx)
-        if threshold > 0.0 and self._last_diagnostics is not None:
-            if float(self._last_diagnostics.touched_weight_fraction) < threshold:
-                out = self.base_mlp(hidden_states)
-                out = self._apply_output_scale(out)
-                out = self._apply_curriculum_blend(out, dense_ref)
-                _record_alignment(
-                    out,
-                    torch.ones_like(hidden_states, device=hidden_states.device, dtype=hidden_states.dtype),
-                    route,
-                    fallback_triggered=True,
-                )
-                return out
+        if (
+            threshold > 0.0
+            and self._last_diagnostics is not None
+            and float(self._last_diagnostics.touched_weight_fraction) < threshold
+        ):
+            out = self.base_mlp(hidden_states)
+            out = self._apply_output_scale(out)
+            out = self._apply_curriculum_blend(out, dense_ref)
+            _record_alignment(
+                out,
+                torch.ones_like(hidden_states, device=hidden_states.device, dtype=hidden_states.dtype),
+                route,
+                fallback_triggered=True,
+            )
+            return out
 
         if active_idx.numel() == 0:
             out = torch.zeros_like(hidden_states)

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
-
 import torch
 
 try:
@@ -68,7 +66,7 @@ if _TRITON_AVAILABLE:
             blocked = refr > step
             score = tl.where(blocked & valid, -float("inf"), score)
 
-        # Deterministic tie-break toward lower block index.
+
         score = score - tl.where(valid, offs.to(tl.float32) * 1e-6, 0.0)
 
         for k in tl.static_range(0, top_k):
@@ -87,9 +85,9 @@ def triton_compute_active_blocks_topk(
     *,
     sigma: float,
     top_k: int,
-    refractory_until: Optional[torch.Tensor] = None,
+    refractory_until: torch.Tensor | None = None,
     step: int = -1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if not triton_sca_gate_available():
         raise RuntimeError("Triton is not available")
     if not query.is_cuda or not block_centers.is_cuda:

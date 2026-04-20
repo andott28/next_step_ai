@@ -4,63 +4,44 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoTokenizer
 
+from llama3_neuroplastic.layer_selection import parse_layer_selection
+
 try:
     from datasets import load_dataset
-except ImportError:  # pragma: no cover
+except ImportError:
     load_dataset = None
 
 try:
     from ..basis_fitting import fit_block_score_basis, fit_layer_basis
     from ..performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
-    from .streaming_llama_runtime import StreamingLlamaRuntime
     from .init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn
-except ImportError:  # pragma: no cover
+    from .streaming_llama_runtime import StreamingLlamaRuntime
+except ImportError:
+    from init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn
+    from streaming_llama_runtime import StreamingLlamaRuntime
+
     from llama3_neuroplastic.basis_fitting import fit_block_score_basis, fit_layer_basis
     from llama3_neuroplastic.performance_utils import configure_runtime_environment, resolve_dataloader_kwargs
-    from streaming_llama_runtime import StreamingLlamaRuntime
-    from init_kv_basis import _fit_kv_basis as _fit_kv_basis_fn  # type: ignore
 
-try:
-    from .neuroplastic_llama_gqa_mamba import NeuroplasticLlama  # type: ignore[attr-defined]
-except ImportError:
-    try:
-        from neuroplastic_llama_gqa_mamba import NeuroplasticLlama  # type: ignore[no-redef]
-    except ImportError:
-        NeuroplasticLlama = None  # type: ignore[assignment,misc]
+NeuroplasticLlama = None
 
 
-def _parse_layers(spec: str | None) -> Optional[List[int]]:
-    if spec is None or spec.strip() == "" or spec.strip().lower() == "all":
-        return None
-    out: set[int] = set()
-    for part in spec.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if "-" in token:
-            s, e = token.split("-", 1)
-            start = int(s)
-            end = int(e)
-            if end < start:
-                raise ValueError(f"Invalid layer range: {token}")
-            out.update(range(start, end + 1))
-        else:
-            out.add(int(token))
-    return sorted(out)
+def _parse_layers(spec: str | None) -> list[int] | None:
+    return parse_layer_selection(spec, all_as_none=True)
 
 
 def _slice_layer_chunk(
-    layers: List[int],
+    layers: list[int],
     *,
     chunk_size: int,
     chunk_index: int,
-) -> List[int]:
+) -> list[int]:
     if int(chunk_size) <= 0:
         return list(layers)
     if int(chunk_index) < 0:
@@ -72,11 +53,11 @@ def _slice_layer_chunk(
 
 def _layers_for_output_save(
     *,
-    selected_layers: List[int],
-    layer_states: Dict[str, Dict[str, torch.Tensor]],
-) -> List[int]:
+    selected_layers: list[int],
+    layer_states: dict[str, dict[str, torch.Tensor]],
+) -> list[int]:
     output_layers = {int(idx) for idx in selected_layers}
-    output_layers.update(int(idx) for idx in layer_states.keys())
+    output_layers.update(int(idx) for idx in layer_states)
     return sorted(output_layers)
 
 
@@ -102,7 +83,7 @@ def _build_dataloader(
         lambda x: isinstance(x[text_column], str) and len(x[text_column].strip()) >= _min_chars
     )
     if len(filtered) == 0:
-        # Fall back gracefully: accept any non-empty line rather than crashing.
+
         print(
             f"[dataloader] WARNING: no examples with >= {_min_chars} chars in "
             f"'{dataset_name}/{dataset_config}'. Falling back to min_text_chars=1.",
@@ -116,16 +97,16 @@ def _build_dataloader(
             f"Dataset '{dataset_name}/{dataset_config}' has no non-empty text in column '{text_column}'."
         )
 
-    # Pre-limit raw examples before tokenising to avoid processing millions of entries.
-    # We need enough raw text to produce max_samples full-length packed chunks.
-    # Each raw example is typically 50–500 chars (~10–100 tokens); 5000 raw examples
-    # easily produces hundreds of max_seq_length=2048 chunks.
+
+
+
+
     _raw_limit = max(int(max_samples) * 200 + 5000, 10000)
     if len(filtered) > _raw_limit:
         filtered = filtered.select(range(_raw_limit))
 
-    # Tokenise without padding/truncation — group_texts will handle chunking.
-    def tokenize_fn(batch: Dict[str, List[str]]) -> Dict[str, Any]:
+
+    def tokenize_fn(batch: dict[str, list[str]]) -> dict[str, Any]:
         return tokenizer(
             batch[text_column],
             truncation=False,
@@ -134,20 +115,20 @@ def _build_dataloader(
 
     tokenized = filtered.map(tokenize_fn, batched=True, remove_columns=filtered.column_names)
 
-    # Pack: concatenate all token IDs and split into fixed-length chunks.
-    # This guarantees every sample has exactly max_seq_length real tokens (mask all 1s),
-    # regardless of individual document length. With max_seq_length=2048 and
-    # max_rows_per_layer=512, the first packed sample fills all layers to capacity.
+
+
+
+
     _seq_len = int(max_seq_length)
 
-    def group_texts(examples: Dict[str, List]) -> Dict[str, Any]:
+    def group_texts(examples: dict[str, list]) -> dict[str, Any]:
         ids = sum(examples["input_ids"], [])
         total = (len(ids) // _seq_len) * _seq_len
         if total == 0:
             return {"input_ids": [], "attention_mask": []}
         return {
             "input_ids": [ids[i : i + _seq_len] for i in range(0, total, _seq_len)],
-            # All tokens are real — no padding — so attention_mask is all ones.
+
             "attention_mask": [[1] * _seq_len for _ in range(0, total, _seq_len)],
         }
 
@@ -179,7 +160,7 @@ def _build_dataloader(
     )
 
 
-def _choose_layers(model: NeuroplasticLlama, explicit_layers: Optional[List[int]]) -> List[int]:
+def _choose_layers(model: NeuroplasticLlama, explicit_layers: list[int] | None) -> list[int]:
     if explicit_layers is not None:
         return sorted(explicit_layers)
     total_layers = len(model.model.model.layers)
@@ -190,17 +171,17 @@ def _choose_layers(model: NeuroplasticLlama, explicit_layers: Optional[List[int]
 def _choose_layers_from_layout(
     *,
     total_layers: int,
-    explicit_layers: Optional[List[int]],
+    explicit_layers: list[int] | None,
     bottom_buffer_layers: int,
     decode_guard_layers: int,
     dense_anchor_stride: int,
     top_buffer_layers: int = 2,
-) -> List[int]:
+) -> list[int]:
     if explicit_layers is not None:
         return sorted(explicit_layers)
     lower = max(int(bottom_buffer_layers), 0)
     upper = int(total_layers) - max(int(top_buffer_layers), 0) - max(int(decode_guard_layers), 0)
-    out: List[int] = []
+    out: list[int] = []
     for layer_idx in range(int(total_layers)):
         if not (lower <= int(layer_idx) < max(upper, 0)):
             continue
@@ -220,7 +201,7 @@ def _fit_layer_basis(
     block_size: int,
     pca_method: str,
     pca_batch_rows: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return fit_layer_basis(
         x=x,
         y=y,
@@ -258,7 +239,7 @@ def _fit_sparse_artifact(
     block_size: int,
     pca_method: str,
     pca_batch_rows: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     target = str(artifact_target).strip().lower()
     if target == "output_reconstruction":
         return _fit_layer_basis(
@@ -280,8 +261,8 @@ def _fit_sparse_artifact(
     raise ValueError(f"Unsupported artifact target: {artifact_target}")
 
 
-def _layer_state_from_fitted(*, artifact_target: str, fitted: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    state: Dict[str, torch.Tensor] = {
+def _layer_state_from_fitted(*, artifact_target: str, fitted: dict[str, Any]) -> dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor] = {
         "encoder_weight": fitted["encoder_weight"],
         "encoder_bias": fitted["encoder_bias"],
         "scale": fitted["scale"],
@@ -310,7 +291,7 @@ def _layer_state_from_fitted(*, artifact_target: str, fitted: Dict[str, Any]) ->
     return state
 
 
-def _load_profile_overrides(path: str) -> Dict[str, Dict[int, int]]:
+def _load_profile_overrides(path: str) -> dict[str, dict[int, int]]:
     if not str(path).strip():
         return {
             "basis_rank_by_layer": {},
@@ -319,7 +300,7 @@ def _load_profile_overrides(path: str) -> Dict[str, Dict[int, int]]:
         }
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     overrides = payload.get("recommended_overrides", {}) if isinstance(payload, dict) else {}
-    out: Dict[str, Dict[int, int]] = {
+    out: dict[str, dict[int, int]] = {
         "basis_rank_by_layer": {},
         "basis_top_k_by_layer": {},
         "top_k_by_layer": {},
@@ -333,12 +314,12 @@ def _load_profile_overrides(path: str) -> Dict[str, Dict[int, int]]:
 
 def _collect_alignment_rows(
     model: NeuroplasticLlama,
-    selected_layers: List[int],
+    selected_layers: list[int],
     *,
     attention_mask: torch.Tensor,
-    layer_x: Dict[int, List[torch.Tensor]],
-    layer_y: Dict[int, List[torch.Tensor]],
-    layer_rows: Dict[int, int],
+    layer_x: dict[int, list[torch.Tensor]],
+    layer_y: dict[int, list[torch.Tensor]],
+    layer_rows: dict[int, int],
     max_rows: int,
 ) -> None:
     valid = attention_mask.reshape(-1).to(dtype=torch.bool)
@@ -366,16 +347,16 @@ def _collect_alignment_rows(
 def _build_basis_payload(
     *,
     args: argparse.Namespace,
-    selected_layers: List[int],
-    layer_states: Dict[str, Dict[str, torch.Tensor]],
-    stats: Dict[str, Dict[str, float]],
+    selected_layers: list[int],
+    layer_states: dict[str, dict[str, torch.Tensor]],
+    stats: dict[str, dict[str, float]],
     block_size: int,
     num_blocks: int,
-    overrides: Dict[str, Dict[int, int]],
-    existing_config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    overrides: dict[str, dict[int, int]],
+    existing_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     artifact_target = str(args.artifact_target).strip().lower()
-    config_payload: Dict[str, Any] = dict(existing_config or {})
+    config_payload: dict[str, Any] = dict(existing_config or {})
     config_payload.update(
         {
             "sparse_placement": "learned_basis",
@@ -388,8 +369,8 @@ def _build_basis_payload(
             "decode_guard_layers": int(config_payload.get("decode_guard_layers", args.sca_decode_guard_layers)),
             "dense_anchor_stride": int(config_payload.get("dense_anchor_stride", args.sca_dense_anchor_stride)),
             "basis_rank": int(config_payload.get("basis_rank", args.basis_rank)),
-            # basis_top_k: latent coordinate sparsity. Default = basis_rank (all coords active,
-            # no latent sparsity). Output-block sparsity is controlled separately by top_k.
+
+
             "basis_top_k": int(config_payload.get("basis_top_k", args.basis_top_k)),
             "pca_method": str(config_payload.get("pca_method", args.pca_method)),
             "pca_batch_rows": int(config_payload.get("pca_batch_rows", args.pca_batch_rows)),
@@ -415,16 +396,16 @@ def _build_basis_payload(
 def _save_basis_resume(
     *,
     resume_path: Path,
-    layer_states: Dict[str, Dict[str, torch.Tensor]],
-    stats: Dict[str, Dict[str, float]],
-    layer_x: Dict[int, List[torch.Tensor]],
-    layer_y: Dict[int, List[torch.Tensor]],
-    selected_layers: List[int],
+    layer_states: dict[str, dict[str, torch.Tensor]],
+    stats: dict[str, dict[str, float]],
+    layer_x: dict[int, list[torch.Tensor]],
+    layer_y: dict[int, list[torch.Tensor]],
+    selected_layers: list[int],
     include_buffers: bool,
-    layer_kv_x: Optional[Dict[int, List[torch.Tensor]]] = None,
-    layer_kv_rows: Optional[Dict[int, int]] = None,
+    layer_kv_x: dict[int, list[torch.Tensor]] | None = None,
+    layer_kv_rows: dict[int, int] | None = None,
 ) -> None:
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "layer_states": layer_states,
         "stats": stats,
     }
@@ -442,13 +423,13 @@ def _save_basis_output(
     *,
     output_path: Path,
     args: argparse.Namespace,
-    selected_layers: List[int],
-    layer_states: Dict[str, Dict[str, torch.Tensor]],
-    stats: Dict[str, Dict[str, float]],
+    selected_layers: list[int],
+    layer_states: dict[str, dict[str, torch.Tensor]],
+    stats: dict[str, dict[str, float]],
     block_size: int,
     num_blocks: int,
-    overrides: Dict[str, Dict[int, int]],
-    existing_config: Optional[Dict[str, Any]] = None,
+    overrides: dict[str, dict[int, int]],
+    existing_config: dict[str, Any] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -562,7 +543,7 @@ def main() -> None:
         raise RuntimeError("--hybrid-checkpoint is required unless --use-streaming-harness is enabled")
     _output_path = Path(args.output_path)
     _resume_path = _output_path.with_suffix(".resume.pt")
-    _existing_output: Dict[str, Any] = {}
+    _existing_output: dict[str, Any] = {}
     if _output_path.exists():
         try:
             _loaded_output = torch.load(_output_path, map_location="cpu")
@@ -609,13 +590,13 @@ def main() -> None:
                 decode_guard_layers=_effective_decode_guard_layers,
                 dense_anchor_stride=_effective_dense_anchor_stride,
             )
-        layer_states: Dict[str, Dict[str, torch.Tensor]] = {}
+        layer_states: dict[str, dict[str, torch.Tensor]] = {}
         if not bool(args.no_resume) and _resume_path.exists():
             _resume_data = torch.load(_resume_path, map_location="cpu")
             layer_states = _resume_data.get("layer_states", {})
         elif not bool(args.no_resume) and _existing_output:
             layer_states = _existing_output.get("layer_states", {})
-        completed_layers = sorted(int(_k) for _k in layer_states.keys())
+        completed_layers = sorted(int(_k) for _k in layer_states)
         selected_layers = list(requested_layers)
         if bool(args.only_missing_from_output):
             selected_layers = [int(idx) for idx in selected_layers if int(idx) not in set(completed_layers)]
@@ -665,9 +646,9 @@ def main() -> None:
         min_text_chars=int(args.min_text_chars),
     )
 
-    artifact: Dict[str, Any] = {}
-    model: Optional[NeuroplasticLlama] = None
-    runtime: Optional[StreamingLlamaRuntime] = None
+    artifact: dict[str, Any] = {}
+    model: NeuroplasticLlama | None = None
+    runtime: StreamingLlamaRuntime | None = None
     _batch_count: int = 0
     if bool(args.use_streaming_harness):
         parsed_taylor_layers = _parse_layers(args.taylor_layers)
@@ -683,6 +664,8 @@ def main() -> None:
             local_files_only=bool(args.local_files_only),
             ram_cache=False,
             materialize_lm_head=False,
+            sparse_basis_path=str(_output_path) if _existing_output and _existing_output.get("layer_states") else None,
+            vram_hot_cache_gb=0.0,
         )
         _explicit_layers = _parse_layers(args.layers)
         if _explicit_layers is not None:
@@ -713,6 +696,11 @@ def main() -> None:
         else:
             raise RuntimeError(f"Unsupported artifact target: {_artifact_target}")
     else:
+        if NeuroplasticLlama is None:
+            raise RuntimeError(
+                "The legacy NeuroplasticLlama fitting path is unavailable. "
+                "Use --use-streaming-harness for the maintained streaming basis fitting path."
+            )
         artifact = torch.load(args.hybrid_checkpoint, map_location="cpu")
         if not isinstance(artifact, dict):
             raise RuntimeError("Hybrid checkpoint must be a dict artifact")
@@ -752,12 +740,12 @@ def main() -> None:
         num_blocks = int(model.sca_config.num_blocks)
 
     requested_layers = list(selected_layers)
-    layer_states: Dict[str, Dict[str, torch.Tensor]] = {}
-    stats: Dict[str, Dict[str, float]] = {}
-    _loaded_layer_x: Dict[int, List[torch.Tensor]] = {}
-    _loaded_layer_y: Dict[int, List[torch.Tensor]] = {}
-    _loaded_layer_kv_x: Dict[int, List[torch.Tensor]] = {}
-    _loaded_layer_kv_rows: Dict[int, int] = {}
+    layer_states: dict[str, dict[str, torch.Tensor]] = {}
+    stats: dict[str, dict[str, float]] = {}
+    _loaded_layer_x: dict[int, list[torch.Tensor]] = {}
+    _loaded_layer_y: dict[int, list[torch.Tensor]] = {}
+    _loaded_layer_kv_x: dict[int, list[torch.Tensor]] = {}
+    _loaded_layer_kv_rows: dict[int, int] = {}
     if not bool(args.no_resume) and _resume_path.exists():
         _resume_data = torch.load(_resume_path, map_location="cpu")
         layer_states = _resume_data.get("layer_states", {})
@@ -779,7 +767,7 @@ def main() -> None:
             flush=True,
         )
 
-    _completed_layer_ids = {int(_k) for _k in layer_states.keys()}
+    _completed_layer_ids = {int(_k) for _k in layer_states}
     if bool(args.only_missing_from_output):
         selected_layers = [int(idx) for idx in selected_layers if int(idx) not in _completed_layer_ids]
     selected_layers = _slice_layer_chunk(
@@ -820,20 +808,20 @@ def main() -> None:
         )
         return
 
-    layer_x: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
-    layer_y: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
-    layer_rows: Dict[int, int] = {int(idx): 0 for idx in selected_layers}
+    layer_x: dict[int, list[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
+    layer_y: dict[int, list[torch.Tensor]] = {int(idx): [] for idx in selected_layers}
+    layer_rows: dict[int, int] = {int(idx): 0 for idx in selected_layers}
 
-    # KV co-collection setup (streaming harness only)
-    _kv_output_path: Optional[Path] = (
+
+    _kv_output_path: Path | None = (
         Path(str(args.kv_basis_output_path))
         if bool(args.use_streaming_harness) and str(args.kv_basis_output_path).strip()
         else None
     )
     _do_kv = _kv_output_path is not None
-    layer_kv_x: Dict[int, List[torch.Tensor]] = {int(idx): [] for idx in selected_layers} if _do_kv else {}
-    layer_kv_rows: Dict[int, int] = {int(idx): 0 for idx in selected_layers} if _do_kv else {}
-    kv_layer_states: Dict[str, Any] = {}
+    layer_kv_x: dict[int, list[torch.Tensor]] = {int(idx): [] for idx in selected_layers} if _do_kv else {}
+    layer_kv_rows: dict[int, int] = {int(idx): 0 for idx in selected_layers} if _do_kv else {}
+    kv_layer_states: dict[str, Any] = {}
     max_rows = int(max(args.max_rows_per_layer, 32))
     _kv_max_rows = int(max(args.kv_max_rows, 32)) if _do_kv else max_rows
     rollout_tokens = int(max(args.dense_rollout_tokens, 1))
@@ -859,30 +847,30 @@ def main() -> None:
     _partial_output_every_batches = max(int(args.write_partial_output_every_batches), 0)
     overrides = _load_profile_overrides(str(args.profile_path))
 
-    # --- EVR-adaptive fitting thresholds -----------------------------------
-    # _fit_threshold: minimum rows before we attempt a first fit.
-    # basis_fitting.py clamps rank_eff = min(basis_rank, rows) and pads zeros for
-    # missing rows, so any number of rows >= 1 is mathematically valid.  We only
-    # need enough rows to make the lstsq well-conditioned; _effective_basis_rank rows
-    # is sufficient (same as the number of latent dimensions we are fitting).
-    # The previous floor of max(64, max_rows // 8) caused a one-off failure when
-    # per-sample token count was exactly basis_rank - 1 (e.g. 63 rows with rank 64).
-    # _EVR_LOW: if explained-variance-ratio < this after a fit, the basis is too
-    #   poor to trust; keep collecting and re-fit at 2× the current row count.
-    # _EVR_HIGH: EVR at or above this is "excellent" — accept without waiting for
-    #   more data (the current early-stop behaviour, unchanged).
-    # _layer_next_fit_at: per-layer "don't try to fit until this many rows" counter.
-    #   Starts at _fit_threshold for every layer; bumped to 2× on poor-EVR fits.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     _fit_threshold = max(int(_effective_basis_rank) - 1, 1)
-    # EVR thresholds.  Rank-64 PCA on 16384-dim MLP outputs achieves 0.15–0.42
-    # EVR regardless of how many calibration rows are collected (rank limitation,
-    # not data quantity).  Setting _EVR_LOW = 0.0 prevents the "keep collecting
-    # and refit at 2× rows" loop from running indefinitely on layers that can
-    # never exceed the rank ceiling.  All fits are accepted on the first attempt.
+
+
+
+
+
     _EVR_LOW: float = 0.0
     _EVR_HIGH: float = 0.85
-    _layer_next_fit_at: Dict[int, int] = {int(idx): _fit_threshold for idx in selected_layers}
-    # -----------------------------------------------------------------------
+    _layer_next_fit_at: dict[int, int] = {int(idx): _fit_threshold for idx in selected_layers}
+
 
     for batch in dataloader:
         if runtime is not None:
@@ -1003,14 +991,14 @@ def main() -> None:
             print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info} [out]", flush=True)
         else:
             print(f"[pass done] {_rows_done} fitted, {_rows_partial} collecting{_row_info}", flush=True)
-        # Fit layers that have collected enough rows.
-        # Each layer has an independent _layer_next_fit_at milestone (starts at
-        # _fit_threshold). After a fit, EVR decides what happens:
-        #   EVR >= _EVR_LOW  → accept the fit, stop collecting for this layer.
-        #   EVR <  _EVR_LOW  → basis too poor; keep all collected rows and
-        #                       re-fit when row count doubles (capped at max_rows).
-        # At max_rows capacity we always accept, whatever the EVR, since there is
-        # no more data to gather.
+
+
+
+
+
+
+
+
         for layer_idx in selected_layers:
             if str(layer_idx) in layer_states or layer_rows[layer_idx] < _layer_next_fit_at[layer_idx]:
                 continue
@@ -1032,7 +1020,7 @@ def main() -> None:
             _evr = float(_fitted.get("explained_variance_ratio", 1.0))
             _at_capacity = layer_rows[layer_idx] >= max_rows
             if _evr >= _EVR_LOW or _at_capacity:
-                # Accept: EVR is good enough, or we have used all the data we will get.
+
                 _evr_tag = (
                     "excellent" if _evr >= _EVR_HIGH
                     else ("acceptable" if _evr >= _EVR_LOW else "best-effort")
@@ -1047,7 +1035,7 @@ def main() -> None:
                     "explained_variance_ratio": _evr,
                     "pca_method": str(_fitted.get("pca_method", _effective_pca_method)),
                 }
-                # Stop collecting for this layer.
+
                 layer_rows[layer_idx] = max_rows
                 layer_x[layer_idx].clear()
                 layer_y[layer_idx].clear()
@@ -1082,8 +1070,8 @@ def main() -> None:
                     flush=True,
                 )
             else:
-                # Poor fit: keep the collected data and schedule a re-fit once the
-                # row count doubles (or reaches max_rows, whichever comes first).
+
+
                 _next_milestone = min(layer_rows[layer_idx] * 2, max_rows)
                 _layer_next_fit_at[layer_idx] = _next_milestone
                 print(
@@ -1102,7 +1090,7 @@ def main() -> None:
         if _mlp_done and _kv_done:
             break
 
-    # Fit any layers that stopped short of max_rows (e.g. dataset exhausted early)
+
     for layer_idx in selected_layers:
         if str(layer_idx) in layer_states:
             continue
@@ -1156,7 +1144,7 @@ def main() -> None:
     )
     print(json.dumps({"output_path": str(_output_path), "layers_initialized": len(layer_states), "stats": stats}, indent=2))
 
-    # ── KV basis fitting (same collected h_norm data, zero extra forward passes) ──
+
     if _do_kv and _kv_output_path is not None and runtime is not None:
         print("[kv_basis] fitting K/V routing basis from co-collected activations...", flush=True)
         _kv_hidden_size = int(getattr(runtime.config, "hidden_size", 16384))
@@ -1175,7 +1163,7 @@ def main() -> None:
             print(f"[kv_basis] layer {layer_idx}: fitting on {int(x.shape[0])} rows...", flush=True)
             fitted_kv = _fit_kv_basis_fn(
                 x=x,
-                kv_out=torch.zeros(int(x.shape[0]), _kv_kv_hidden),  # unused in routing fit
+                kv_out=torch.zeros(int(x.shape[0]), _kv_kv_hidden),
                 basis_rank=int(args.kv_basis_rank),
                 block_size=_kv_block_size,
                 hidden_size=_kv_hidden_size,

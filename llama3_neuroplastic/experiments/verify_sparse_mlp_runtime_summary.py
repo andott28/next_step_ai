@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import torch
 
 try:
     from .streaming_llama_runtime import StreamingLlamaRuntime
-except ImportError:  # pragma: no cover
-    from streaming_llama_runtime import StreamingLlamaRuntime  # type: ignore
+except ImportError:
+    from streaming_llama_runtime import StreamingLlamaRuntime
 
 
 def _parse_device(device_name: str) -> torch.device:
@@ -66,7 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _count_matches(counts: Dict[str, int], key: str, expected_total: int) -> bool:
+def _count_matches(counts: dict[str, int], key: str, expected_total: int) -> bool:
     return int(counts.get(str(key), 0)) == int(expected_total)
 
 
@@ -90,13 +90,13 @@ def main() -> int:
     )
 
     summary = runtime.get_sparse_mlp_summary()
-    layer_infos: List[Dict[str, Any]] = []
+    layer_infos: list[dict[str, Any]] = []
     for layer_idx in sorted(runtime._sparse_routing.keys()):
         info = runtime.get_sparse_mlp_layer_info(int(layer_idx))
         if info is not None:
             layer_infos.append(info)
 
-    errors: List[str] = []
+    errors: list[str] = []
     loaded_layers = int(summary.get("layers", 0))
     if loaded_layers < int(args.min_layers):
         errors.append(f"loaded sparse layers {loaded_layers} < required minimum {int(args.min_layers)}")
@@ -123,7 +123,7 @@ def main() -> int:
     if int(args.expect_num_blocks) > 0 and unique_num_blocks != [int(args.expect_num_blocks)]:
         errors.append(f"unique_num_blocks={unique_num_blocks} != expected [{int(args.expect_num_blocks)}]")
 
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "model_name": str(args.model_name),
         "sparse_basis_path": str(args.sparse_basis_path),
         "runtime_summary": summary,

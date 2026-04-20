@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +7,7 @@ import torch.nn.functional as F
 try:
     from .sca_sparse_config import SCASparseConfig
     from .triton_sca_gate import triton_compute_active_blocks_topk, triton_sca_gate_available
-except ImportError:  # Script-mode fallback (non-package import path)
+except ImportError:
     from sca_sparse_config import SCASparseConfig
     from triton_sca_gate import triton_compute_active_blocks_topk, triton_sca_gate_available
 
@@ -19,9 +16,9 @@ def compute_active_blocks_torch(
     query: torch.Tensor,
     block_centers: torch.Tensor,
     config: SCASparseConfig,
-    refractory_mask: Optional[torch.Tensor] = None,
-    inhibition_matrix: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    refractory_mask: torch.Tensor | None = None,
+    inhibition_matrix: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     query: [N, 3]
     block_centers: [num_blocks, 3]
@@ -46,7 +43,7 @@ def compute_active_blocks_torch(
         inhibition = torch.matmul(scores, inhibition_matrix.to(dtype=scores.dtype))
         scores = scores - (config.inhibition_lambda * inhibition)
 
-    # Deterministic tie-break: lower block index wins.
+
     index_bias = (
         torch.arange(scores.shape[1], device=scores.device, dtype=scores.dtype).unsqueeze(0) * 1e-6
     )
@@ -65,7 +62,7 @@ def _apply_adaptive_top_k(
     active_idx: torch.Tensor,
     active_score: torch.Tensor,
     config: SCASparseConfig,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if not bool(config.adaptive_top_k):
         return active_idx, active_score
     if active_idx.numel() == 0:
@@ -119,8 +116,8 @@ class SCABlockSparseAdapter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
-        active_score: Optional[torch.Tensor] = None,
-        score_weights: Optional[torch.Tensor] = None,
+        active_score: torch.Tensor | None = None,
+        score_weights: torch.Tensor | None = None,
         use_cuda_kernel: bool = False,
         cuda_kernels=None,
     ) -> torch.Tensor:
@@ -138,13 +135,13 @@ class SCABlockSparseAdapter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
-        active_score: Optional[torch.Tensor],
-        score_weights: Optional[torch.Tensor],
+        active_score: torch.Tensor | None,
+        score_weights: torch.Tensor | None,
         cuda_kernels,
     ) -> torch.Tensor:
         flat_hidden = hidden_states.reshape(-1, self.hidden_size).contiguous()
 
-        # CUDA extension currently expects FP16 tensors.
+
         hidden_fp16 = flat_hidden.to(dtype=torch.float16)
         delta = cuda_kernels.sparse_adapter(
             hidden_fp16,
@@ -155,9 +152,9 @@ class SCABlockSparseAdapter(nn.Module):
             self.up_b.contiguous(),
         )
         if score_weights is None and active_score is not None:
-            # Current CUDA kernel does not consume scores directly. Keep API parity:
-            # scale per-selected block in a lightweight torch pass.
-            # This path is mainly for eval/inference, so this branch is rarely used.
+
+
+
             valid_mask = active_idx >= 0
             raw = active_score.to(device=delta.device, dtype=delta.dtype)
             neg_inf = torch.full_like(raw, float("-inf"))
@@ -186,8 +183,8 @@ class SCABlockSparseAdapter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         active_idx: torch.Tensor,
-        active_score: Optional[torch.Tensor] = None,
-        score_weights: Optional[torch.Tensor] = None,
+        active_score: torch.Tensor | None = None,
+        score_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, seq_len, hidden = hidden_states.shape
         n_rows = batch * seq_len
@@ -234,7 +231,7 @@ class SCABlockSparseAdapter(nn.Module):
         return delta
 
     def dense_adapter_flops_per_token(self) -> float:
-        # 2*in*out for down + 2*in*out for up across all blocks.
+
         return float(4 * self.hidden_size * self.block_rank)
 
     def sparse_adapter_flops_per_token(self, mean_active_blocks: float) -> float:
@@ -246,18 +243,18 @@ def compute_active_blocks(
     query: torch.Tensor,
     block_centers: torch.Tensor,
     config: SCASparseConfig,
-    refractory_until: Optional[torch.Tensor],
+    refractory_until: torch.Tensor | None,
     step: int,
     decode_mode: bool,
-    inhibition_matrix: Optional[torch.Tensor],
+    inhibition_matrix: torch.Tensor | None,
     use_cuda_kernel: bool,
     cuda_kernels,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     refractory_mask = None
     if decode_mode and refractory_until is not None:
         refractory_mask = refractory_until > step
 
-    # Prefer Triton gate on CUDA to avoid custom extension build/runtime dependencies.
+
     if (
         use_cuda_kernel
         and query.is_cuda
@@ -277,7 +274,7 @@ def compute_active_blocks(
             idx, score = _apply_adaptive_top_k(active_idx=idx.long(), active_score=score.float(), config=config)
             return idx.long(), score.float()
         except Exception:
-            # Keep robust fallback to extension/torch path on any Triton runtime mismatch.
+
             pass
 
     if use_cuda_kernel and cuda_kernels is not None and query.is_cuda:

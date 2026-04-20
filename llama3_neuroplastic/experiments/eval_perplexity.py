@@ -25,24 +25,24 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import torch
 
 try:
     from datasets import load_dataset
 except ImportError:
-    load_dataset = None  # type: ignore
+    load_dataset = None
 
 try:
     from transformers import AutoTokenizer
 except ImportError:
-    AutoTokenizer = None  # type: ignore
+    AutoTokenizer = None
 
 try:
     from .streaming_llama_runtime import StreamingLlamaRuntime
 except ImportError:
-    from streaming_llama_runtime import StreamingLlamaRuntime  # type: ignore
+    from streaming_llama_runtime import StreamingLlamaRuntime
 
 
 def _build_token_corpus(
@@ -57,7 +57,7 @@ def _build_token_corpus(
     if load_dataset is None:
         raise RuntimeError("datasets package is required: pip install datasets")
     dataset = load_dataset(dataset_name, dataset_config, split=dataset_split, streaming=True)
-    all_ids: List[int] = []
+    all_ids: list[int] = []
     for row in dataset:
         text = str(row.get(text_column, "") or "").strip()
         if not text:
@@ -75,7 +75,7 @@ def evaluate_perplexity(
     *,
     stride: int = 512,
     context_len: int = 2048,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Sliding-window perplexity evaluation.
 
     Splits ``token_ids`` into overlapping windows of ``context_len`` tokens
@@ -89,39 +89,39 @@ def evaluate_perplexity(
     if total_tokens < 2:
         raise ValueError("Need at least 2 tokens to evaluate perplexity")
 
-    nlls: List[float] = []
+    nlls: list[float] = []
     evaluated_tokens = 0
 
     prev_end = 0
     for begin in range(0, total_tokens - 1, stride):
         end = min(begin + context_len, total_tokens)
-        target_begin = max(begin, prev_end)  # avoid double-counting
+        target_begin = max(begin, prev_end)
         if target_begin >= end - 1:
             prev_end = end
             continue
 
-        input_ids = token_ids[begin:end].unsqueeze(0)  # [1, seq_len]
+        input_ids = token_ids[begin:end].unsqueeze(0)
         target_ids = token_ids[begin + 1 : end + 1]
 
-        # Run a single forward pass through the runtime to get logits.
-        # We use the raw generate hook to avoid sampling — just get the
-        # logit tensor for all prompt positions.
+
+
+
         with torch.no_grad():
-            logits_all = _run_forward_only(runtime, input_ids)  # [1, seq_len, vocab]
+            logits_all = _run_forward_only(runtime, input_ids)
 
         if logits_all is None:
             print(f"[ppl] WARNING: forward pass returned None for window [{begin}:{end}], skipping")
             prev_end = end
             continue
 
-        # Only score the non-context tokens (target_begin..end-1).
+
         score_start = int(target_begin - begin)
-        score_end = int(end - 1 - begin)  # last target token index in window
+        score_end = int(end - 1 - begin)
         if score_start >= score_end:
             prev_end = end
             continue
 
-        logits_slice = logits_all[0, score_start:score_end, :].float()  # [T, V]
+        logits_slice = logits_all[0, score_start:score_end, :].float()
         target_slice = target_ids[score_start:score_end].to(logits_slice.device)
 
         nll = torch.nn.functional.cross_entropy(logits_slice, target_slice, reduction="sum").item()
@@ -158,11 +158,11 @@ def evaluate_perplexity(
 def _run_forward_only(
     runtime: StreamingLlamaRuntime,
     input_ids: torch.LongTensor,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """Run a single prefill pass and return logits for all positions.
 
-    This bypasses the generate() sampling loop and directly calls _forward_prefill
-    to get the full logit tensor for perplexity scoring.
+    This bypasses the generate() sampling loop and uses the runtime prefill
+    façade before replaying token logits for perplexity scoring.
     """
     runtime.reset_caches()
     seq_len = int(input_ids.shape[1])
@@ -170,24 +170,26 @@ def _run_forward_only(
         return None
     try:
         with torch.no_grad():
-            last_logits = runtime._forward_prefill(input_ids.to(runtime.device))
-        # _forward_prefill only returns logits for the last token position.
-        # For full perplexity scoring we need all positions.
-        # Fall back to a token-by-token loop for the full sequence.
-        # This is slow but correct.
+            runtime.begin_traffic_phase("prefill")
+            runtime.prefill_logits(input_ids.to(runtime.device))
+
+
+
+
         runtime.reset_caches()
         logits_list = []
+        runtime.begin_traffic_phase("decode")
         for pos in range(seq_len - 1):
             tok = input_ids[:, pos : pos + 1].to(runtime.device)
-            logits_step, _ = runtime.forward_token(tok, position_index=pos)
+            logits_step = runtime.decode_token_logits(tok, position_index=pos)
             logits_list.append(logits_step.cpu())
-        return torch.cat(logits_list, dim=1)  # [1, seq_len-1, vocab]
+        return torch.cat(logits_list, dim=1)
     except Exception as exc:
         print(f"[ppl] forward pass error: {type(exc).__name__}: {exc}", flush=True)
         return None
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Evaluate streaming runtime perplexity")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--sparse-basis-path", default=None)
@@ -222,9 +224,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     print(f"[ppl] Corpus: {token_ids.shape[0]} tokens", flush=True)
 
-    print(f"[ppl] Initializing StreamingLlamaRuntime ...", flush=True)
+    print("[ppl] Initializing StreamingLlamaRuntime ...", flush=True)
     runtime = StreamingLlamaRuntime(
-        model_name=args.model_name,
+        model_name_or_path=args.model_name,
         sparse_basis_path=args.sparse_basis_path,
         attn_head_importance_path=args.attn_head_importance_path,
         kv_basis_path=args.kv_basis_path,

@@ -1,13 +1,6 @@
 from __future__ import annotations
 
-# sca_sparse_kv.py
-# Dynamic SCA-style block bank for K/V projections.
-# The core idea: W_K is [kv_hidden, hidden_size]. K = x @ W_K^T decomposes into
-# 512 column-blocks of size 32. A latent router predicts which ~51 blocks (10%)
-# are active for each token. Only those blocks are loaded over PCIe.
-
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -41,7 +34,7 @@ def route_kv_blocks(
     hidden: torch.Tensor,
     routing: dict,
     *,
-    banked_mask: Optional[torch.Tensor] = None,
+    banked_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Route K/V column blocks for the given hidden states.
 
@@ -62,21 +55,21 @@ def route_kv_blocks(
     dec_norm_t = routing["dec_norm_t"]
     top_k = int(routing["top_k"])
 
-    # Flatten any batch/seq dims into N
+
     N = int(hidden.shape[0]) if hidden.ndim == 2 else int(hidden.shape[0] * hidden.shape[1])
     h = hidden.reshape(N, -1).to(device=enc_w.device, dtype=enc_w.dtype)
 
-    # Encode: [N, basis_rank]
+
     latent = F.silu(F.linear(h, enc_w, enc_b))
-    # Score: [N, num_col_blocks]
+
     scores = torch.matmul(latent.abs(), dec_norm_t)
 
     if banked_mask is not None:
-        # banked_mask: bool [num_col_blocks], True = banked (exclude)
+
         scores[:, banked_mask.to(device=scores.device)] = float("-inf")
 
     top_k = max(1, min(top_k, int(scores.shape[-1])))
-    return scores.topk(top_k, dim=-1).indices  # [N, top_k]
+    return scores.topk(top_k, dim=-1).indices
 
 
 def update_kv_block_banking(
@@ -106,7 +99,7 @@ def update_kv_block_banking(
     """
     num_blocks = int(usage_ema.numel())
 
-    # Determine which blocks were used this step
+
     used = active_blocks.reshape(-1).cpu()
     used = used[(used >= 0) & (used < num_blocks)]
 
@@ -119,11 +112,11 @@ def update_kv_block_banking(
         )
         current_usage = (current_usage > 0).float()
 
-    # Update EMA
+
     usage_ema.mul_(ema_decay)
     usage_ema.add_(current_usage * (1.0 - ema_decay))
 
-    # Banking logic
+
     low_mask = usage_ema < low_threshold
     in_cooldown = banked_until > step
     vote_mask = low_mask & ~in_cooldown

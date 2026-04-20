@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
+import llama3_neuroplastic.experiments.runtime.safetensor_loader as _sft_loader_mod
 from llama3_neuroplastic import token_posting_archive as posting_mod
 from llama3_neuroplastic.experiments import init_attn_share as attn_share_mod
 from llama3_neuroplastic.experiments import run_streaming_inference as cli_mod
@@ -32,7 +32,7 @@ def test_loader_reopens_shards_when_cache_disabled(tmp_path, monkeypatch) -> Non
         opened_paths.append(str(path))
         return {key: torch.tensor([len(opened_paths)], dtype=torch.float32) for key in keys}
 
-    monkeypatch.setattr(runtime_mod, "_load_safetensors_direct", _fake_load_safetensors_direct)
+    monkeypatch.setattr(_sft_loader_mod, "_load_safetensors_direct", _fake_load_safetensors_direct)
     loader = runtime_mod.ShardedSafetensorLoader(tmp_path, cache_shard_handles=False)
 
     first = loader._load_exact_tensors(["model.layers.0.mlp.up_proj.weight"])
@@ -65,7 +65,7 @@ def test_loader_reuses_shards_when_cache_enabled(tmp_path, monkeypatch) -> None:
         opened_paths.append(path)
         return _FakeHandle(path)
 
-    monkeypatch.setattr(runtime_mod, "safe_open", _fake_safe_open)
+    monkeypatch.setattr(_sft_loader_mod, "safe_open", _fake_safe_open)
     loader = runtime_mod.ShardedSafetensorLoader(tmp_path, cache_shard_handles=True)
 
     loader._load_exact_tensors(["model.layers.0.mlp.up_proj.weight"])
@@ -171,8 +171,8 @@ def _make_sparse_runtime_stub() -> runtime_mod.StreamingLlamaRuntime:
     runtime._sparse_block_size = 2
     runtime._sparse_checkpoint_basis_rank = 2
     runtime._sparse_semantic_block_score_normalized = False
-    runtime._sparse_mlp_execution_request = "output_basis_surrogate"
-    runtime._sparse_basis_execution = "output_basis_surrogate"
+    runtime._sparse_mlp_execution_request = "exact_intermediate_sparse"
+    runtime._sparse_basis_execution = "exact_intermediate_sparse"
     runtime._sparse_mlp_prefill_mode = "sparse"
     runtime._traffic_current_phase = "decode"
     runtime._mlp_hot_blocks_by_layer = {}
@@ -215,186 +215,131 @@ def test_route_sparse_mlp_uses_masked_latent_support() -> None:
     assert int(active_blocks.item()) == 0
 
 
-def test_maybe_fit_local_decode_guard_basis_registers_session_sparse_route(monkeypatch) -> None:
-    runtime = _make_sparse_runtime_stub()
-    runtime._upper_decode_guard_layers = {5}
-
-    monkeypatch.setattr(
-        runtime_mod,
-        "fit_layer_basis",
-        lambda **kwargs: {
-            "encoder_weight": torch.eye(2, 4, dtype=torch.float32),
-            "encoder_bias": torch.zeros(2, dtype=torch.float32),
-            "decoder_blocks": torch.ones((2, 2, 2), dtype=torch.float32),
-            "decoder_bias": torch.zeros((2, 2), dtype=torch.float32),
-            "scale": torch.tensor(1.0, dtype=torch.float32),
-        },
-    )
-
-    mlp_input = torch.ones((1, 2, 4), dtype=torch.float32)
-    mlp_out = torch.ones((1, 2, 4), dtype=torch.float32)
-    runtime._maybe_fit_local_decode_guard_basis(5, mlp_input, mlp_out)
-
-    assert 5 in runtime._sparse_routing
-    assert runtime._sparse_top_k_by_layer[5] == 1
-    assert runtime._sparse_basis_top_k_by_layer[5] == 2
-    assert 5 in runtime._session_sparse_route_layers
-
-
-def test_forward_learned_basis_mlp_applies_bias_only_to_selected_blocks() -> None:
-    runtime = _make_sparse_runtime_stub()
-    runtime._sparse_routing[0] = {
-        "enc_w": torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
-        "enc_b": torch.zeros(1, dtype=torch.float32),
-        "dec": torch.tensor(
-            [
-                [[1.0, 2.0]],
-                [[3.0, 4.0]],
-            ],
-            dtype=torch.float32,
-        ),
-        "dec_bias": torch.tensor(
-            [
-                [10.0, 20.0],
-                [30.0, 40.0],
-            ],
-            dtype=torch.float32,
-        ),
-        "scale": 1.0,
-        "basis_top_k": 1,
+def test_calibrate_vram_hot_cache_replaces_blocks_without_expanding_budget() -> None:
+    runtime = runtime_mod.StreamingLlamaRuntime.__new__(runtime_mod.StreamingLlamaRuntime)
+    runtime.device = torch.device("cpu")
+    runtime._vram_hot_cache_enabled = True
+    runtime._vram_hot_cache_used_bytes = 0
+    runtime._traffic_current_phase = "decode"
+    runtime._sparse_mlp_prefill_mode = "hot_cache"
+    runtime._hot_cache_calibration_active = False
+    runtime._hot_cache_calibration_hits = {}
+    runtime._sparse_num_blocks = 8
+    runtime._sparse_runtime_top_k = 4
+    runtime._sparse_top_k = 4
+    runtime._sparse_routing = {
+        0: {"num_blocks": 8, "top_k": 4},
+        1: {"num_blocks": 8, "top_k": 4},
+    }
+    runtime._mlp_hot_blocks_by_layer = {
+        0: torch.tensor([0, 1], dtype=torch.long),
+        1: torch.tensor([2], dtype=torch.long),
     }
 
-    hidden = torch.tensor([[[2.0, 0.0, 0.0, 0.0]]], dtype=torch.float32)
-    active_blocks = torch.tensor([[1]], dtype=torch.long)
-    out = runtime._forward_learned_basis_mlp(0, hidden, active_blocks)
+    reset_calls = []
+    rebuild_calls = []
+    clear_calls = []
 
-    latent = torch.tensor(2.0)
-    expected = torch.tensor(
-        [[[0.0, 0.0, latent * 3.0 + 30.0, latent * 4.0 + 40.0]]],
-        dtype=torch.float32,
+    def _set_traffic_phase(phase: str) -> None:
+        runtime._traffic_current_phase = str(phase)
+
+    def _fake_forward_prefill(token_ids: torch.LongTensor, *, compute_logits: bool = True) -> torch.Tensor:
+        assert token_ids.shape == (1, 3)
+        assert compute_logits is False
+        assert runtime._traffic_current_phase == "prefill"
+        assert runtime._sparse_mlp_prefill_mode == "sparse"
+        assert runtime._hot_cache_calibration_active is True
+        runtime._record_hot_cache_calibration_blocks(0, torch.tensor([[3, 3, 4, 5], [3, 4, 4, 4]]))
+        runtime._record_hot_cache_calibration_blocks(1, torch.tensor([[7, 6, 7, 7]]))
+        return torch.empty((1, 3, 4), dtype=torch.float32)
+
+    runtime.reset_caches = lambda: reset_calls.append("reset")
+    runtime._set_traffic_phase = _set_traffic_phase
+    runtime._forward_prefill = _fake_forward_prefill
+    runtime._clear_vram_hot_cache_entries = lambda: clear_calls.append("clear")
+    runtime.pre_warm_vram_hot_cache = lambda: rebuild_calls.append("prewarm")
+
+    report = runtime.calibrate_vram_hot_cache(
+        torch.tensor([[10, 11, 12, 13, 14]], dtype=torch.long),
+        max_tokens=3,
+        rebuild_cache=True,
     )
-    assert torch.allclose(out, expected)
+
+    assert report["tokens"] == 3
+    assert report["updated_layers"] == 2
+    assert report["hits"] == 12
+    assert report["cached_blocks"] == 3
+    assert runtime._sparse_mlp_prefill_mode == "hot_cache"
+    assert runtime._traffic_current_phase == "decode"
+    assert runtime._hot_cache_calibration_active is False
+    assert torch.equal(runtime._mlp_hot_blocks_by_layer[0], torch.tensor([4, 3], dtype=torch.long))
+    assert torch.equal(runtime._mlp_hot_blocks_by_layer[1], torch.tensor([7], dtype=torch.long))
+    assert len(reset_calls) == 2
+    assert clear_calls == ["clear"]
+    assert rebuild_calls == ["prewarm"]
 
 
-def test_forward_learned_basis_mlp_full_output_reconstructs_all_blocks_from_sparse_latent() -> None:
-    runtime = _make_sparse_runtime_stub()
-    runtime._sparse_routing[0] = {
-        "enc_w": torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
-        "enc_b": torch.zeros(1, dtype=torch.float32),
-        "dec": torch.tensor(
-            [
-                [[1.0, 2.0]],
-                [[3.0, 4.0]],
-            ],
-            dtype=torch.float32,
-        ),
-        "dec_bias": torch.tensor(
-            [
-                [10.0, 20.0],
-                [30.0, 40.0],
-            ],
-            dtype=torch.float32,
-        ),
-        "scale": 1.0,
-        "basis_top_k": 1,
+def test_cached_sparse_param_rebuild_repins_hot_cache_entries() -> None:
+    runtime = runtime_mod.StreamingLlamaRuntime.__new__(runtime_mod.StreamingLlamaRuntime)
+    runtime._traffic_current_phase = "decode"
+    runtime._sparse_mlp_prefill_mode = "hot_cache"
+    runtime._sparse_param_cache = {
+        "model.layers.0.mlp.gate_proj.weight": {
+            "absmax_cpu": torch.arange(4, dtype=torch.float32),
+            "blocks_per_col": 2,
+            "bytes_per_block": 3,
+            "absmax_per_block": 2,
+        }
     }
+    load_calls = []
+    cache_calls = []
 
-    hidden = torch.tensor([[[2.0, 0.0, 0.0, 0.0]]], dtype=torch.float32)
-    out = runtime._forward_learned_basis_mlp_full_output(0, hidden)
+    def _load_raw_for_param(full_name: str, *, store_in_ram_cache: bool = True):
+        load_calls.append((full_name, bool(store_in_ram_cache)))
+        return torch.arange(6, dtype=torch.uint8), {}
 
-    latent = torch.tensor(2.0)
-    expected = torch.tensor(
-        [[[latent * 1.0 + 10.0, latent * 2.0 + 20.0, latent * 3.0 + 30.0, latent * 4.0 + 40.0]]],
-        dtype=torch.float32,
-    )
-    assert torch.allclose(out, expected)
+    def _maybe_cache_sparse_param_hot_blocks(full_name: str, param: dict) -> None:
+        cache_calls.append(full_name)
+        param["vram_hot"] = {"block_ids_cpu": torch.tensor([1], dtype=torch.long)}
 
+    runtime.loader = SimpleNamespace(_load_raw_for_param=_load_raw_for_param)
+    runtime._maybe_cache_sparse_param_hot_blocks = _maybe_cache_sparse_param_hot_blocks
 
-def test_mlp_forward_dispatch_uses_full_output_basis_for_covered_layers_and_guard_for_others(monkeypatch) -> None:
-    runtime = _make_sparse_runtime_stub()
-    runtime._sparse_routing = {2: {"dummy": torch.tensor(1.0), "block_domain": "output"}}
-    layer = SimpleNamespace(mlp=object())
-    mlp_input = torch.zeros((1, 1, 4), dtype=torch.float32)
-    calls = []
+    param = runtime._get_sparse_4bit_param("model.layers.0.mlp.gate_proj.weight")
 
-    def _fake_full_output(layer_idx: int, hidden: torch.Tensor) -> torch.Tensor:
-        calls.append(("full_output", int(layer_idx)))
-        return torch.full_like(hidden, 3.0)
-
-    def _fake_guard(layer_idx: int, mlp, hidden: torch.Tensor) -> torch.Tensor:
-        calls.append(("guard", int(layer_idx)))
-        return torch.full_like(hidden, 5.0)
-
-    monkeypatch.setattr(runtime, "_forward_learned_basis_mlp_full_output", _fake_full_output)
-    monkeypatch.setattr(runtime, "_dense_guard_mlp_forward_exact_chunked_4bit", _fake_guard)
-    monkeypatch.setattr(runtime, "_resolve_sparse_mlp_execution_for_routing", lambda layer_idx, routing=None: "output_basis_surrogate")
-
-    sparse_out = runtime._mlp_forward_dispatch(2, layer, mlp_input)
-    guard_out = runtime._mlp_forward_dispatch(1, layer, mlp_input)
-
-    assert torch.all(sparse_out == 3.0)
-    assert torch.all(guard_out == 5.0)
-    assert calls[0][0] == "full_output"
-    assert calls[0][1] == 2
-    assert calls[1] == ("guard", 1)
+    assert load_calls == [("model.layers.0.mlp.gate_proj.weight", True)]
+    assert cache_calls == ["model.layers.0.mlp.gate_proj.weight"]
+    assert "vram_hot" in param
+    assert "vram_hot" in runtime._sparse_param_cache["model.layers.0.mlp.gate_proj.weight"]
 
 
-def test_mlp_forward_dispatch_routed_block_mode_keeps_block_router(monkeypatch) -> None:
-    runtime = _make_sparse_runtime_stub()
-    runtime._sparse_mlp_execution_request = "routed_output_blocks"
-    runtime._sparse_basis_execution = "routed_output_blocks"
-    runtime._sparse_routing = {2: {"dummy": torch.tensor(1.0), "block_domain": "output"}}
-    layer = SimpleNamespace(mlp=object())
-    mlp_input = torch.zeros((1, 1, 4), dtype=torch.float32)
-    calls = []
+def test_sparse_param_metadata_only_skips_raw_load_when_hot_cache_exists() -> None:
+    runtime = runtime_mod.StreamingLlamaRuntime.__new__(runtime_mod.StreamingLlamaRuntime)
+    full_name = "model.layers.0.mlp.gate_proj.weight"
+    runtime._sparse_param_cache = {
+        full_name: {
+            "full_name": full_name,
+            "absmax_cpu": torch.arange(4, dtype=torch.float32),
+            "blocks_per_col": 2,
+            "bytes_per_block": 3,
+            "absmax_per_block": 2,
+            "vram_hot": {"block_ids_cpu": torch.tensor([1], dtype=torch.long)},
+        }
+    }
+    load_calls = []
 
-    monkeypatch.setattr(runtime, "_resolve_sparse_mlp_execution_for_routing", lambda layer_idx, routing=None: "routed_output_blocks")
-    monkeypatch.setattr(
-        runtime,
-        "_route_sparse_mlp",
-        lambda hidden, layer_idx: torch.tensor([[7]], dtype=torch.long) if int(layer_idx) == 2 else None,
-    )
+    def _load_raw_for_param(name: str, *, store_in_ram_cache: bool = True):
+        load_calls.append((name, bool(store_in_ram_cache)))
+        raise AssertionError("metadata-only sparse param access should not load raw weights")
 
-    def _fake_sparse(layer_idx: int, hidden: torch.Tensor, active_blocks: torch.Tensor) -> torch.Tensor:
-        calls.append(("routed_blocks", int(layer_idx), active_blocks.clone()))
-        return torch.full_like(hidden, 3.0)
+    runtime.loader = SimpleNamespace(_load_raw_for_param=_load_raw_for_param)
 
-    monkeypatch.setattr(runtime, "_forward_learned_basis_mlp", _fake_sparse)
+    param = runtime._get_sparse_4bit_param(full_name, require_raw=False)
 
-    sparse_out = runtime._mlp_forward_dispatch(2, layer, mlp_input)
-
-    assert torch.all(sparse_out == 3.0)
-    assert calls[0][0] == "routed_blocks"
-    assert calls[0][1] == 2
-    assert torch.equal(calls[0][2], torch.tensor([[7]], dtype=torch.long))
-
-
-def test_sparse_mlp_forward_fast_accepts_oracle_intermediate_mode(monkeypatch) -> None:
-    runtime = _make_sparse_runtime_stub()
-    runtime._sparse_mlp_execution_request = "exact_intermediate_sparse_oracle"
-    runtime._sparse_basis_execution = "exact_intermediate_sparse_oracle"
-    runtime._sparse_routing = {2: {"block_domain": "intermediate"}}
-    hidden = torch.zeros((1, 1, 4), dtype=torch.float32)
-    active_blocks = torch.tensor([[0, 1]], dtype=torch.long)
-    calls = []
-
-    monkeypatch.setattr(
-        runtime,
-        "_resolve_sparse_mlp_execution_for_routing",
-        lambda layer_idx, routing=None: "exact_intermediate_sparse_oracle",
-    )
-
-    def _fake_sparse(layer_idx, mlp, sparse_hidden, sparse_active_blocks):
-        calls.append((int(layer_idx), sparse_active_blocks.clone()))
-        return torch.full_like(sparse_hidden, 9.0)
-
-    monkeypatch.setattr(runtime, "_sparse_mlp_forward", _fake_sparse)
-
-    out = runtime._sparse_mlp_forward_fast(2, SimpleNamespace(), hidden, active_blocks)
-
-    assert torch.all(out == 9.0)
-    assert calls[0][0] == 2
-    assert torch.equal(calls[0][1], active_blocks)
+    assert load_calls == []
+    assert "packed_weight" not in param
+    assert "packed_blocks" not in param
+    assert param["vram_hot"]["block_ids_cpu"].tolist() == [1]
 
 
 def test_get_attn_active_heads_preserves_importance_ranking_when_trimming() -> None:
@@ -1031,7 +976,7 @@ def test_token_posting_select_candidates_preserves_token_scale_signal() -> None:
     archive.append_token(0, 1, k2, v)
     archive.append_token(0, 2, k3, v)
 
-    # Both archived tokens have the same latent direction; larger scale should rank first.
+
     cand = archive.select_candidates(
         layer_idx=0,
         group_idx=0,
@@ -1081,7 +1026,7 @@ def test_token_posting_fetch_shortlist_unions_multi_head_queries() -> None:
     )
     k_all, v_all = archive.fetch_shortlist_kv(layer_idx=0, group_idx=0, q_rep_gpu=q_multi, step=1, M=2)
 
-    # 2 archive candidates (union of both queries) + 1 token in ring.
+
     assert int(k_all.shape[0]) == 3
     assert int(v_all.shape[0]) == 3
 
@@ -1109,7 +1054,7 @@ def test_token_posting_warmup_supports_legacy_cache_conversion() -> None:
         key_mean=np.zeros((4,), dtype=np.float32),
     )
 
-    # [B=1, G=1, T=3, D=4]
+
     k = torch.tensor(
         [[[[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]]],
         dtype=torch.float32,

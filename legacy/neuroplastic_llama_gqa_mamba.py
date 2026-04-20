@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any
 
+import bitsandbytes.functional as bnb_functional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import bitsandbytes.functional as bnb_functional
 from transformers import BitsAndBytesConfig, LlamaForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
 try:
     from transformers.cache_utils import DynamicCache
-except Exception:  # pragma: no cover
+except Exception:
     DynamicCache = None
 
 try:
@@ -28,11 +30,6 @@ try:
         TieredContextPolicy,
         apply_retrieved_chunks_to_prompt,
     )
-    from .sca_sparse_adapter import compute_active_blocks
-    from .sca_decoder_mirror import DecoderMirrorConfig, SparseDecoderMirrorSCA
-    from .sca_sparse_config import SCASparseConfig, build_block_centers, build_inhibition_matrix
-    from .sca_sparse_mlp import SparseLlamaMLP, SparseRouteSelection
-    from .triton_sparse_mlp import materialize_linear_weight
     from .gqa_mamba_rank_collapse import (
         GQALayout,
         GQAMambaRankCollapseBlock,
@@ -44,7 +41,12 @@ try:
         TaylorSSDLayerCache,
     )
     from .paged_sparse_attention import SparseAttentionConfig, SparseAttentionRuntime
-except ImportError:  # Script-mode fallback
+    from .sca_decoder_mirror import DecoderMirrorConfig, SparseDecoderMirrorSCA
+    from .sca_sparse_adapter import compute_active_blocks
+    from .sca_sparse_config import SCASparseConfig, build_block_centers, build_inhibition_matrix
+    from .sca_sparse_mlp import SparseLlamaMLP, SparseRouteSelection
+    from .triton_sparse_mlp import materialize_linear_weight
+except ImportError:
     from bounded_context import (
         BoundedContextConfig,
         CodeRepoMemoryIndex,
@@ -55,11 +57,6 @@ except ImportError:  # Script-mode fallback
         TieredContextPolicy,
         apply_retrieved_chunks_to_prompt,
     )
-    from sca_sparse_adapter import compute_active_blocks
-    from sca_decoder_mirror import DecoderMirrorConfig, SparseDecoderMirrorSCA
-    from sca_sparse_config import SCASparseConfig, build_block_centers, build_inhibition_matrix
-    from sca_sparse_mlp import SparseLlamaMLP, SparseRouteSelection
-    from triton_sparse_mlp import materialize_linear_weight
     from gqa_mamba_rank_collapse import (
         GQALayout,
         GQAMambaRankCollapseBlock,
@@ -71,12 +68,17 @@ except ImportError:  # Script-mode fallback
         TaylorSSDLayerCache,
     )
     from paged_sparse_attention import SparseAttentionConfig, SparseAttentionRuntime
+    from sca_decoder_mirror import DecoderMirrorConfig, SparseDecoderMirrorSCA
+    from sca_sparse_adapter import compute_active_blocks
+    from sca_sparse_config import SCASparseConfig, build_block_centers, build_inhibition_matrix
+    from sca_sparse_mlp import SparseLlamaMLP, SparseRouteSelection
+    from triton_sparse_mlp import materialize_linear_weight
 
 
 @dataclass
 class _PackedInt4Tensor:
     packed: torch.Tensor
-    shape: Tuple[int, ...]
+    shape: tuple[int, ...]
     scale: float
     numel: int
     source_device: str
@@ -99,7 +101,7 @@ def _default_middle_layer_band(num_layers: int) -> list[int]:
     return list(range(start, stop))
 
 
-def _normalize_layer_indices(layer_indices: Optional[List[int]], num_layers: int) -> list[int]:
+def _normalize_layer_indices(layer_indices: list[int] | None, num_layers: int) -> list[int]:
     if layer_indices is None:
         return _default_middle_layer_band(num_layers)
     normalized = sorted({int(idx) for idx in layer_indices if 0 <= int(idx) < num_layers})
@@ -117,7 +119,7 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
 
 
 class _TierMaskedLlamaAttention(nn.Module):
-    def __init__(self, base_attn: nn.Module, tier_mask_bundle_getter: Callable[[], Optional[TieredAttentionMaskBundle]]) -> None:
+    def __init__(self, base_attn: nn.Module, tier_mask_bundle_getter: Callable[[], TieredAttentionMaskBundle | None]) -> None:
         super().__init__()
         self.base_attn = base_attn
         self._tier_mask_bundle_getter = tier_mask_bundle_getter
@@ -132,10 +134,10 @@ class _TierMaskedLlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Any] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        cache_position: torch.LongTensor | None = None,
         **kwargs: Any,
     ) -> Any:
         if past_key_values is None and "past_key_value" in kwargs:
@@ -168,7 +170,7 @@ class _TierMaskedLlamaAttention(nn.Module):
                     device=hidden_states.device,
                 )
 
-        call_kwargs: Dict[str, Any] = dict(kwargs)
+        call_kwargs: dict[str, Any] = dict(kwargs)
         call_kwargs["hidden_states"] = hidden_states
         call_kwargs["attention_mask"] = layer_attention_mask
         if position_embeddings is not None:
@@ -210,7 +212,7 @@ class _CollapsedMambaSelfAttention(nn.Module):
         qshape = tuple(getattr(qstate, "shape", ())) if qstate is not None else ()
         qnumel = int(qshape[0] * qshape[1]) if len(qshape) == 2 else 0
 
-        def _accept_if_valid(candidate: Any) -> Optional[torch.Tensor]:
+        def _accept_if_valid(candidate: Any) -> torch.Tensor | None:
             if not torch.is_tensor(candidate):
                 return None
             dense = candidate.detach()
@@ -226,9 +228,9 @@ class _CollapsedMambaSelfAttention(nn.Module):
                 return dense.float().cpu().contiguous()
             return None
 
-        # Quantized path: require dequantization to resolve exact dense shape.
+
         if torch.is_tensor(weight) and qstate is not None:
-            # Known-good path in this environment.
+
             try:
                 for packed in (weight, weight.t() if weight.ndim == 2 else weight):
                     deq = _accept_if_valid(bnb_functional.dequantize_4bit(packed, quant_state=qstate))
@@ -237,7 +239,7 @@ class _CollapsedMambaSelfAttention(nn.Module):
             except Exception as e:
                 print(f"bnb dequantize warning: {e}")
 
-            # Fallback path for some bitsandbytes builds.
+
             if hasattr(weight, "dequantize"):
                 try:
                     dense = _accept_if_valid(weight.dequantize())
@@ -251,14 +253,11 @@ class _CollapsedMambaSelfAttention(nn.Module):
                 f"packed_shape={tuple(weight.shape)} quant_shape={qshape}"
             )
 
-        # Dense path.
+
         if torch.is_tensor(weight) and weight.dim() == 2 and weight.is_floating_point():
             return weight.detach().float().cpu().contiguous()
 
-        if torch.is_tensor(weight):
-            dev = weight.device
-        else:
-            dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = weight.device if torch.is_tensor(weight) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         try:
             dense = materialize_linear_weight(linear, device=dev, dtype=torch.float32)
             return dense.detach().float().cpu().contiguous()
@@ -279,11 +278,11 @@ class _CollapsedMambaSelfAttention(nn.Module):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
-        target_rank: Optional[int],
+        target_rank: int | None,
         variance_threshold: float,
-        state_dim: Optional[int],
+        state_dim: int | None,
         dtype: torch.dtype,
-    ) -> "_CollapsedMambaSelfAttention":
+    ) -> _CollapsedMambaSelfAttention:
         layout = GQALayout(
             num_attention_heads=int(num_attention_heads),
             num_key_value_heads=int(num_key_value_heads),
@@ -313,13 +312,13 @@ class _CollapsedMambaSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Any | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> Any:
         del attention_mask, position_ids, cache_position, position_embeddings, kwargs
@@ -354,7 +353,7 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
         self.enable_output_bias = bool(enable_output_bias)
         self.capture_alignment = False
         self.capture_alignment_tensors = False
-        self._last_alignment: Optional[Dict[str, Any]] = None
+        self._last_alignment: dict[str, Any] | None = None
 
     @property
     def mix_value(self) -> torch.Tensor:
@@ -373,12 +372,12 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
-        target_rank: Optional[int],
+        target_rank: int | None,
         variance_threshold: float,
-        state_dim: Optional[int],
+        state_dim: int | None,
         mix_init: float,
         dtype: torch.dtype,
-    ) -> "HybridCollapsedMambaSelfAttention":
+    ) -> HybridCollapsedMambaSelfAttention:
         collapsed = _CollapsedMambaSelfAttention.from_llama_attention(
             source_attn=source_attn,
             layer_idx=layer_idx,
@@ -404,10 +403,10 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
         if not enabled:
             self._last_alignment = None
 
-    def get_last_alignment(self) -> Optional[Dict[str, Any]]:
+    def get_last_alignment(self) -> dict[str, Any] | None:
         return self._last_alignment
 
-    def export_hybrid_state(self) -> Dict[str, Any]:
+    def export_hybrid_state(self) -> dict[str, Any]:
         return {
             "mamba_block": {k: v.detach().cpu() for k, v in self.mamba_block.state_dict().items()},
             "mix_logit": self.mix_logit.detach().cpu(),
@@ -416,7 +415,7 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
             "enable_output_bias": bool(self.enable_output_bias),
         }
 
-    def load_hybrid_state(self, payload: Dict[str, Any], strict: bool = True) -> None:
+    def load_hybrid_state(self, payload: dict[str, Any], strict: bool = True) -> None:
         if "mamba_block" in payload:
             self.mamba_block.load_state_dict(payload["mamba_block"], strict=True)
             if "mix_logit" in payload:
@@ -432,19 +431,19 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
             self.enable_output_bias = bool(payload.get("enable_output_bias", self.enable_output_bias))
             return
 
-        # Backward compatibility: accept old collapsed-Mamba state dicts.
+
         self.mamba_block.load_state_dict(payload, strict=True)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Any] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: Any | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> Any:
         original_result = self.original_attn(
@@ -498,7 +497,7 @@ class HybridCollapsedMambaSelfAttention(nn.Module):
 
 
 class NeuroplasticLlama(nn.Module):
-    _BnbConfigSingleton: Optional[BitsAndBytesConfig] = None
+    _BnbConfigSingleton: BitsAndBytesConfig | None = None
 
     @classmethod
     def _get_bnb_config(cls) -> BitsAndBytesConfig:
@@ -525,8 +524,8 @@ class NeuroplasticLlama(nn.Module):
         sca_semantic_block_score_normalized: bool = False,
         sca_output_compensation_bias_enabled: bool = False,
         sca_adaptive_top_k: bool = False,
-        sca_adaptive_top_k_min: Optional[int] = None,
-        sca_adaptive_top_k_max: Optional[int] = None,
+        sca_adaptive_top_k_min: int | None = None,
+        sca_adaptive_top_k_max: int | None = None,
         sca_adaptive_top_k_min_score_ratio: float = 0.15,
         sca_sigma: float = 1.0,
         sca_refractory_steps: int = 100,
@@ -542,9 +541,9 @@ class NeuroplasticLlama(nn.Module):
         sca_stability_dense_fallback_threshold: float = 0.0,
         sca_bottom_buffer_layers: int = 2,
         sca_decode_guard_layers: int = 12,
-        sca_basis_rank_by_layer: Optional[Dict[int, int]] = None,
-        sca_basis_top_k_by_layer: Optional[Dict[int, int]] = None,
-        sca_top_k_by_layer: Optional[Dict[int, int]] = None,
+        sca_basis_rank_by_layer: dict[int, int] | None = None,
+        sca_basis_top_k_by_layer: dict[int, int] | None = None,
+        sca_top_k_by_layer: dict[int, int] | None = None,
         sca_dense_anchor_stride: int = 0,
         strict_decode_repetition_penalty: float = 1.35,
         strict_decode_penalty_window: int = 64,
@@ -571,27 +570,27 @@ class NeuroplasticLlama(nn.Module):
         attention_sink_tokens: int = 8,
         attention_page_size_tokens: int = 256,
         attention_retrieval_top_k_pages: int = 8,
-        attention_retrieval_head_group_ids: Optional[List[int]] = None,
-        attention_retrieval_start_layer: Optional[int] = None,
+        attention_retrieval_head_group_ids: list[int] | None = None,
+        attention_retrieval_start_layer: int | None = None,
         attention_archive_cpu_dtype: str = "int4",
         attention_hot_archive_gpu_pages: int = 0,
         attention_disable_ssd_fetch_in_decode: bool = True,
         attention_force_single_model_runtime: bool = True,
         attention_gqa_mamba_enabled: bool = False,
-        attention_gqa_target_rank: Optional[int] = None,
+        attention_gqa_target_rank: int | None = None,
         attention_gqa_variance_threshold: float = 0.90,
-        attention_gqa_state_dim: Optional[int] = None,
-        attention_gqa_max_layers: Optional[int] = None,
+        attention_gqa_state_dim: int | None = None,
+        attention_gqa_max_layers: int | None = None,
         attention_gqa_verbose: bool = False,
         attention_hybrid_enabled: bool = False,
-        attention_hybrid_layers: Optional[List[int]] = None,
+        attention_hybrid_layers: list[int] | None = None,
         attention_hybrid_mix_init: float = 0.05,
-        attention_hybrid_target_rank: Optional[int] = 16,
+        attention_hybrid_target_rank: int | None = 16,
         attention_hybrid_variance_threshold: float = 0.90,
-        attention_hybrid_state_dim: Optional[int] = None,
+        attention_hybrid_state_dim: int | None = None,
         attention_hybrid_force_no_cache: bool = True,
         attention_taylor_ssd_enabled: bool = False,
-        attention_taylor_layers: Optional[List[int]] = None,
+        attention_taylor_layers: list[int] | None = None,
         attention_taylor_order: int = 2,
         attention_taylor_symmetric_quadratic: bool = True,
         attention_taylor_temperature: float = 1.0,
@@ -604,10 +603,10 @@ class NeuroplasticLlama(nn.Module):
         attention_taylor_bottom_buffer: int = 4,
         attention_taylor_top_buffer: int = 4,
         decoder_mirror_enabled: bool = False,
-        decoder_mirror_top_k: Optional[int] = None,
+        decoder_mirror_top_k: int | None = None,
         decoder_mirror_rank: int = 4,
         decoder_mirror_route_conditioned: bool = True,
-        decoder_mirror_source_layers: Optional[List[int]] = None,
+        decoder_mirror_source_layers: list[int] | None = None,
         decoder_mirror_route_prior_scale_init: float = 0.25,
         decoder_mirror_residual_scale_init: float = 0.0,
         **_: object,
@@ -625,7 +624,7 @@ class NeuroplasticLlama(nn.Module):
         self.strict_decode_enable_repetition_penalty = bool(strict_decode_enable_repetition_penalty)
         self.strict_decode_upper_layer_cap_enabled = bool(strict_decode_upper_layer_cap_enabled)
         self.strict_runtime_allow_noncuda_spmm_diagnostic = bool(strict_runtime_allow_noncuda_spmm_diagnostic)
-        self.collect_bio_gate_telemetry = False  # compatibility flag
+        self.collect_bio_gate_telemetry = False
         self.kv_int4_quantization = bool(kv_int4_quantization)
         self.kv_cpu_offload = bool(kv_cpu_offload or kv_int4_quantization)
         self.bounded_context_config = BoundedContextConfig(
@@ -644,16 +643,16 @@ class NeuroplasticLlama(nn.Module):
             retrieval_top_k_max=int(retrieval_top_k_max),
         )
         self.bounded_context_config.validate()
-        self._tier_policy: Optional[TieredContextPolicy] = None
-        self._tier_cache_compressor: Optional[TieredCacheCompressor] = None
-        self._tier_mask_bundle: Optional[TieredAttentionMaskBundle] = None
-        self._latest_tier_metadata: Optional[TierCacheMetadata] = None
+        self._tier_policy: TieredContextPolicy | None = None
+        self._tier_cache_compressor: TieredCacheCompressor | None = None
+        self._tier_mask_bundle: TieredAttentionMaskBundle | None = None
+        self._latest_tier_metadata: TierCacheMetadata | None = None
         self._summary_manager = RollingSummaryManager(
             min_interval_tokens=self.bounded_context_config.summary_interval_min_tokens,
             max_interval_tokens=self.bounded_context_config.summary_interval_max_tokens,
         )
-        self._summary_provider: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
-        self._repo_index: Optional[CodeRepoMemoryIndex] = None
+        self._summary_provider: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        self._repo_index: CodeRepoMemoryIndex | None = None
         retrieval_groups = attention_retrieval_head_group_ids if attention_retrieval_head_group_ids is not None else [0]
         self.sparse_attention_config = SparseAttentionConfig(
             enabled=bool(attention_sparse_mode),
@@ -670,8 +669,8 @@ class NeuroplasticLlama(nn.Module):
             strict_fully_sparse=False,
         )
         self.sparse_attention_config.validate()
-        self._sparse_attention_runtime: Optional[SparseAttentionRuntime] = None
-        self._last_sparse_attention_step: Dict[str, Any] = {}
+        self._sparse_attention_runtime: SparseAttentionRuntime | None = None
+        self._last_sparse_attention_step: dict[str, Any] = {}
 
         self.model = LlamaForCausalLM.from_pretrained(
             model_name,
@@ -752,14 +751,14 @@ class NeuroplasticLlama(nn.Module):
         self.register_buffer("block_centers", centers.float(), persistent=True)
         self.register_buffer("inhibition_matrix", inhibition.float(), persistent=True)
 
-        self.sca_adapters = nn.ModuleList()  # backward-compat placeholder (legacy checkpoints/scripts)
+        self.sca_adapters = nn.ModuleList()
         self.adapters = self.sca_adapters
         self.adapter_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float16), requires_grad=False)
-        self.score = nn.Linear(self.hidden_size, 1)  # compatibility for old scripts
+        self.score = nn.Linear(self.hidden_size, 1)
         self.sca_sparse_mlps: list[SparseLlamaMLP] = []
         num_layers = self.num_hidden_layers
         self.sca_layer_output_scale = nn.Parameter(torch.ones((num_layers,), dtype=torch.float32), requires_grad=False)
-        # Mildly dampen upper decode-critical layers by default to reduce lexical attractor collapse.
+
         decode_band_start = max(int(num_layers * 0.75), 0)
         if decode_band_start < num_layers:
             with torch.no_grad():
@@ -767,8 +766,8 @@ class NeuroplasticLlama(nn.Module):
 
         if self.sca_config.use_cuda and not torch.cuda.is_available():
             raise RuntimeError("sca_use_cuda=True requires CUDA runtime")
-        # Runtime is extension-free by default; routing uses Triton gate when available,
-        # otherwise torch fallback, while sparse SpMM stays on CUDA path.
+
+
         self.sca_cuda_kernels = None
 
         num_layers = self.num_hidden_layers
@@ -788,7 +787,7 @@ class NeuroplasticLlama(nn.Module):
         self.attention_hybrid_target_rank = attention_hybrid_target_rank
         self.attention_hybrid_variance_threshold = float(attention_hybrid_variance_threshold)
         self.attention_hybrid_state_dim = attention_hybrid_state_dim
-        self._sparse_mlp_bank_manifest_path: Optional[str] = None
+        self._sparse_mlp_bank_manifest_path: str | None = None
         self.attention_gqa_mamba_enabled = bool(attention_gqa_mamba_enabled)
         self.attention_taylor_ssd_enabled = bool(attention_taylor_ssd_enabled)
         self.attention_taylor_layers = _normalize_layer_indices(attention_taylor_layers, num_layers)
@@ -845,28 +844,28 @@ class NeuroplasticLlama(nn.Module):
         self._install_bounded_context_attention_hooks()
 
         self._current_task_id = 0
-        self._cached_task_emb: Optional[torch.Tensor] = None
-        self._cached_task_emb_task_id: Optional[int] = None
+        self._cached_task_emb: torch.Tensor | None = None
+        self._cached_task_emb_task_id: int | None = None
         self.disable_task_bias_injection: bool = False
-        self._sca_recalibration_layer_indices: List[int] = []
-        self._sca_recalibration_active_sparse_layer_indices: List[int] = []
+        self._sca_recalibration_layer_indices: list[int] = []
+        self._sca_recalibration_active_sparse_layer_indices: list[int] = []
         self._sca_recalibration_mode: str = "local_mlp_geometry"
-        self._sca_recalibration_trainable_modules: List[str] = []
+        self._sca_recalibration_trainable_modules: list[str] = []
         self._sca_recalibration_hybrid_checkpoint_path: str = ""
-        self._sca_disable_task_bias_injection_from_artifact: Optional[bool] = None
-        self._sca_sparse_layer_override: Optional[set[int]] = None
-        self.decoder_mirror_config: Optional[DecoderMirrorConfig] = None
-        self.decoder_mirror: Optional[SparseDecoderMirrorSCA] = None
+        self._sca_disable_task_bias_injection_from_artifact: bool | None = None
+        self._sca_sparse_layer_override: set[int] | None = None
+        self.decoder_mirror_config: DecoderMirrorConfig | None = None
+        self.decoder_mirror: SparseDecoderMirrorSCA | None = None
         self._decoder_mirror_enabled: bool = bool(decoder_mirror_enabled)
-        self._last_decoder_mirror_diagnostics: Dict[str, Any] = {}
+        self._last_decoder_mirror_diagnostics: dict[str, Any] = {}
         self._decoder_mirror_calibration_mode: str = "decoder_co_warp"
-        self._decoder_mirror_trainable_modules: List[str] = []
+        self._decoder_mirror_trainable_modules: list[str] = []
         self._decoder_mirror_hybrid_checkpoint_path: str = ""
         self._decoder_mirror_sca_checkpoint_path: str = ""
-        self._decoder_mirror_source_layers: List[int] = []
+        self._decoder_mirror_source_layers: list[int] = []
         self._decoder_mirror_route_prior_missing: bool = True
-        self._decoder_mirror_source_layers_used: List[int] = []
-        self._decoder_mirror_init_kwargs: Dict[str, Any] = {
+        self._decoder_mirror_source_layers_used: list[int] = []
+        self._decoder_mirror_init_kwargs: dict[str, Any] = {
             "top_k": None if decoder_mirror_top_k is None else int(decoder_mirror_top_k),
             "rank": int(decoder_mirror_rank),
             "route_conditioned": bool(decoder_mirror_route_conditioned),
@@ -875,7 +874,7 @@ class NeuroplasticLlama(nn.Module):
             "residual_scale_init": float(decoder_mirror_residual_scale_init),
         }
 
-        # Keep trainable parts on model device.
+
         dev = self.device
         self.task_embedding.to(device=dev, dtype=torch.float16)
         self.spatial_proj.to(device=dev, dtype=torch.float16)
@@ -892,7 +891,7 @@ class NeuroplasticLlama(nn.Module):
         idx = int(max(min(layer_idx, int(self.sca_layer_output_scale.shape[0]) - 1), 0))
         scale = self.sca_layer_output_scale[idx].to(device=device, dtype=dtype)
         scale = scale.clamp(min=0.0, max=1.5)
-        # In strict sparse decode, cap upper-layer SCA contribution to reduce repetitive lexical attractors.
+
         if bool(self.strict_decode_upper_layer_cap_enabled) and bool(self._runtime_flags.get("strict_sparse_decode", False)):
             decode_band_start = max(int(self.sca_layer_output_scale.shape[0] * 0.75), 0)
             if idx >= decode_band_start:
@@ -965,7 +964,7 @@ class NeuroplasticLlama(nn.Module):
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
 
-    def set_kv_cache_mode(self, int4_quantization: Optional[bool] = None, cpu_offload: Optional[bool] = None) -> None:
+    def set_kv_cache_mode(self, int4_quantization: bool | None = None, cpu_offload: bool | None = None) -> None:
         if int4_quantization is not None:
             self.kv_int4_quantization = bool(int4_quantization)
         if cpu_offload is not None:
@@ -976,12 +975,12 @@ class NeuroplasticLlama(nn.Module):
 
     def set_bounded_context_mode(
         self,
-        enabled: Optional[bool] = None,
-        sink_tokens: Optional[int] = None,
-        local_window_tokens: Optional[int] = None,
-        global_window_tokens: Optional[int] = None,
-        global_start_layer: Optional[int] = None,
-        global_group_id: Optional[int] = None,
+        enabled: bool | None = None,
+        sink_tokens: int | None = None,
+        local_window_tokens: int | None = None,
+        global_window_tokens: int | None = None,
+        global_start_layer: int | None = None,
+        global_group_id: int | None = None,
     ) -> None:
         if enabled is not None:
             self.bounded_context_config.enabled = bool(enabled)
@@ -1008,10 +1007,10 @@ class NeuroplasticLlama(nn.Module):
             self._tier_mask_bundle = TieredAttentionMaskBundle(self._tier_policy)
         self._refresh_runtime_flags()
 
-    def register_summary_provider(self, provider: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]]) -> None:
+    def register_summary_provider(self, provider: Callable[[dict[str, Any]], dict[str, Any]] | None) -> None:
         self._summary_provider = provider
 
-    def get_bounded_context_summary_state(self) -> Dict[str, Any]:
+    def get_bounded_context_summary_state(self) -> dict[str, Any]:
         snap = self._summary_manager.snapshot()
         token_ids = snap.summary_token_ids.tolist() if snap.summary_token_ids is not None else None
         return {
@@ -1021,7 +1020,7 @@ class NeuroplasticLlama(nn.Module):
             "pending_refresh": bool(self._summary_manager.pending_refresh),
         }
 
-    def get_bounded_context_memory_estimate(self) -> Dict[str, float]:
+    def get_bounded_context_memory_estimate(self) -> dict[str, float]:
         estimate = self._bounded_memory_estimate
         return {
             "bytes_per_token_all_layers": float(estimate.bytes_per_token_all_layers),
@@ -1035,18 +1034,18 @@ class NeuroplasticLlama(nn.Module):
 
     def set_sparse_attention_mode(
         self,
-        enabled: Optional[bool] = None,
-        local_window_tokens: Optional[int] = None,
-        sink_tokens: Optional[int] = None,
-        page_size_tokens: Optional[int] = None,
-        retrieval_top_k_pages: Optional[int] = None,
-        retrieval_head_group_ids: Optional[List[int]] = None,
-        retrieval_start_layer: Optional[int] = None,
-        archive_cpu_dtype: Optional[str] = None,
-        hot_archive_gpu_pages: Optional[int] = None,
-        disable_ssd_fetch_in_decode: Optional[bool] = None,
-        force_single_model_runtime: Optional[bool] = None,
-        strict_fully_sparse: Optional[bool] = None,
+        enabled: bool | None = None,
+        local_window_tokens: int | None = None,
+        sink_tokens: int | None = None,
+        page_size_tokens: int | None = None,
+        retrieval_top_k_pages: int | None = None,
+        retrieval_head_group_ids: list[int] | None = None,
+        retrieval_start_layer: int | None = None,
+        archive_cpu_dtype: str | None = None,
+        hot_archive_gpu_pages: int | None = None,
+        disable_ssd_fetch_in_decode: bool | None = None,
+        force_single_model_runtime: bool | None = None,
+        strict_fully_sparse: bool | None = None,
     ) -> None:
         if enabled is not None:
             self.sparse_attention_config.enabled = bool(enabled)
@@ -1077,7 +1076,7 @@ class NeuroplasticLlama(nn.Module):
             self._sparse_attention_runtime.config = self.sparse_attention_config
         self._refresh_runtime_flags()
 
-    def get_sparse_attention_diagnostics(self) -> Dict[str, Any]:
+    def get_sparse_attention_diagnostics(self) -> dict[str, Any]:
         if self._sparse_attention_runtime is None:
             return {
                 "enabled": False,
@@ -1102,7 +1101,7 @@ class NeuroplasticLlama(nn.Module):
         )
         return int(self._repo_index.build())
 
-    def retrieve_repo_chunks(self, query: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
+    def retrieve_repo_chunks(self, query: str, top_k: int | None = None) -> list[dict[str, Any]]:
         if self._repo_index is None:
             return []
         top_k = int(top_k) if top_k is not None else self.bounded_context_config.retrieval_top_k_min
@@ -1153,18 +1152,16 @@ class NeuroplasticLlama(nn.Module):
                 "gqa_mamba_disables_cache": bool(getattr(self, "attention_gqa_mamba_enabled", False)),
                 "taylor_attention_enabled": bool(getattr(self, "attention_taylor_ssd_enabled", False)),
             }
-        # Sparse-attention decode requires cache and provides its own bounded behavior.
+
         if bool(runtime_flags.get("sparse_attention_enabled", False)):
             return False
-        # Taylor V1 disables KV/offload optimizations via _enforce_taylor_safe_cache_policy,
-        # but recurrent decode cache is supported and should stay enabled.
+
+
         if bool(runtime_flags.get("taylor_attention_enabled", False)):
             return False
         if bool(runtime_flags.get("hybrid_forces_no_cache", False)):
             return True
-        if bool(runtime_flags.get("gqa_mamba_disables_cache", False)):
-            return True
-        return False
+        return bool(bool(runtime_flags.get("gqa_mamba_disables_cache", False)))
 
     @staticmethod
     def _to_legacy_cache(past_key_values: Any) -> Any:
@@ -1185,8 +1182,8 @@ class NeuroplasticLlama(nn.Module):
 
     @staticmethod
     def _normalize_eos_token_ids(
-        eos_token_id: Optional[Union[int, List[int], Tuple[int, ...]]],
-    ) -> Optional[List[int]]:
+        eos_token_id: int | list[int] | tuple[int, ...] | None,
+    ) -> list[int] | None:
         if eos_token_id is None:
             return None
         if isinstance(eos_token_id, int):
@@ -1253,7 +1250,7 @@ class NeuroplasticLlama(nn.Module):
             return bool(runtime_flags.get("bounded_context_enabled", False))
         return bool(getattr(getattr(self, "bounded_context_config", None), "enabled", False))
 
-    def _get_tier_mask_bundle(self) -> Optional[TieredAttentionMaskBundle]:
+    def _get_tier_mask_bundle(self) -> TieredAttentionMaskBundle | None:
         if not self._bounded_context_enabled():
             return None
         return self._tier_mask_bundle
@@ -1268,7 +1265,7 @@ class NeuroplasticLlama(nn.Module):
     def _replace_attention_with_taylor_ssd(
         self,
         *,
-        layer_indices: Optional[List[int]] = None,
+        layer_indices: list[int] | None = None,
         order: int = 2,
         symmetric_quadratic: bool = True,
         taylor_temperature: float = 1.0,
@@ -1320,10 +1317,10 @@ class NeuroplasticLlama(nn.Module):
 
     def _replace_attention_with_gqa_mamba(
         self,
-        target_rank: Optional[int] = None,
+        target_rank: int | None = None,
         variance_threshold: float = 0.90,
-        state_dim: Optional[int] = None,
-        max_layers: Optional[int] = None,
+        state_dim: int | None = None,
+        max_layers: int | None = None,
         verbose: bool = False,
     ) -> None:
         num_attention_heads = int(getattr(self.config, "num_attention_heads", 1))
@@ -1359,11 +1356,11 @@ class NeuroplasticLlama(nn.Module):
 
     def _replace_attention_with_hybrid_gqa_mamba(
         self,
-        target_rank: Optional[int] = 16,
+        target_rank: int | None = 16,
         variance_threshold: float = 0.90,
-        state_dim: Optional[int] = None,
+        state_dim: int | None = None,
         mix_init: float = 0.05,
-        layer_indices: Optional[List[int]] = None,
+        layer_indices: list[int] | None = None,
         verbose: bool = False,
     ) -> None:
         num_attention_heads = int(getattr(self.config, "num_attention_heads", 1))
@@ -1399,38 +1396,38 @@ class NeuroplasticLlama(nn.Module):
             replacement._converted_from_llama = True
             layer.self_attn = replacement
 
-    def iter_taylor_attention_modules(self) -> List[Tuple[int, GQATaylorSSDSelfAttention]]:
-        modules: List[Tuple[int, GQATaylorSSDSelfAttention]] = []
+    def iter_taylor_attention_modules(self) -> list[tuple[int, GQATaylorSSDSelfAttention]]:
+        modules: list[tuple[int, GQATaylorSSDSelfAttention]] = []
         for layer_idx, layer in enumerate(self.model.model.layers):
             attn = _unwrap_tier_masked_attention(layer.self_attn)
             if isinstance(attn, GQATaylorSSDSelfAttention):
                 modules.append((layer_idx, attn))
         return modules
 
-    def get_effective_taylor_layers(self) -> List[int]:
+    def get_effective_taylor_layers(self) -> list[int]:
         return [layer_idx for layer_idx, _attn in self.iter_taylor_attention_modules()]
 
-    def iter_hybrid_attention_modules(self) -> List[Tuple[int, HybridCollapsedMambaSelfAttention]]:
-        modules: List[Tuple[int, HybridCollapsedMambaSelfAttention]] = []
+    def iter_hybrid_attention_modules(self) -> list[tuple[int, HybridCollapsedMambaSelfAttention]]:
+        modules: list[tuple[int, HybridCollapsedMambaSelfAttention]] = []
         for layer_idx, layer in enumerate(self.model.model.layers):
             attn = _unwrap_tier_masked_attention(layer.self_attn)
             if isinstance(attn, HybridCollapsedMambaSelfAttention):
                 modules.append((layer_idx, attn))
         return modules
 
-    def get_effective_hybrid_layers(self) -> List[int]:
+    def get_effective_hybrid_layers(self) -> list[int]:
         return [layer_idx for layer_idx, _attn in self.iter_hybrid_attention_modules()]
 
     def set_hybrid_alignment_capture(self, enabled: bool) -> None:
         for _layer_idx, attn in self.iter_hybrid_attention_modules():
             attn.set_alignment_capture(enabled)
 
-    def set_mlp_alignment_capture(self, enabled: bool, layer_indices: Optional[List[int]] = None) -> None:
+    def set_mlp_alignment_capture(self, enabled: bool, layer_indices: list[int] | None = None) -> None:
         selected = set(layer_indices) if layer_indices is not None else None
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             wrapper.set_alignment_capture(bool(enabled) and (selected is None or layer_idx in selected))
 
-    def set_sparse_curriculum(self, enabled: bool, alpha: float, layer_indices: Optional[List[int]] = None) -> None:
+    def set_sparse_curriculum(self, enabled: bool, alpha: float, layer_indices: list[int] | None = None) -> None:
         selected = set(layer_indices) if layer_indices is not None else None
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             use_layer = selected is None or layer_idx in selected
@@ -1445,7 +1442,7 @@ class NeuroplasticLlama(nn.Module):
         cooldown_steps: int = 64,
         max_fraction: float = 0.25,
         usage_ema_decay: float = 0.95,
-        layer_indices: Optional[List[int]] = None,
+        layer_indices: list[int] | None = None,
     ) -> None:
         selected = set(layer_indices) if layer_indices is not None else None
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
@@ -1459,9 +1456,9 @@ class NeuroplasticLlama(nn.Module):
                 usage_ema_decay=float(usage_ema_decay),
             )
 
-    def get_sparse_block_banking_stats(self) -> Dict[str, Any]:
-        per_layer: Dict[str, Dict[str, float]] = {}
-        banked_fractions: List[float] = []
+    def get_sparse_block_banking_stats(self) -> dict[str, Any]:
+        per_layer: dict[str, dict[str, float]] = {}
+        banked_fractions: list[float] = []
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             stats = wrapper.get_block_banking_stats()
             per_layer[str(layer_idx)] = stats
@@ -1471,7 +1468,7 @@ class NeuroplasticLlama(nn.Module):
             "per_layer": per_layer,
         }
 
-    def _default_decoder_mirror_source_layers(self) -> List[int]:
+    def _default_decoder_mirror_source_layers(self) -> list[int]:
         total_layers = len(getattr(self, "sca_sparse_mlps", []))
         if total_layers <= 0:
             return []
@@ -1481,7 +1478,7 @@ class NeuroplasticLlama(nn.Module):
             candidates = list(range(total_layers))
         return candidates[-4:]
 
-    def _normalize_decoder_mirror_source_layers(self, layer_indices: Optional[List[int]]) -> List[int]:
+    def _normalize_decoder_mirror_source_layers(self, layer_indices: list[int] | None) -> list[int]:
         total_layers = len(getattr(self, "sca_sparse_mlps", []))
         selected = self._default_decoder_mirror_source_layers() if layer_indices is None else sorted({int(v) for v in layer_indices})
         invalid = [idx for idx in selected if idx < 0 or idx >= total_layers]
@@ -1492,12 +1489,12 @@ class NeuroplasticLlama(nn.Module):
     def _ensure_decoder_mirror_module(
         self,
         *,
-        source_layers: Optional[List[int]] = None,
-        top_k: Optional[int] = None,
-        rank: Optional[int] = None,
-        route_conditioned: Optional[bool] = None,
-        route_prior_scale_init: Optional[float] = None,
-        residual_scale_init: Optional[float] = None,
+        source_layers: list[int] | None = None,
+        top_k: int | None = None,
+        rank: int | None = None,
+        route_conditioned: bool | None = None,
+        route_prior_scale_init: float | None = None,
+        residual_scale_init: float | None = None,
     ) -> SparseDecoderMirrorSCA:
         init_kwargs = dict(getattr(self, "_decoder_mirror_init_kwargs", {}))
         resolved_source_layers = self._normalize_decoder_mirror_source_layers(
@@ -1573,24 +1570,24 @@ class NeuroplasticLlama(nn.Module):
         layer_indices = None if self.decoder_mirror_config is None else self.decoder_mirror_config.source_layer_indices
         self.set_decoder_mirror_route_capture(bool(enabled), layer_indices=layer_indices)
 
-    def set_decoder_mirror_route_capture(self, enabled: bool, layer_indices: Optional[List[int]] = None) -> None:
+    def set_decoder_mirror_route_capture(self, enabled: bool, layer_indices: list[int] | None = None) -> None:
         selected = set(layer_indices) if layer_indices is not None else None
         for layer_idx, wrapper in enumerate(getattr(self, "sca_sparse_mlps", [])):
             wrapper.set_route_capture(bool(enabled) and (selected is None or layer_idx in selected))
 
     def _build_decoder_mirror_route_prior(
         self,
-        source_layers: Optional[List[int]] = None,
-        batch_size: Optional[int] = None,
-        seq_len: Optional[int] = None,
-        device: Optional[torch.device] = None,
+        source_layers: list[int] | None = None,
+        batch_size: int | None = None,
+        seq_len: int | None = None,
+        device: torch.device | None = None,
     ) -> torch.Tensor:
         selected = self._normalize_decoder_mirror_source_layers(source_layers)
         inferred_batch = int(batch_size) if batch_size is not None else None
         inferred_seq = int(seq_len) if seq_len is not None else None
-        rows: Optional[int] = None
-        route_prior: Optional[torch.Tensor] = None
-        used_layers: List[int] = []
+        rows: int | None = None
+        route_prior: torch.Tensor | None = None
+        used_layers: list[int] = []
 
         target_device = device if device is not None else self.device
         for layer_idx in selected:
@@ -1649,7 +1646,7 @@ class NeuroplasticLlama(nn.Module):
             final_seq = 1 if rows > 0 else 0
         return route_prior.view(final_batch, final_seq, self.sca_config.num_blocks)
 
-    def get_decoder_mirror_diagnostics(self) -> Dict[str, Any]:
+    def get_decoder_mirror_diagnostics(self) -> dict[str, Any]:
         out = dict(getattr(self, "_last_decoder_mirror_diagnostics", {}))
         if not out and self.decoder_mirror is not None:
             out = self.decoder_mirror.get_last_diagnostics()
@@ -1666,11 +1663,11 @@ class NeuroplasticLlama(nn.Module):
         include_adapter_scale: bool = False,
         include_layer_output_scale: bool = True,
         freeze_basis_decoder: bool = False,
-        layer_indices: Optional[List[int]] = None,
-        active_sparse_layer_indices: Optional[List[int]] = None,
+        layer_indices: list[int] | None = None,
+        active_sparse_layer_indices: list[int] | None = None,
         recalibration_mode: str = "local_mlp_geometry",
         hybrid_checkpoint_path: str = "",
-    ) -> List[nn.Parameter]:
+    ) -> list[nn.Parameter]:
         for param in self.parameters():
             param.requires_grad = False
 
@@ -1697,8 +1694,8 @@ class NeuroplasticLlama(nn.Module):
             include_task_embedding = False
             self._decoder_mirror_enabled = False
 
-        trainable: List[nn.Parameter] = []
-        trainable_names: List[str] = []
+        trainable: list[nn.Parameter] = []
+        trainable_names: list[str] = []
         if include_spatial_proj:
             self.spatial_proj.to(device=self.device, dtype=torch.float32)
             for name, param in self.spatial_proj.named_parameters():
@@ -1740,7 +1737,7 @@ class NeuroplasticLlama(nn.Module):
         self._sca_recalibration_trainable_modules = trainable_names
         return trainable
 
-    def set_sparse_layer_override(self, layer_indices: Optional[List[int]]) -> None:
+    def set_sparse_layer_override(self, layer_indices: list[int] | None) -> None:
         if layer_indices is None:
             self._sca_sparse_layer_override = None
             return
@@ -1753,25 +1750,25 @@ class NeuroplasticLlama(nn.Module):
         self,
         loss_mode: str = "mse_plus_norm",
         norm_weight: float = 0.01,
-        layer_weight_map: Optional[Dict[int, float]] = None,
+        layer_weight_map: dict[int, float] | None = None,
         delta_norm_cap: float = 0.25,
         delta_norm_cap_weight: float = 0.0,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         allowed_modes = {"mse", "cosine", "mse_plus_norm"}
         if loss_mode not in allowed_modes:
             raise ValueError(f"Unsupported loss_mode '{loss_mode}', expected one of {sorted(allowed_modes)}")
 
         selected = set(self._sca_recalibration_layer_indices) if self._sca_recalibration_layer_indices else None
-        total_losses: List[torch.Tensor] = []
-        mse_terms: List[torch.Tensor] = []
-        cosine_terms: List[torch.Tensor] = []
-        norm_terms: List[torch.Tensor] = []
-        delta_norm_ratio_terms: List[torch.Tensor] = []
-        delta_norm_cap_terms: List[torch.Tensor] = []
-        per_layer_loss: Dict[str, float] = {}
-        per_layer_norm: Dict[str, float] = {}
-        per_layer_delta_norm_ratio: Dict[str, float] = {}
-        fallback_by_layer: Dict[str, float] = {}
+        total_losses: list[torch.Tensor] = []
+        mse_terms: list[torch.Tensor] = []
+        cosine_terms: list[torch.Tensor] = []
+        norm_terms: list[torch.Tensor] = []
+        delta_norm_ratio_terms: list[torch.Tensor] = []
+        delta_norm_cap_terms: list[torch.Tensor] = []
+        per_layer_loss: dict[str, float] = {}
+        per_layer_norm: dict[str, float] = {}
+        per_layer_delta_norm_ratio: dict[str, float] = {}
+        fallback_by_layer: dict[str, float] = {}
 
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             if selected is not None and layer_idx not in selected:
@@ -1835,7 +1832,7 @@ class NeuroplasticLlama(nn.Module):
 
         total = torch.stack(total_losses).mean()
         fallback_values = list(fallback_by_layer.values())
-        metrics: Dict[str, Any] = {
+        metrics: dict[str, Any] = {
             "layers_captured": float(len(total_losses)),
             "loss_mse": float(torch.stack(mse_terms).mean().cpu().item()),
             "loss_cosine": float(torch.stack(cosine_terms).mean().cpu().item()),
@@ -1850,7 +1847,7 @@ class NeuroplasticLlama(nn.Module):
         }
         return total, metrics
 
-    def export_sca_recalibration_state(self) -> Dict[str, Any]:
+    def export_sca_recalibration_state(self) -> dict[str, Any]:
         active_sparse_layers = [
             int(v) for v in getattr(self, "_sca_recalibration_active_sparse_layer_indices", []) if int(v) >= 0
         ]
@@ -1858,7 +1855,7 @@ class NeuroplasticLlama(nn.Module):
         trainable_modules = list(getattr(self, "_sca_recalibration_trainable_modules", []))
         export_layers = sorted(set(active_sparse_layers or recalibration_layers))
         export_layer_set = set(export_layers)
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model_name": self.model_name,
             "hybrid_checkpoint_path": str(getattr(self, "_sca_recalibration_hybrid_checkpoint_path", "")),
             "layer_selection": list(export_layers),
@@ -1902,7 +1899,7 @@ class NeuroplasticLlama(nn.Module):
             payload["adapter_scale"] = self.adapter_scale.detach().cpu()
         if "sca_layer_output_scale" in trainable_modules and hasattr(self, "sca_layer_output_scale"):
             payload["sca_layer_output_scale"] = self.sca_layer_output_scale.detach().cpu()
-        sparse_wrapper_state: Dict[str, Dict[str, torch.Tensor]] = {}
+        sparse_wrapper_state: dict[str, dict[str, torch.Tensor]] = {}
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             if int(layer_idx) in export_layer_set and hasattr(wrapper, "export_sparse_recalibration_state"):
                 sparse_wrapper_state[str(layer_idx)] = wrapper.export_sparse_recalibration_state()
@@ -1914,7 +1911,7 @@ class NeuroplasticLlama(nn.Module):
         self,
         checkpoint_path: str,
         strict: bool = True,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         blob = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(blob, dict):
             raise RuntimeError("SCA recalibration checkpoint must be a dict")
@@ -2009,7 +2006,7 @@ class NeuroplasticLlama(nn.Module):
             self.bottom_buffer_layers = max(int(router_metadata["bottom_buffer_layers"]), 0)
         return {"loaded_items": int(loaded), "missing_items": int(missing)}
 
-    def export_sparse_router_state(self) -> Dict[str, Any]:
+    def export_sparse_router_state(self) -> dict[str, Any]:
         return {
             "model_name": self.model_name,
             "sca_config": self.sca_config.to_dict(),
@@ -2023,10 +2020,10 @@ class NeuroplasticLlama(nn.Module):
             },
         }
 
-    def load_sparse_router_state(self, checkpoint_path: str, strict: bool = False) -> Dict[str, int]:
+    def load_sparse_router_state(self, checkpoint_path: str, strict: bool = False) -> dict[str, int]:
         return self.load_sca_recalibration_state(checkpoint_path=checkpoint_path, strict=bool(strict))
 
-    def load_learned_basis_init(self, checkpoint_path: str, strict: bool = True) -> Dict[str, int]:
+    def load_learned_basis_init(self, checkpoint_path: str, strict: bool = True) -> dict[str, int]:
         blob = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(blob, dict):
             raise RuntimeError("learned-basis init checkpoint must be a dict")
@@ -2078,14 +2075,14 @@ class NeuroplasticLlama(nn.Module):
 
     def prepare_decoder_mirror_calibration(
         self,
-        source_layer_indices: Optional[List[int]] = None,
-        top_k: Optional[int] = None,
+        source_layer_indices: list[int] | None = None,
+        top_k: int | None = None,
         rank: int = 4,
         route_conditioned: bool = True,
         calibration_mode: str = "decoder_co_warp",
         hybrid_checkpoint_path: str = "",
         sca_recalibrated_checkpoint_path: str = "",
-    ) -> List[nn.Parameter]:
+    ) -> list[nn.Parameter]:
         for param in self.parameters():
             param.requires_grad = False
 
@@ -2102,8 +2099,8 @@ class NeuroplasticLlama(nn.Module):
         self._decoder_mirror_sca_checkpoint_path = str(sca_recalibrated_checkpoint_path or "")
         self.set_decoder_mirror_route_capture(True, layer_indices=mirror.config.source_layer_indices)
 
-        trainable: List[nn.Parameter] = []
-        trainable_names: List[str] = []
+        trainable: list[nn.Parameter] = []
+        trainable_names: list[str] = []
         for name, param in mirror.named_parameters():
             param.requires_grad = True
             trainable.append(param)
@@ -2115,11 +2112,11 @@ class NeuroplasticLlama(nn.Module):
         self,
         mirror_logits: torch.Tensor,
         dense_logits: torch.Tensor,
-        labels: Optional[torch.Tensor] = None,
+        labels: torch.Tensor | None = None,
         logits_kl_weight: float = 1.0,
         ce_weight: float = 0.25,
         delta_penalty_weight: float = 0.01,
-    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.decoder_mirror is None:
             raise RuntimeError("Decoder mirror is not initialized")
         if not torch.isfinite(mirror_logits).all() or not torch.isfinite(dense_logits).all():
@@ -2148,7 +2145,7 @@ class NeuroplasticLlama(nn.Module):
             for idx, wrapper in enumerate(getattr(self, "sca_sparse_mlps", []))
         }
         diagnostics = self.get_decoder_mirror_diagnostics()
-        metrics: Dict[str, Any] = {
+        metrics: dict[str, Any] = {
             "loss_total": float(total.detach().cpu().item()),
             "loss_logits_kl": float(logits_kl.detach().cpu().item()),
             "loss_ce": float(ce.detach().cpu().item()),
@@ -2160,7 +2157,7 @@ class NeuroplasticLlama(nn.Module):
         }
         return total, metrics
 
-    def export_decoder_mirror_state(self) -> Dict[str, Any]:
+    def export_decoder_mirror_state(self) -> dict[str, Any]:
         if self.decoder_mirror is None or self.decoder_mirror_config is None:
             raise RuntimeError("Decoder mirror is not initialized")
         return {
@@ -2182,7 +2179,7 @@ class NeuroplasticLlama(nn.Module):
             "sca_config_summary": self.sca_config.to_dict(),
         }
 
-    def load_decoder_mirror_state(self, checkpoint_path: str, strict: bool = True) -> Dict[str, int]:
+    def load_decoder_mirror_state(self, checkpoint_path: str, strict: bool = True) -> dict[str, int]:
         blob = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(blob, dict):
             raise RuntimeError("Decoder mirror checkpoint must be a dict")
@@ -2213,10 +2210,10 @@ class NeuroplasticLlama(nn.Module):
         self.set_decoder_mirror_enabled(True)
         return {"loaded_items": 1, "missing_items": 0}
 
-    def prepare_local_geometry_calibration(self, include_output_bias: bool = False) -> List[nn.Parameter]:
+    def prepare_local_geometry_calibration(self, include_output_bias: bool = False) -> list[nn.Parameter]:
         for param in self.parameters():
             param.requires_grad = False
-        trainable: List[nn.Parameter] = []
+        trainable: list[nn.Parameter] = []
         self.set_hybrid_alignment_capture(True)
         for _layer_idx, attn in self.iter_hybrid_attention_modules():
             params = [attn.mix_logit, attn.output_gain]
@@ -2234,10 +2231,10 @@ class NeuroplasticLlama(nn.Module):
         self,
         mix_regularization: float = 0.01,
         norm_regularization: float = 0.01,
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        losses: List[torch.Tensor] = []
-        mix_values: List[float] = []
-        norm_terms: List[float] = []
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        losses: list[torch.Tensor] = []
+        mix_values: list[float] = []
+        norm_terms: list[float] = []
 
         for _layer_idx, attn in self.iter_hybrid_attention_modules():
             alignment = attn.get_last_alignment()
@@ -2266,7 +2263,7 @@ class NeuroplasticLlama(nn.Module):
         }
         return total, metrics
 
-    def sanitize_hybrid_parameters(self) -> Dict[str, int]:
+    def sanitize_hybrid_parameters(self) -> dict[str, int]:
         repaired = 0
         for _layer_idx, attn in self.iter_hybrid_attention_modules():
             with torch.no_grad():
@@ -2285,10 +2282,10 @@ class NeuroplasticLlama(nn.Module):
                     repaired += 1
         return {"repaired_layers": int(repaired)}
 
-    def export_hybrid_attention_state(self) -> Dict[str, Any]:
-        state_dict: Dict[str, Any] = {}
-        mix_values: Dict[str, float] = {}
-        layer_selection: List[int] = []
+    def export_hybrid_attention_state(self) -> dict[str, Any]:
+        state_dict: dict[str, Any] = {}
+        mix_values: dict[str, float] = {}
+        layer_selection: list[int] = []
         for layer_idx, attn in self.iter_hybrid_attention_modules():
             key = f"layers.{layer_idx}.self_attn"
             state_dict[key] = attn.export_hybrid_state()
@@ -2304,10 +2301,10 @@ class NeuroplasticLlama(nn.Module):
             "mix_values_by_layer": mix_values,
         }
 
-    def export_collapsed_attention_state(self) -> Dict[str, Dict[str, torch.Tensor]]:
+    def export_collapsed_attention_state(self) -> dict[str, dict[str, torch.Tensor]]:
         if self.attention_hybrid_enabled:
             return self.export_hybrid_attention_state()
-        payload: Dict[str, Dict[str, torch.Tensor]] = {}
+        payload: dict[str, dict[str, torch.Tensor]] = {}
         for layer_idx, layer in enumerate(self.model.model.layers):
             attn = layer.self_attn
             if hasattr(attn, "mamba_block"):
@@ -2318,7 +2315,7 @@ class NeuroplasticLlama(nn.Module):
         self,
         checkpoint_path: str,
         strict: bool = True,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         blob = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(blob, dict):
             raise RuntimeError("hybrid attention checkpoint must be a dict")
@@ -2357,7 +2354,7 @@ class NeuroplasticLlama(nn.Module):
         self,
         checkpoint_path: str,
         strict: bool = True,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         return self.load_hybrid_attention_state(checkpoint_path=checkpoint_path, strict=strict)
 
     def clear_sparse_mlp_bank_manifest(self) -> None:
@@ -2370,7 +2367,7 @@ class NeuroplasticLlama(nn.Module):
         self,
         manifest_path: str,
         strict: bool = True,
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         manifest_file = Path(manifest_path)
         if not manifest_file.exists():
             raise RuntimeError(f"Sparse MLP manifest does not exist: {manifest_path}")
@@ -2381,7 +2378,7 @@ class NeuroplasticLlama(nn.Module):
         if not isinstance(layer_entries, list):
             raise RuntimeError("Sparse MLP manifest missing 'layers' list")
 
-        by_layer: Dict[int, Dict[str, Any]] = {}
+        by_layer: dict[int, dict[str, Any]] = {}
         for entry in layer_entries:
             if not isinstance(entry, dict):
                 continue
@@ -2423,8 +2420,8 @@ class NeuroplasticLlama(nn.Module):
         self._sparse_mlp_bank_manifest_path = str(manifest_file)
         return {"loaded_layers": int(loaded), "missing_layers": int(missing)}
 
-    def get_sparse_mlp_bank_status(self) -> Dict[str, Any]:
-        loaded_layers: List[int] = []
+    def get_sparse_mlp_bank_status(self) -> dict[str, Any]:
+        loaded_layers: list[int] = []
         for layer_idx, wrapper in enumerate(self.sca_sparse_mlps):
             has_bank = bool(hasattr(wrapper, "has_block_bank") and wrapper.has_block_bank())
             if has_bank:
@@ -2435,21 +2432,21 @@ class NeuroplasticLlama(nn.Module):
             "manifest_path": self._sparse_mlp_bank_manifest_path,
         }
 
-    def get_sparse_mlp_diagnostics(self) -> Dict[str, Any]:
-        layers: List[Dict[str, Any]] = []
+    def get_sparse_mlp_diagnostics(self) -> dict[str, Any]:
+        layers: list[dict[str, Any]] = []
         total_bytes = 0.0
         mean_fraction = 0.0
         counted = 0
-        latent_norms: List[float] = []
-        latent_active_fractions: List[float] = []
-        latent_coords_used: List[float] = []
-        latent_usage_entropies: List[float] = []
-        latent_support_overlaps: List[float] = []
-        latent_support_unique_fractions: List[float] = []
-        max_latent_importance_fractions: List[float] = []
-        max_latent_load_fractions: List[float] = []
-        max_block_importance_fractions: List[float] = []
-        max_block_load_fractions: List[float] = []
+        latent_norms: list[float] = []
+        latent_active_fractions: list[float] = []
+        latent_coords_used: list[float] = []
+        latent_usage_entropies: list[float] = []
+        latent_support_overlaps: list[float] = []
+        latent_support_unique_fractions: list[float] = []
+        max_latent_importance_fractions: list[float] = []
+        max_latent_load_fractions: list[float] = []
+        max_block_importance_fractions: list[float] = []
+        max_block_load_fractions: list[float] = []
         for wrapper in self.sca_sparse_mlps:
             diag = wrapper.get_last_diagnostics()
             if diag is None:
@@ -2501,13 +2498,10 @@ class NeuroplasticLlama(nn.Module):
             "mean_max_block_load_fraction": float(sum(max_block_load_fractions) / max(len(max_block_load_fractions), 1)),
         }
 
-    def _maybe_update_summary(self, generated: Union[torch.LongTensor, int]) -> None:
+    def _maybe_update_summary(self, generated: torch.LongTensor | int) -> None:
         if generated is None:
             return
-        if isinstance(generated, int):
-            total_tokens = int(generated)
-        else:
-            total_tokens = int(generated.shape[-1])
+        total_tokens = int(generated) if isinstance(generated, int) else int(generated.shape[-1])
         if not self._summary_manager.observe(total_tokens):
             return
         if self._summary_provider is None:
@@ -2619,7 +2613,7 @@ class NeuroplasticLlama(nn.Module):
         logits: torch.Tensor,
         do_sample: bool,
         temperature: float,
-        top_k: Optional[int],
+        top_k: int | None,
         top_p: float,
     ) -> torch.Tensor:
         if (not do_sample) or temperature <= 0.0:
@@ -2681,7 +2675,7 @@ class NeuroplasticLlama(nn.Module):
         return out
 
     def register_hooks(self) -> None:
-        # Backward-compat no-op: routing now lives inside SparseLlamaMLP wrappers.
+
         return None
 
     def _replace_mlp_with_sparse_wrappers(self) -> None:
@@ -2715,7 +2709,7 @@ class NeuroplasticLlama(nn.Module):
         enabled = lower <= int(layer_idx) < max(upper, 0)
         if not enabled:
             return False
-        # Dense anchor logic: bypass sparsity every N layers to reset the manifold
+
         dense_anchor_stride = int(getattr(self, "sca_dense_anchor_stride", 0))
         if dense_anchor_stride > 0:
             active_offset = int(layer_idx) - lower + 1
@@ -2728,9 +2722,9 @@ class NeuroplasticLlama(nn.Module):
 
     def _prepare_routing_state(
         self,
-        input_ids: Optional[torch.LongTensor],
-        inputs_embeds: Optional[torch.FloatTensor],
-        past_key_values: Optional[List[torch.FloatTensor]],
+        input_ids: torch.LongTensor | None,
+        inputs_embeds: torch.FloatTensor | None,
+        past_key_values: list[torch.FloatTensor] | None,
     ) -> None:
         if not self.neuroplasticity_enabled:
             self._routing_decode_mode = False
@@ -2799,17 +2793,17 @@ class NeuroplasticLlama(nn.Module):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: list[torch.FloatTensor] | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
         task_id: int = 0,
         **kwargs: Any,
     ):
@@ -2826,7 +2820,7 @@ class NeuroplasticLlama(nn.Module):
             self._cached_task_emb_task_id = self._current_task_id
         self._last_decoder_mirror_diagnostics = {}
 
-        # Keep clean baseline path when disabled: no task embedding injection.
+
         if (
             self.neuroplasticity_enabled
             and (not self.disable_task_bias_injection)
@@ -2846,9 +2840,9 @@ class NeuroplasticLlama(nn.Module):
             past_key_values=past_key_values,
         )
         tier_mask_bundle = self._get_tier_mask_bundle()
-        model_kwargs: Dict[str, Any] = dict(kwargs)
-        # LlamaForCausalLM forwards unknown kwargs into loss_function when labels are set.
-        # Keep tier-specific kwargs on generation path only.
+        model_kwargs: dict[str, Any] = dict(kwargs)
+
+
         if tier_mask_bundle is not None and labels is None:
             model_kwargs["tier_mask_bundle"] = tier_mask_bundle
 
@@ -2933,8 +2927,8 @@ class NeuroplasticLlama(nn.Module):
     def forward_dual_stream(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
         use_cache: bool = False,
         output_hidden_states: bool = False,
         task_id: int = 0,
@@ -2988,17 +2982,17 @@ class NeuroplasticLlama(nn.Module):
     def _generate_with_kv_optimizations(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: Optional[int] = None,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int | None = None,
         do_sample: bool = False,
         temperature: float = 1.0,
-        top_k: Optional[int] = 50,
+        top_k: int | None = 50,
         top_p: float = 1.0,
         use_cache: bool = True,
-        eos_token_id: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
-        pad_token_id: Optional[int] = None,
+        eos_token_id: int | list[int] | tuple[int, ...] | None = None,
+        pad_token_id: int | None = None,
         task_id: int = 0,
-        retrieved_chunk_ids: Optional[List[torch.LongTensor]] = None,
+        retrieved_chunk_ids: list[torch.LongTensor] | None = None,
     ) -> torch.LongTensor:
         use_cache = not self._should_disable_generation_cache(bool(use_cache))
         if bool(self._runtime_flags.get("taylor_attention_enabled", False)):
@@ -3070,7 +3064,7 @@ class NeuroplasticLlama(nn.Module):
             pad_token_id = int(eos_ids[0])
 
         generated = input_ids
-        generated_chunks: List[torch.Tensor] = [generated]
+        generated_chunks: list[torch.Tensor] = [generated]
         unfinished = torch.ones((generated.shape[0],), dtype=torch.bool, device=generated.device)
         cached_state: Any = None
         use_packed_cache = bool(use_cache and self._kv_optimized_generation_enabled())
@@ -3199,18 +3193,18 @@ class NeuroplasticLlama(nn.Module):
 
     def generate(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: Optional[int] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        max_new_tokens: int | None = None,
         do_sample: bool = False,
         temperature: float = 1.0,
-        top_k: Optional[int] = 50,
+        top_k: int | None = 50,
         top_p: float = 1.0,
         use_cache: bool = True,
-        eos_token_id: Optional[Union[int, List[int], Tuple[int, ...]]] = None,
-        pad_token_id: Optional[int] = None,
+        eos_token_id: int | list[int] | tuple[int, ...] | None = None,
+        pad_token_id: int | None = None,
         task_id: int = 0,
-        retrieved_chunk_ids: Optional[List[torch.LongTensor]] = None,
+        retrieved_chunk_ids: list[torch.LongTensor] | None = None,
         **kwargs: Any,
     ):
         if input_ids is None:
@@ -3328,7 +3322,7 @@ class NeuroplasticLlama(nn.Module):
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args, **kwargs):
         config_path = os.path.join(pretrained_model_name_or_path, "config.json")
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 config = json.load(f)
             model_name = config.get("base_model_name", "unsloth/Meta-Llama-3.1-8B-bnb-4bit")
             num_tasks = int(config.get("num_tasks", 10))

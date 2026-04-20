@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -29,17 +28,17 @@ class SCASparseConfig:
     routing_mode: str = "spatial_grid"
     semantic_block_score_normalized: bool = False
     output_compensation_bias_enabled: bool = False
-    basis_rank_by_layer: Dict[int, int] = field(default_factory=dict)
-    basis_top_k_by_layer: Dict[int, int] = field(default_factory=dict)
-    top_k_by_layer: Dict[int, int] = field(default_factory=dict)
+    basis_rank_by_layer: dict[int, int] = field(default_factory=dict)
+    basis_top_k_by_layer: dict[int, int] = field(default_factory=dict)
+    top_k_by_layer: dict[int, int] = field(default_factory=dict)
     soft_mask: bool = True
     grouped_row_gemm: bool = False
     grouped_row_min_bucket: int = 2
     grouped_row_allow_4bit_dequant: bool = False
     stability_dense_fallback_threshold: float = 0.0
-    _basis_rank_by_layer_arr: Optional[Tuple[int, ...]] = field(default=None, init=False, repr=False)
-    _basis_top_k_by_layer_arr: Optional[Tuple[int, ...]] = field(default=None, init=False, repr=False)
-    _top_k_by_layer_arr: Optional[Tuple[int, ...]] = field(default=None, init=False, repr=False)
+    _basis_rank_by_layer_arr: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    _basis_top_k_by_layer_arr: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    _top_k_by_layer_arr: tuple[int, ...] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -144,8 +143,8 @@ class SCASparseConfig:
         self._top_k_by_layer_arr = tuple(top_k_vals)
 
     @staticmethod
-    def _normalize_layer_map(raw: Dict[int, int] | Dict[str, int]) -> Dict[int, int]:
-        out: Dict[int, int] = {}
+    def _normalize_layer_map(raw: dict[int, int] | dict[str, int]) -> dict[int, int]:
+        out: dict[int, int] = {}
         for key, value in dict(raw).items():
             layer_idx = int(key)
             if layer_idx < 0:
@@ -181,8 +180,8 @@ class SCASparseConfig:
         default = self.top_k_by_layer.get(int(layer_idx), self.route_top_k)
         return int(max(1, min(int(default), self.num_blocks)))
 
-    def to_dict(self) -> Dict[str, object]:
-        payload: Dict[str, object] = {}
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {}
         for key, value in self.__dict__.items():
             if key.startswith("_"):
                 continue
@@ -190,7 +189,7 @@ class SCASparseConfig:
         return payload
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, object]) -> "SCASparseConfig":
+    def from_dict(cls, payload: dict[str, object]) -> SCASparseConfig:
         return cls(**payload)
 
     @classmethod
@@ -203,7 +202,7 @@ class SCASparseConfig:
         top_k: int = 2,
         use_cuda: bool = True,
         spmm_impl: str = "dense",
-    ) -> "SCASparseConfig":
+    ) -> SCASparseConfig:
         return cls(
             hidden_size=int(hidden_size),
             block_size=int(block_size),

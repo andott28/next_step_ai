@@ -1,110 +1,32 @@
 # next_step_ai
 
-Inference runtime for **Llama 3.1 405B on 8 GB VRAM**, using learned-basis MLP sparsity, NF4 quantization, and layer-by-layer streaming.
+Streaming inference runtime for Llama 3.1 405B on constrained VRAM. The maintained path visits all 126 transformer layers during real generation, but streams only the active layer to GPU and reduces per-layer transfer with learned-basis sparse MLP routing, sparse attention, sparse K/V loading, and VRAM hot-block caching.
 
----
+## Maintained Surface
 
-## What this is
-
-Standard 405B inference requires ~800 GB of GPU memory. This project achieves full-quality autoregressive generation on a single 8 GB GPU by combining three techniques:
-
-1. **Layer streaming** — only one decoder layer lives on the GPU at any time; the remaining 125 layers are kept in RAM and streamed on demand.
-2. **Sparse MLP routing** - the preferred artifact fits a linear router over true SiLU-gated FFN intermediate block scores. At decode time, selected gate/up/down blocks still execute the original `SiLU(gate) * up` MLP math; legacy output-basis artifacts remain available only as approximation modes.
-3. **NF4 hot-block VRAM cache** — the most frequently-accessed NF4 weight blocks for covered MLP layers are pinned in VRAM, cutting per-token PCIe traffic by up to 60%.
-
-### Design philosophy: No-Training Invariant
-
-All model modifications are **closed-form and zero-shot** — no SGD, no gradient-based tuning. The sparse basis is fitted once via PCA + least-squares regression on calibration activations. This makes every run fully deterministic and reproducible without requiring any training infrastructure.
-
----
-
-## Architecture overview
-
-```
-Input tokens
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  StreamingLlamaRuntime              │
-│                                     │
-│  for each layer (0–125):            │
-│    ├─ Load weights (RAM → GPU)      │
-│    ├─ Self-attention (GQA)          │  ← optional sparse head loading
-│    └─ MLP forward                   │
-│         ├─ Covered (0–125):         │  ← learned-basis sparse path
-│         │    router -> active FFN   │
-│         │    -> exact sparse MLP    │
-│         └─ Uncovered (guard layers):│  ← exact 4-bit dense guard
-│              chunked NF4 dequant    │
-└─────────────────────────────────────┘
-    │
-    ▼
-  lm_head → logits → next token
-```
-
-### MLP sparsity: exact intermediate routing
-
-For each covered layer, the preferred offline fitting path produces:
-
-| Tensor | Shape | Purpose |
-|--------|-------|---------|
-| `encoder_weight` | `[basis_rank, hidden_size]` | Projects hidden state to linear latent coefficients |
-| `encoder_bias` | `[basis_rank]` | Encoder bias |
-| `score_weight` | `[num_intermediate_blocks, basis_rank]` | Reconstructs per-block intermediate activity scores |
-| `score_bias` | `[num_intermediate_blocks]` | Mean score offset |
-| `block_importance` | `[num_intermediate_blocks]` | Global fallback ranking and hot-cache signal |
-
-At decode time:
-```python
-latent = hidden @ encoder_weight.T + encoder_bias
-latent = keep_top_abs(latent, k=basis_top_k)
-scores = latent @ score_weight.T + score_bias
-active_blocks = top_k(scores, k=sparse_top_k)
-out = down_proj(SiLU(gate_proj_active(hidden)) * up_proj_active(hidden))
-```
-
-The old `output_reconstruction` artifact is still loadable through `output_basis_surrogate` and `routed_output_blocks`, but it is an output approximation. Use `intermediate_block_scores` plus `exact_intermediate_sparse` for correctness.
-
-### Memory layout (per token, decode)
-
-| Location | Contents | Size |
-|----------|----------|------|
-| GPU VRAM | 1 decoder layer skeleton | ~32 MB |
-| GPU VRAM | NF4 hot-block cache | up to 6.4 GB |
-| GPU VRAM | KV cache for current session | small |
-| CPU RAM (pinned) | Full weight cache (LRU) | up to available RAM |
-| SSD | Full NF4 safetensors checkpoint | ~210 GB |
-
----
-
-## Repository layout
-
-```
+```text
 next_step_ai/
 ├── llama3_neuroplastic/
-│   ├── basis_fitting.py                 # PCA + least-squares basis fitting
-│   ├── bounded_context.py               # Tiered context masking for long sequences
-│   ├── gqa_taylor_ssd.py                # Taylor-SSD linear attention backend
-│   ├── neuroplastic_llama_gqa_mamba.py  # Full NeuroplasticLlama model class
-│   ├── paged_sparse_attention.py        # Page-based sparse KV attention
-│   ├── performance_utils.py             # Runtime env config (TF32, pinned memory)
-│   ├── sca_decoder_mirror.py            # Experimental: predictive routing
-│   ├── sca_sparse_adapter.py            # Routing utilities
-│   ├── sca_sparse_config.py             # Config dataclass + validation
-│   ├── sca_sparse_kv.py                 # Sparse K/V column-block routing
-│   ├── sca_sparse_mlp.py                # Sparse MLP wrapper (NeuroplasticLlama path)
-│   ├── token_posting_archive.py         # CPU sparse token index for long-context retrieval
-│   ├── triton_sca_gate.py               # Triton gate kernels
-│   ├── triton_sparse_mlp.py             # Triton sparse MLP kernels
+│   ├── basis_fitting.py
+│   ├── gqa_taylor_ssd.py
+│   ├── layer_selection.py
+│   ├── performance_utils.py
+│   ├── token_posting_archive.py
+│   ├── triton_sparse_mlp.py
 │   └── experiments/
-│       ├── streaming_llama_runtime.py   # Main streaming inference runtime (core)
-│       ├── run_streaming_inference.py   # Interactive CLI entrypoint
-│       ├── init_learned_basis_from_dense_mlp.py  # Offline basis fitting pipeline
-│       ├── init_kv_basis.py             # K/V column-block routing fitting
-│       ├── init_attn_share.py           # Attention weight sharing initialization
-│       ├── init_attn_token_posting_basis.py      # Token-posting basis fitting
-│       ├── eval_perplexity.py           # Perplexity evaluation harness
-│       └── benchmark.py                 # Throughput benchmark
+│       ├── streaming_llama_runtime.py
+│       ├── run_streaming_inference.py
+│       ├── init_learned_basis_from_dense_mlp.py
+│       ├── init_kv_basis.py
+│       ├── init_attn_share.py
+│       ├── init_attn_token_posting_basis.py
+│       ├── eval_perplexity.py
+│       ├── benchmark.py
+│       ├── verify_sparse_mlp_checkpoint.py
+│       ├── verify_sparse_mlp_generation_pair.py
+│       └── verify_sparse_mlp_runtime_summary.py
+├── legacy/
+│   └── older experimental full-model/SCA code and one-off diagnostics
 ├── tests/
 │   └── test_streaming_llama_runtime.py
 ├── pyproject.toml
@@ -112,84 +34,187 @@ next_step_ai/
 └── README.md
 ```
 
----
+Anything under `legacy/` is not part of the supported runtime surface.
 
-## Installation
+## Core Idea
+
+Standard 405B inference does not fit in 8 GB VRAM. This runtime reduces resident VRAM and per-token transfer by combining:
+
+1. Layer streaming: every generated token still traverses all 126 transformer layers, but only the active decoder layer is materialized on GPU.
+2. Learned-basis MLP routing: covered layers route to selected FFN intermediate blocks and execute the original `SiLU(gate) * up -> down` math for those blocks.
+3. Sparse attention and sparse K/V loading: attention artifacts reduce q/o and k/v transfer inside each layer.
+4. NF4 hot-block caching: frequently used packed NF4 MLP blocks stay in VRAM to reduce repeated PCIe transfer.
+5. Decode-time cache adaptation: cold MLP blocks and down-proj columns that are actually used during decode are promoted into the VRAM hot cache when budget remains, so calibration misses do not stay permanent misses.
+
+Sparse execution here means less work inside each layer, not skipping transformer layers. Whole-layer skipping is not part of the maintained generation path because skipped layers would miss residual updates and K/V cache state.
+
+The preferred sparse MLP artifact target is `intermediate_block_scores`; legacy `output_reconstruction` artifacts are approximate and should be treated as compatibility mode only. `exact_intermediate_sparse` requires an intermediate artifact with `score_weight` and `score_bias`; it will fail on legacy output artifacts with `decoder_blocks`.
+
+## Install
 
 ```bash
-# Clone and install in editable mode
-git clone <repo-url>
-cd next_step_ai
 pip install -e .
-
-# With Triton kernels (Windows — required for fast sparse MLP)
 pip install -e ".[triton]"
-
-# With evaluation tools
 pip install -e ".[eval]"
 ```
 
-**Requirements:** Python 3.10+, CUDA 11.8+, ~30 GB RAM (for weight cache), 8 GB VRAM minimum (RTX 2080 tested).
+Requirements: Python 3.10+, PyTorch with CUDA, `bitsandbytes`, `transformers`, and enough host RAM for the selected cache settings.
 
----
-
-## Quick start
-
-### 1. Fit the learned basis (offline, run once)
-
-Streams calibration activations through the dense model and fits a PCA basis per MLP layer. Requires the full 405B checkpoint.
+## Fit Sparse MLP Basis
 
 ```bash
 python -m llama3_neuroplastic.experiments.init_learned_basis_from_dense_mlp \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
-    --output-path results/mlp_basis_full126.pt \
+    --output-path results/mlp_basis_intermediate_full126.pt \
     --use-streaming-harness \
     --layers 0-125 \
     --max-rows-per-layer 4096 \
+    --artifact-target intermediate_block_scores \
     --basis-rank 64 \
+    --basis-top-k 64 \
     --sca-block-size 32 \
     --resume-save-every-batches 1 \
     --write-partial-output-every-batches 1
 ```
 
-This produces `results/mlp_basis_full126.pt` covering all 126 layers. If you have a partial checkpoint from a previous run, add `--hybrid-checkpoint results/mlp_basis.pt --only-missing-from-output` to skip already-fitted layers.
+The non-streaming legacy fitting path is intentionally unsupported. Use `--use-streaming-harness`.
 
-### 2. Run interactive inference
+## Run Inference
 
 ```bash
 python -m llama3_neuroplastic.experiments.run_streaming_inference \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
     --local-files-only \
-    --sparse-basis-path results/mlp_basis_full126.pt \
+    --sparse-basis-path results/mlp_basis_intermediate_full126.pt \
+    --sparse-mlp-execution auto \
     --sparse-top-k 51 \
     --attn-head-importance-path results/attn_head_importance_405b.pt \
     --attn-active-heads 9 \
     --attn-min-active-heads 9 \
     --attn-max-active-heads 9 \
+    --kv-basis-path results/kv_basis_r32.pt \
+    --sparse-kv-prefill-mode sparse \
+    --sparse-attn-prefill-mode sparse \
     --vram-hot-cache-gb 2.0 \
+    --pre-warm \
+    --calibrate-hot-cache \
+    --hot-cache-calibration-tokens 64 \
     --prompt-format chat \
     --prompt "What is the capital of France?"
 ```
 
-This is the configuration tuned for RTX 2080 (8 GB VRAM). For GPUs with more VRAM, increase `--vram-hot-cache-gb` accordingly (up to ~6.4 GB on a 24 GB card) and raise `--attn-active-heads`.
+Use `--pre-warm` when you want the VRAM hot cache loaded before the first prompt. Add `--calibrate-hot-cache` for throughput probes: it first loads the static hot cache, runs a short live sparse-routing pass from the actual prompt positions, replaces the hot-block map with the blocks that are actually selected by `_route_sparse_mlp(...)`, then rebuilds the VRAM cache. This intentionally makes startup longer so decode traffic is lower.
 
-### 3. Benchmark throughput
+The runtime also adapts during decode. If a calibrated MLP block is missing from the VRAM hot cache, the first cold load still completes the token, then the loaded gate/up block or down-proj column is promoted into the hot cache if the budget allows. Sparse attention Q/O hot-cache reads also support partial hits: cached heads are used immediately and only missing heads take the cold path.
+
+## 3.3 tok/s Probe
+
+The 3.3 tok/s decode path assumes all 126 layers are still visited. The target comes from lowering per-layer traffic, not from reducing layer count. At about 23 MiB/layer, one token transfers about 2.8 GiB across all layers; on a roughly 9.3 GiB/s PCIe path, that is about 0.30 s/token, or 3.3 tok/s.
+
+This path needs the intermediate sparse MLP artifact, sparse attention, sparse K/V prefill, live-route hot-cache calibration, decode-time hot-cache promotion, GPU LM head, and the Triton sparse MLP kernels. Do not use `results/mlp_basis_full126.pt` for this path; that file is a legacy `output_reconstruction` artifact with 512 output blocks and cannot run `exact_intermediate_sparse`.
+
+Validated intermediate artifact shape:
+
+```text
+checkpoint = results/mlp_basis_intermediate_full126.pt
+artifact_target = intermediate_block_scores
+block_domain = intermediate
+recommended_execution = exact_intermediate_sparse
+layers = 126
+num_blocks = 1664
+```
+
+Verify the artifact before probing throughput:
+
+```bash
+python -m llama3_neuroplastic.experiments.verify_sparse_mlp_checkpoint \
+    --checkpoint results/mlp_basis_intermediate_full126.pt \
+    --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
+    --local-files-only \
+    --expect-target intermediate_block_scores \
+    --expect-block-domain intermediate \
+    --expect-layers 126 \
+    --expect-num-blocks 1664
+```
+
+Run the throughput probe:
+
+```powershell
+if (Test-Path .\verification_env\Scripts\Activate.ps1) { . .\verification_env\Scripts\Activate.ps1 }; $env:STREAMING_GPU_LM_HEAD="1"; $env:STREAMING_BACKGROUND_PREFETCH="1"; $env:STREAMING_WINDOWS_BATCH_PRELOAD="1"; $env:STREAMING_SHOW_PROGRESS="1"; $env:STREAMING_VRAM_HOT_CACHE_GB="5.25"; python -m llama3_neuroplastic.experiments.run_streaming_inference --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" --local-files-only --taylor-layers none --sparse-basis-path results/mlp_basis_intermediate_full126.pt --sparse-mlp-execution exact_intermediate_sparse --sparse-top-k 51 --sparse-basis-top-k 64 --sparse-mlp-prefill-mode hot_cache --vram-hot-cache-gb 5.25 --pre-warm --calibrate-hot-cache --hot-cache-calibration-tokens 64 --attn-head-importance-path results/attn_head_importance_405b.pt --attn-active-heads 5 --attn-min-active-heads 5 --attn-max-active-heads 5 --sparse-attn-prefill-mode sparse --kv-basis-path results/kv_basis_r32.pt --sparse-kv-prefill-mode sparse --prompt-format chat --max-new-tokens 64 --no-stream-output --dump-json results/throughput_3_3_probe.json --prompt "What is the capital of France?"
+```
+
+Pass conditions:
+
+```text
+decode_tok_s >= 3.30
+mean decode latency <= 303 ms/token
+decode traffic near 23 MiB/layer for the 3.3 tok/s target
+LM head resident on GPU
+VRAM hot cache remains enabled
+Triton sparse MLP path remains enabled
+```
+
+Expected startup log sequence:
+
+```text
+[pre-warm] complete ...
+[hot-cache-calibration] collecting live MLP routes from N token(s)
+[hot-cache-calibration] updated 126/126 layers ...
+[hot-cache-calibration] rebuilding VRAM hot-cache from live routes
+[pre-warm] complete ...
+```
+
+If the run is slow, inspect `results/throughput_3_3_probe.json` and the console traffic line. High decode traffic means attention/K/V transfer or cold MLP block transfer is still too large; low traffic with low tok/s points to execution overhead or Triton fallback.
+
+The main remaining performance risk is whether the calibrated hot-cache budget is large enough for the live routed blocks. If `--calibrate-hot-cache` updates far fewer than 126 layers, the calibration pass did not exercise sparse MLP routing for the full model. If it updates all layers but decode traffic is still high, raise `--vram-hot-cache-gb` until the active blocks fit or lower `--sparse-top-k` for the probe.
+
+On Windows WDDM, the hot-cache capacity check uses both driver free VRAM and PyTorch allocator-reserved VRAM. This avoids false auto-clamping immediately after a large hot-cache rebuild when WDDM has not yet reflected deallocation in `mem_get_info()`.
+
+## Optional Artifact Builders
+
+```bash
+python -m llama3_neuroplastic.experiments.init_kv_basis \
+    --model-path "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
+    --output-path results/kv_basis_r32.pt \
+    --basis-rank 32 \
+    --block-size 32 \
+    --top-k 51 \
+    --layers all
+
+python -m llama3_neuroplastic.experiments.init_attn_share \
+    --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
+    --output-path results/attn_share_qokv.pt \
+    --layers all
+
+python -m llama3_neuroplastic.experiments.init_attn_token_posting_basis \
+    --model-path "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
+    --output-path results/attn_token_posting_basis.pt
+```
+
+There is currently no maintained `init_learned_attn_head_importance.py` in this tree. If you pass `--attn-head-importance-path`, the artifact must already exist.
+
+## Benchmark
 
 ```bash
 python -m llama3_neuroplastic.experiments.benchmark \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
-    --sparse-basis-path results/mlp_basis.pt \
-    --max-new-tokens 20 \
-    --warmup-tokens 5 \
+    --sparse-basis-path results/mlp_basis_intermediate_full126.pt \
+    --attn-head-importance-path results/attn_head_importance_405b.pt \
+    --taylor-layers none \
+    --vram-hot-cache-gb 5.25 \
+    --max-new-tokens 5 \
+    --warmup-tokens 2 \
     --output-json results/benchmark.json
 ```
 
-### 4. Evaluate perplexity
+The benchmark warms the runtime, calibrates the VRAM hot cache from the actual timed prompt, rebuilds the hot cache, and records a traffic report in the output JSON.
+
+## Evaluate Perplexity
 
 ```bash
 python -m llama3_neuroplastic.experiments.eval_perplexity \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
-    --sparse-basis-path results/mlp_basis.pt \
+    --sparse-basis-path results/mlp_basis_intermediate_full126.pt \
     --dataset wikitext \
     --dataset-config wikitext-2-raw-v1 \
     --dataset-split test \
@@ -197,131 +222,36 @@ python -m llama3_neuroplastic.experiments.eval_perplexity \
     --output-json results/ppl_eval.json
 ```
 
----
-
-## Key CLI flags
-
-### `run_streaming_inference.py` / `StreamingLlamaRuntime`
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--sparse-basis-path` | None | Path to learned-basis checkpoint (`.pt`) |
-| `--attn-head-importance-path` | None | Sparse attention head importance artifact |
-| `--kv-basis-path` | None | K/V column-block routing artifact |
-| `--vram-hot-cache-gb` | 6.4 | VRAM budget for hot NF4 block cache |
-| `--sparse-top-k` | auto | Active MLP blocks per token. For `intermediate_block_scores`, this is FFN intermediate block sparsity |
-| `--sparse-basis-top-k` | checkpoint | Runtime override for latent support sparsity |
-| `--sparse-mlp-execution` | `auto` | `auto`, `output_basis_surrogate`, `routed_output_blocks`, `exact_intermediate_sparse`, or `exact_intermediate_sparse_oracle` |
-| `--sparse-mlp-prefill-mode` | `dense` | Keep prompt prefill dense by default, or opt into sparse covered-layer prefill |
-| `--max-runtime-layers` | None | Cap layers for smoke testing |
-| `--no-stream-output` | off | Batch output instead of token streaming |
-| `--no-ram-cache` | off | Disable RAM weight cache (re-reads from SSD each token) |
-
-### `init_learned_basis_from_dense_mlp.py`
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--layers` | all | Layer range to fit, e.g. `2-111` or `0,1,112-125` |
-| `--artifact-target` | `intermediate_block_scores` | Preferred target for exact sparse MLP routing. Use `output_reconstruction` only for legacy surrogate checkpoints |
-| `--use-streaming-harness` | off | Required for `intermediate_block_scores` so the collector can capture true streamed FFN block scores |
-| `--basis-rank` | 64 | PCA decomposition rank per layer |
-| `--basis-top-k` | 64 | Latent support sparsity at decode time |
-| `--max-rows-per-layer` | 4096 | Calibration activations per layer |
-| `--output-path` | required | Destination `.pt` checkpoint |
-| `--resume` | off | Resume from a partial `.resume.pt` checkpoint |
-
----
-
-## Performance
-
-Measured on a single RTX 2080 (8 GB VRAM) / 405B model, PCIe 3.0 x16 (~11 GB/s H2D):
-
-| Configuration | Decode (tok/s) | Notes |
-|---------------|----------------|-------|
-| Dense guard only (no basis) | ~0.04 | Baseline — all 126 layers dense, ~1510 MB/layer |
-| Basis layers 2–111, 16 heads | ~0.8 | 16 dense guard layers dominate at ~1510 MB each |
-| All 126 layers, 9 heads, hot-cache | **~3.3** | Target — ~23 MB/layer transfer |
-
-Target: **3.3 tok/s** with all 126 layers covered by the basis, 9 active attention heads, and 2.0 GB VRAM hot-block cache enabled.
-
----
-
-## Known limitations
-
-- **Dense guard layers** — any layers not covered by the basis checkpoint fall back to the full dense 4-bit guard path (~1510 MB/layer), which dominates decode latency. A full 126-layer basis eliminates this.
-- **Sparse MLP prefill defaults to dense** — decode can use sparse covered layers, while prompt prefill stays dense unless `--sparse-mlp-prefill-mode sparse` is set.
-- **Attention compute is not sparse** — head-importance routing reduces PCIe weight transfer, but softmax attention still runs on the full dense skeleton.
-- **Batch size 1 only** — the runtime is single-sequence only.
-- **Taylor-SSD attention is incompatible with sparse head routing** — enabling both is experimental (`STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN=1`) and may produce incorrect outputs.
-
----
-
-## How the sparse MLP fitting works
-
-```
-Dense model forward pass
-    │  (collect MLP inputs x and SiLU-gated intermediate block scores)
-    ▼
-Per-layer PCA on block scores:
-    scores ≈ score_bias + coeff @ score_weight.T
-
-Encoder fit (least-squares):
-    coeff ≈ encoder_weight @ x + encoder_bias
-
-Store: encoder_weight, encoder_bias, score_weight, score_bias, block_importance
-```
-
-The `explained_variance_ratio` field in the checkpoint tells you what fraction of intermediate block-score variance is captured by the router. Full `--sparse-top-k` over all intermediate blocks should match dense MLP execution because the selected path still runs the original gate/up/down weights and applies `SiLU` before `down_proj`.
-
----
-
-## Sparse MLP verification
+## Verify Sparse MLP Artifacts
 
 ```bash
-python verify_sparse_mlp.py
-
 python -m llama3_neuroplastic.experiments.verify_sparse_mlp_checkpoint \
-    --checkpoint results/mlp_basis.pt \
+    --checkpoint results/mlp_basis_intermediate_full126.pt \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
     --expect-target intermediate_block_scores \
     --expect-block-domain intermediate \
-    --expect-layers 110 \
+    --expect-layers 126 \
     --expect-num-blocks 1664
 
 python -m llama3_neuroplastic.experiments.verify_sparse_mlp_runtime_summary \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
-    --sparse-basis-path results/mlp_basis.pt \
+    --sparse-basis-path results/mlp_basis_intermediate_full126.pt \
     --sparse-mlp-execution auto \
-    --expect-execution exact_intermediate_sparse \
-    --expect-target intermediate_block_scores \
-    --expect-block-domain intermediate \
-    --expect-layers 110 \
-    --expect-num-blocks 1664
-
-python -m llama3_neuroplastic.experiments.verify_sparse_mlp_generation_pair \
-    --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
-    --sparse-basis-path results/mlp_basis.pt \
-    --sparse-mlp-execution exact_intermediate_sparse \
-    --sparse-mlp-prefill-mode dense \
-    --sparse-top-k 1664 \
-    --max-new-tokens 2 \
-    --require-identical
+    --expect-execution exact_intermediate_sparse
 ```
 
----
-
-## Running tests
+## Run Tests
 
 ```bash
 pytest tests/ -v
 ```
 
----
-
-## Environment variables
+## Key Environment Variables
 
 | Variable | Effect |
-|----------|--------|
-| `STREAMING_SPARSE_BASIS_EXECUTION` | `auto` (default), `output_basis_surrogate`, `routed_output_blocks`, `exact_intermediate_sparse`, or `exact_intermediate_sparse_oracle` |
-| `STREAMING_SPARSE_MLP_PREFILL_MODE` | `dense` (default) or `sparse` for covered-layer prompt prefill |
-| `STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN` | `1` to allow Taylor-SSD + sparse attention (experimental, may diverge) |
+| --- | --- |
+| `STREAMING_SPARSE_BASIS_EXECUTION` | `auto`, `output_basis_surrogate`, `routed_output_blocks`, `exact_intermediate_sparse`, or `exact_intermediate_sparse_oracle` |
+| `STREAMING_SPARSE_MLP_PREFILL_MODE` | `dense`, `sparse`, or `hot_cache` |
+| `STREAMING_VRAM_HOT_CACHE_GB` | Default VRAM hot-cache budget |
+| `STREAMING_RAM_CACHE_MAX_GB` | Host RAM cache cap |
+| `STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN` | Allows Taylor-SSD with sparse attention despite known divergence risk |

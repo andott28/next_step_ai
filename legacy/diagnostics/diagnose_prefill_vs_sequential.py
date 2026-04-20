@@ -9,7 +9,6 @@ sys.path.insert(0, ".")
 
 from llama3_neuroplastic.experiments.streaming_llama_runtime import StreamingLlamaRuntime
 
-
 MODEL = "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit"
 PROMPT = "The capital of France is"
 

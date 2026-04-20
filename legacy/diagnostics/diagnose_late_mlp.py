@@ -3,15 +3,14 @@ from __future__ import annotations
 import gc
 import sys
 
+import bitsandbytes.functional as bnb_functional
 import torch
 import torch.nn.functional as F
-import bitsandbytes.functional as bnb_functional
 from transformers import AutoTokenizer
 
 sys.path.insert(0, ".")
 
 from llama3_neuroplastic.experiments.streaming_llama_runtime import StreamingLlamaRuntime
-
 
 MODEL = "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit"
 TARGET_LAYER = 125

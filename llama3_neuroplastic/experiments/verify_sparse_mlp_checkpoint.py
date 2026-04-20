@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import torch
 
 try:
     from transformers import AutoConfig
-except ImportError:  # pragma: no cover
-    AutoConfig = None  # type: ignore[assignment]
+except ImportError:
+    AutoConfig = None
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -35,7 +35,7 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _layer_stat(layer_state: Dict[str, Any], stats: Dict[str, Any], layer_key: str, name: str, default: Any) -> Any:
+def _layer_stat(layer_state: dict[str, Any], stats: dict[str, Any], layer_key: str, name: str, default: Any) -> Any:
     if name in layer_state:
         return layer_state[name]
     layer_stats = stats.get(layer_key, {}) if isinstance(stats, dict) else {}
@@ -44,7 +44,7 @@ def _layer_stat(layer_state: Dict[str, Any], stats: Dict[str, Any], layer_key: s
     return default
 
 
-def _load_model_shape(model_name: str, local_files_only: bool) -> Dict[str, int]:
+def _load_model_shape(model_name: str, local_files_only: bool) -> dict[str, int]:
     if not model_name:
         return {}
     if AutoConfig is None:
@@ -57,7 +57,7 @@ def _load_model_shape(model_name: str, local_files_only: bool) -> Dict[str, int]
     }
 
 
-def _expected_blocks_for_domain(model_shape: Dict[str, int], block_domain: str, block_size: int) -> Optional[int]:
+def _expected_blocks_for_domain(model_shape: dict[str, int], block_domain: str, block_size: int) -> int | None:
     if not model_shape:
         return None
     width = int(model_shape["hidden_size"] if block_domain == "output" else model_shape["intermediate_size"])
@@ -71,18 +71,18 @@ def _expected_blocks_for_domain(model_shape: Dict[str, int], block_domain: str, 
 def _validate_layer(
     *,
     layer_key: str,
-    layer_state: Dict[str, Any],
-    stats: Dict[str, Any],
-    config: Dict[str, Any],
-    model_shape: Dict[str, int],
+    layer_state: dict[str, Any],
+    stats: dict[str, Any],
+    config: dict[str, Any],
+    model_shape: dict[str, int],
     artifact_target: str,
     block_domain: str,
     block_size: int,
     config_num_blocks: int,
     min_explained_variance: float,
-) -> Tuple[Dict[str, Any], List[str]]:
-    errors: List[str] = []
-    layer_summary: Dict[str, Any] = {"layer": int(layer_key)}
+) -> tuple[dict[str, Any], list[str]]:
+    errors: list[str] = []
+    layer_summary: dict[str, Any] = {"layer": int(layer_key)}
 
     enc_w = layer_state.get("encoder_weight")
     enc_b = layer_state.get("encoder_bias")
@@ -238,7 +238,7 @@ def main() -> int:
     config_num_blocks = int(config.get("num_blocks", 0))
     model_shape = _load_model_shape(str(args.model_name), bool(args.local_files_only)) if args.model_name else {}
 
-    errors: List[str] = []
+    errors: list[str] = []
     if args.expect_target != "any" and artifact_target != str(args.expect_target):
         errors.append(f"artifact_target={artifact_target!r}, expected {args.expect_target!r}")
     if args.expect_block_domain != "any" and block_domain != str(args.expect_block_domain):
@@ -270,7 +270,7 @@ def main() -> int:
     if len(layer_states) < int(args.min_layers):
         errors.append(f"layer count {len(layer_states)} < required minimum {int(args.min_layers)}")
 
-    layer_summaries: List[Dict[str, Any]] = []
+    layer_summaries: list[dict[str, Any]] = []
     for layer_key in sorted(layer_states.keys(), key=lambda value: int(value)):
         state = layer_states[layer_key]
         if not isinstance(state, dict):
@@ -295,7 +295,7 @@ def main() -> int:
     num_blocks = sorted({int(item["num_blocks"]) for item in layer_summaries if "num_blocks" in item})
     if int(args.expect_num_blocks) > 0 and num_blocks != [int(args.expect_num_blocks)]:
         errors.append(f"unique_num_blocks={num_blocks} != expected [{int(args.expect_num_blocks)}]")
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "checkpoint": str(checkpoint_path),
         "artifact_target": artifact_target,
         "block_domain": block_domain,

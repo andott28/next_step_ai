@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import torch
 
 try:
     from sklearn.decomposition import IncrementalPCA
-except ImportError:  # pragma: no cover
+except ImportError:
     IncrementalPCA = None
 
 
@@ -28,7 +28,7 @@ def _select_pca_method(
     return "lowrank"
 
 
-def _fit_lowrank_pca(y_centered: torch.Tensor, *, rank_eff: int) -> Tuple[torch.Tensor, torch.Tensor, float]:
+def _fit_lowrank_pca(y_centered: torch.Tensor, *, rank_eff: int) -> tuple[torch.Tensor, torch.Tensor, float]:
     _u, singular_values, v = torch.pca_lowrank(y_centered, q=int(rank_eff), center=False, niter=2)
     v = v[:, : int(rank_eff)].contiguous()
     coeff = y_centered @ v
@@ -43,7 +43,7 @@ def _fit_incremental_pca(
     *,
     rank_eff: int,
     batch_rows: int,
-) -> Tuple[torch.Tensor, torch.Tensor, float]:
+) -> tuple[torch.Tensor, torch.Tensor, float]:
     if IncrementalPCA is None:
         raise RuntimeError("scikit-learn is required for incremental PCA")
     batch_size = int(max(batch_rows, rank_eff, 1))
@@ -69,7 +69,7 @@ def _fit_encoder_from_coeff(
     *,
     x_cpu: torch.Tensor,
     coeff: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     ones = torch.ones((x_cpu.shape[0], 1), dtype=x_cpu.dtype)
     x_aug = torch.cat([x_cpu, ones], dim=-1)
     proj = torch.linalg.lstsq(x_aug, coeff).solution
@@ -84,7 +84,7 @@ def _pad_basis_rows(
     enc_w_eff: torch.Tensor,
     enc_b_eff: torch.Tensor,
     basis_rank: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if int(basis.shape[0]) >= int(basis_rank):
         return basis, enc_w_eff, enc_b_eff
     pad_rows = int(basis_rank) - int(basis.shape[0])
@@ -105,7 +105,7 @@ def fit_layer_basis(
     block_size: int,
     pca_method: str = "auto",
     pca_batch_rows: int = 1024,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if x.ndim != 2 or y.ndim != 2 or x.shape[0] != y.shape[0]:
         raise RuntimeError("x/y must be 2D with matching rows")
     hidden_size = int(y.shape[1])
@@ -162,7 +162,7 @@ def fit_block_score_basis(
     basis_rank: int,
     pca_method: str = "auto",
     pca_batch_rows: int = 1024,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if x.ndim != 2 or block_scores.ndim != 2 or x.shape[0] != block_scores.shape[0]:
         raise RuntimeError("x/block_scores must be 2D with matching rows")
 

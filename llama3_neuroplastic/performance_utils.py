@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
-from typing import Any, Dict, Iterable, Iterator, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
 from torch.optim import AdamW
 
 try:
     import bitsandbytes as bnb
-except ImportError:  # pragma: no cover
+except ImportError:
     bnb = None
 
 
-_AMP_DTYPES: Dict[str, torch.dtype] = {
+_AMP_DTYPES: dict[str, torch.dtype] = {
     "float16": torch.float16,
     "fp16": torch.float16,
     "half": torch.float16,
@@ -44,13 +45,13 @@ def resolve_dataloader_kwargs(
     *,
     batch_size: int,
     num_workers: int,
-    pin_memory: Optional[bool] = None,
+    pin_memory: bool | None = None,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     resolved_workers = resolve_num_workers(num_workers)
     should_pin = torch.cuda.is_available() if pin_memory is None else bool(pin_memory)
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "batch_size": int(batch_size),
         "shuffle": True,
         "num_workers": int(resolved_workers),
@@ -62,7 +63,7 @@ def resolve_dataloader_kwargs(
     return kwargs
 
 
-def resolve_amp_dtype(*, device: torch.device, requested: str) -> Tuple[bool, torch.dtype]:
+def resolve_amp_dtype(*, device: torch.device, requested: str) -> tuple[bool, torch.dtype]:
     dtype = _AMP_DTYPES.get(str(requested).strip().lower())
     if dtype is None:
         raise ValueError(f"Unsupported AMP dtype: {requested}")
@@ -87,7 +88,7 @@ def build_grad_scaler(*, enabled: bool) -> Any:
     return torch.cuda.amp.GradScaler(enabled=bool(enabled and torch.cuda.is_available()))
 
 
-def _resolve_bnb_optimizer(name: str) -> Optional[type]:
+def _resolve_bnb_optimizer(name: str) -> type | None:
     if bnb is None:
         return None
     normalized = str(name).strip().lower()
@@ -109,7 +110,7 @@ def build_optimizer(
     optimizer_name: str,
     lr: float,
     weight_decay: float,
-) -> Tuple[torch.optim.Optimizer, Dict[str, Any]]:
+) -> tuple[torch.optim.Optimizer, dict[str, Any]]:
     params_list = [param for param in params if param.requires_grad]
     if not params_list:
         raise RuntimeError("No trainable parameters found")
@@ -167,7 +168,7 @@ def backward_step(
     scaler: Any,
     params: Iterable[torch.nn.Parameter],
     max_grad_norm: float = 0.0,
-    after_unscale: Optional[Any] = None,
+    after_unscale: Any | None = None,
 ) -> None:
     if scaler is not None and bool(getattr(scaler, "is_enabled", lambda: False)()):
         scaler.scale(loss).backward()

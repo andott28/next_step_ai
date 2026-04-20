@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
+from llama3_neuroplastic.layer_selection import parse_layer_selection
+
 try:
     from .streaming_llama_runtime import ShardedSafetensorLoader, _resolve_snapshot_dir
-except ImportError:  # pragma: no cover
+except ImportError:
     from streaming_llama_runtime import ShardedSafetensorLoader, _resolve_snapshot_dir
 
 
@@ -46,25 +49,8 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _parse_layer_selection(spec: str, total_layers: int) -> List[int]:
-    stripped = str(spec).strip()
-    if stripped == "" or stripped.lower() == "all":
-        return list(range(total_layers))
-    out: set[int] = set()
-    for part in stripped.split(","):
-        token = part.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_s, end_s = token.split("-", 1)
-            start = int(start_s)
-            end = int(end_s)
-            if end < start:
-                raise ValueError(f"Invalid layer range: {token}")
-            out.update(range(start, end + 1))
-        else:
-            out.add(int(token))
-    return sorted(v for v in out if 0 <= v < total_layers)
+def _parse_layer_selection(spec: str, total_layers: int) -> list[int]:
+    return parse_layer_selection(spec, total_layers=int(total_layers)) or []
 
 
 def _build_layer_groups(
@@ -74,10 +60,10 @@ def _build_layer_groups(
     group_size: int,
     exact_lower_layers: int,
     exact_upper_layers: int,
-) -> Tuple[List[List[int]], List[int]]:
+) -> tuple[list[list[int]], list[int]]:
     selected = sorted({int(v) for v in selected_layers if 0 <= int(v) < int(total_layers)})
-    exact: List[int] = []
-    shareable: List[int] = []
+    exact: list[int] = []
+    shareable: list[int] = []
     lower_cut = max(int(exact_lower_layers), 0)
     upper_cut = int(total_layers) - max(int(exact_upper_layers), 0)
     for layer_idx in selected:
@@ -85,9 +71,9 @@ def _build_layer_groups(
             exact.append(layer_idx)
         else:
             shareable.append(layer_idx)
-    groups: List[List[int]] = []
-    cur: List[int] = []
-    prev: Optional[int] = None
+    groups: list[list[int]] = []
+    cur: list[int] = []
+    prev: int | None = None
     for layer_idx in shareable:
         if prev is None or (layer_idx == prev + 1 and len(cur) < int(group_size)):
             cur.append(layer_idx)
@@ -196,7 +182,7 @@ def _greedy_head_permutation(ref_sig: torch.Tensor, cur_sig: torch.Tensor) -> to
     return perm
 
 
-def _factor_matrix_low_rank(matrix: torch.Tensor, rank: int, *, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def _factor_matrix_low_rank(matrix: torch.Tensor, rank: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     matrix = matrix.to(device=device, dtype=torch.float32)
     max_rank = max(1, min(int(rank), int(min(matrix.shape))))
     if max_rank >= min(int(matrix.shape[0]), int(matrix.shape[1])):
@@ -215,12 +201,12 @@ def _reconstruct_from_factors(left: torch.Tensor, right: torch.Tensor) -> torch.
     return torch.matmul(left.float(), right.float())
 
 
-def _factor_head_stack_low_rank(head_stack: torch.Tensor, rank: int, *, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def _factor_head_stack_low_rank(head_stack: torch.Tensor, rank: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     if head_stack.ndim != 3:
         raise RuntimeError(f"Expected [num_heads, rows, cols] head stack, got {tuple(head_stack.shape)}")
     num_heads = int(head_stack.shape[0])
-    left_parts: List[torch.Tensor] = []
-    right_parts: List[torch.Tensor] = []
+    left_parts: list[torch.Tensor] = []
+    right_parts: list[torch.Tensor] = []
     for head_idx in range(num_heads):
         left, right = _factor_matrix_low_rank(head_stack[head_idx], rank, device=device)
         left_parts.append(left)
@@ -287,7 +273,7 @@ def _bridge_head_matrix_ortho_centroid(source: torch.Tensor, target: torch.Tenso
     t_out = torch.matmul(u, vh)
     rotated = torch.matmul(t_out, src_center)
 
-    # Cheap input-side bridge: signed diagonal alignment from per-column agreement.
+
     col_corr = (rotated * tgt_center).sum(dim=0)
     sign = torch.where(col_corr >= 0.0, torch.ones_like(col_corr), -torch.ones_like(col_corr))
     rotated = rotated * sign.unsqueeze(0)
@@ -312,8 +298,8 @@ def _bridge_head_stack_ortho_centroid(source_heads: torch.Tensor, target_heads: 
 
 def _fit_group_shared_qo(
     layers: Sequence[int],
-    layer_q: Dict[int, torch.Tensor],
-    layer_o: Dict[int, torch.Tensor],
+    layer_q: dict[int, torch.Tensor],
+    layer_o: dict[int, torch.Tensor],
     *,
     num_heads: int,
     head_dim: int,
@@ -323,7 +309,7 @@ def _fit_group_shared_qo(
     sample_rows: int,
     factor_device: torch.device,
     bridge_mode: str,
-) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
     ordered_layers = [int(v) for v in layers]
     ref_layer = int(ordered_layers[0])
     ref_sig = _build_head_signature(
@@ -334,14 +320,14 @@ def _fit_group_shared_qo(
         sample_cols=sample_cols,
         sample_rows=sample_rows,
     )
-    aligned_q: Dict[int, torch.Tensor] = {}
-    aligned_o: Dict[int, torch.Tensor] = {}
-    share_q: Dict[int, torch.Tensor] = {}
-    share_o: Dict[int, torch.Tensor] = {}
-    head_perm_by_layer: Dict[int, torch.Tensor] = {}
+    aligned_q: dict[int, torch.Tensor] = {}
+    aligned_o: dict[int, torch.Tensor] = {}
+    share_q: dict[int, torch.Tensor] = {}
+    share_o: dict[int, torch.Tensor] = {}
+    head_perm_by_layer: dict[int, torch.Tensor] = {}
 
-    q_sum: Optional[torch.Tensor] = None
-    o_sum: Optional[torch.Tensor] = None
+    q_sum: torch.Tensor | None = None
+    o_sum: torch.Tensor | None = None
     for layer_idx in ordered_layers:
         if layer_idx == ref_layer:
             head_perm = torch.arange(num_heads, dtype=torch.long)
@@ -371,7 +357,7 @@ def _fit_group_shared_qo(
             o_heads_share = o_heads
         else:
             q_heads_share = _bridge_head_stack_ortho_centroid(ref_q_heads, q_heads)
-            # O projection is [hidden, heads, head_dim]. Bridge on transposed heads so rows=head_dim.
+
             o_heads_share_t = _bridge_head_stack_ortho_centroid(
                 ref_o_heads.transpose(1, 2).contiguous(),
                 o_heads.transpose(1, 2).contiguous(),
@@ -402,7 +388,7 @@ def _fit_group_shared_qo(
         "o_base_v_heads": o_base_v_heads,
         "recon_error_by_layer": {},
     }
-    layer_states: Dict[int, Dict[str, Any]] = {}
+    layer_states: dict[int, dict[str, Any]] = {}
     for layer_idx in ordered_layers:
         q_resid = aligned_q[layer_idx] - q_base_recon
         o_resid = aligned_o[layer_idx] - o_base_recon
@@ -433,7 +419,7 @@ def _load_qo_weights(
     loader: ShardedSafetensorLoader,
     *,
     layer_idx: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     prefix = f"model.layers.{int(layer_idx)}.self_attn."
     q_weight = loader.load_parameter(f"{prefix}q_proj.weight").contiguous()
     o_weight = loader.load_parameter(f"{prefix}o_proj.weight").contiguous()
@@ -444,7 +430,7 @@ def _load_kv_weights(
     loader: ShardedSafetensorLoader,
     *,
     layer_idx: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     prefix = f"model.layers.{int(layer_idx)}.self_attn."
     k_weight = loader.load_parameter(f"{prefix}k_proj.weight").contiguous()
     v_weight = loader.load_parameter(f"{prefix}v_proj.weight").contiguous()
@@ -453,8 +439,8 @@ def _load_kv_weights(
 
 def _fit_group_shared_kv(
     layers: Sequence[int],
-    layer_k: Dict[int, torch.Tensor],
-    layer_v: Dict[int, torch.Tensor],
+    layer_k: dict[int, torch.Tensor],
+    layer_v: dict[int, torch.Tensor],
     *,
     num_kv_heads: int,
     head_dim: int,
@@ -463,7 +449,7 @@ def _fit_group_shared_kv(
     sample_cols: int,
     factor_device: torch.device,
     bridge_mode: str,
-) -> Tuple[Dict[str, Any], Dict[int, Dict[str, Any]]]:
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
     ordered_layers = [int(v) for v in layers]
     ref_layer = int(ordered_layers[0])
     ref_sig = _build_kv_head_signature(
@@ -473,14 +459,14 @@ def _fit_group_shared_kv(
         head_dim=head_dim,
         sample_cols=sample_cols,
     )
-    aligned_k: Dict[int, torch.Tensor] = {}
-    aligned_v: Dict[int, torch.Tensor] = {}
-    share_k: Dict[int, torch.Tensor] = {}
-    share_v: Dict[int, torch.Tensor] = {}
-    head_perm_by_layer: Dict[int, torch.Tensor] = {}
+    aligned_k: dict[int, torch.Tensor] = {}
+    aligned_v: dict[int, torch.Tensor] = {}
+    share_k: dict[int, torch.Tensor] = {}
+    share_v: dict[int, torch.Tensor] = {}
+    head_perm_by_layer: dict[int, torch.Tensor] = {}
 
-    k_sum: Optional[torch.Tensor] = None
-    v_sum: Optional[torch.Tensor] = None
+    k_sum: torch.Tensor | None = None
+    v_sum: torch.Tensor | None = None
     for layer_idx in ordered_layers:
         if layer_idx == ref_layer:
             head_perm = torch.arange(num_kv_heads, dtype=torch.long)
@@ -534,7 +520,7 @@ def _fit_group_shared_kv(
         "v_base_v_heads": v_base_v_heads,
         "kv_recon_error_by_layer": {},
     }
-    layer_states: Dict[int, Dict[str, Any]] = {}
+    layer_states: dict[int, dict[str, Any]] = {}
     for layer_idx in ordered_layers:
         k_resid = aligned_k[layer_idx] - k_base_recon
         v_resid = aligned_v[layer_idx] - v_base_recon
@@ -585,7 +571,7 @@ def main() -> None:
         exact_upper_layers=int(args.exact_upper_layers),
     )
     factor_device = torch.device(str(args.factor_device).strip() or ("cuda" if torch.cuda.is_available() else "cpu"))
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "config": {
             "hidden_size": hidden_size,
             "num_heads": num_heads,
@@ -608,10 +594,10 @@ def main() -> None:
 
     for group_idx, layers in enumerate(groups):
         print(f"[attn_share] fitting group {group_idx + 1}/{len(groups)}: layers {layers}", flush=True)
-        layer_q: Dict[int, torch.Tensor] = {}
-        layer_o: Dict[int, torch.Tensor] = {}
-        layer_k: Dict[int, torch.Tensor] = {}
-        layer_v: Dict[int, torch.Tensor] = {}
+        layer_q: dict[int, torch.Tensor] = {}
+        layer_o: dict[int, torch.Tensor] = {}
+        layer_k: dict[int, torch.Tensor] = {}
+        layer_v: dict[int, torch.Tensor] = {}
         for layer_idx in layers:
             q_weight, o_weight = _load_qo_weights(loader, layer_idx=int(layer_idx))
             k_weight, v_weight = _load_kv_weights(loader, layer_idx=int(layer_idx))
@@ -700,5 +686,5 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

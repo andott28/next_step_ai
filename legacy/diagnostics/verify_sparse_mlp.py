@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import traceback
+from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Callable, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -146,7 +146,7 @@ def verify_oracle_dispatch_selects_dense_block_scores() -> None:
         torch.tensor([[0.1, 3.0]], dtype=torch.float32),
     )
 
-    seen: List[torch.Tensor] = []
+    seen: list[torch.Tensor] = []
 
     def sparse_fast(layer_idx, mlp, hidden, active_blocks):
         seen.append(active_blocks.clone())
@@ -167,7 +167,7 @@ def verify_fast_executor_accepts_oracle_mode() -> None:
     runtime._sparse_routing[0] = {"block_domain": "intermediate"}
     active_blocks = torch.tensor([[0, 1]], dtype=torch.long)
     hidden = torch.zeros((1, 1, 4), dtype=torch.float32)
-    seen: List[torch.Tensor] = []
+    seen: list[torch.Tensor] = []
 
     def sparse_reference(layer_idx, mlp, sparse_hidden, sparse_active_blocks):
         seen.append(sparse_active_blocks.clone())
@@ -182,7 +182,7 @@ def verify_fast_executor_accepts_oracle_mode() -> None:
 
 
 def main() -> int:
-    checks: List[Tuple[str, Callable[[], None]]] = [
+    checks: list[tuple[str, Callable[[], None]]] = [
         ("linear latent absolute top-k", verify_linear_latent_uses_absolute_topk),
         ("intermediate router score reconstruction", verify_intermediate_router_scores_use_linear_reconstruction),
         ("SiLU-gated intermediate block scores", verify_intermediate_block_scores_apply_silu_gate),
