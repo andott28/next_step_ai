@@ -27,6 +27,132 @@ def _parse_layer_selection(spec: str | None) -> list[int] | None:
     return parse_layer_selection(spec, all_as_none=True, allow_none_token=True)
 
 
+_THROUGHPUT_PROBE_DEFAULTS: dict[str, Any] = {
+    "sparse_top_k": 51,
+    "sparse_basis_top_k": 64,
+    "sparse_mlp_execution": "exact_blockwise_sparse",
+    "sparse_mlp_prefill_mode": "hot_cache",
+    "vram_hot_cache_gb": 5.25,
+    "pre_warm": True,
+    "calibrate_hot_cache": True,
+    "hot_cache_calibration_tokens": 64,
+    "attn_active_heads": 5,
+    "attn_min_active_heads": 5,
+    "attn_max_active_heads": 5,
+    "sparse_attn_prefill_mode": "sparse",
+    "sparse_kv_prefill_mode": "sparse",
+}
+
+_THROUGHPUT_CONTRACT_TARGETS: dict[str, float] = {
+    "decode_tok_s": 3.30,
+    "mean_decode_ms_per_token": 303.0,
+    "decode_avg_mb_per_layer": 23.0,
+}
+
+
+def _apply_throughput_probe_defaults(args: Any) -> None:
+    for key, value in _THROUGHPUT_PROBE_DEFAULTS.items():
+        setattr(args, key, value)
+
+
+def _validate_required_path(path_value: str | None, *, flag: str) -> None:
+    if not str(path_value or "").strip():
+        raise RuntimeError(f"{flag} is required for --throughput-probe")
+
+
+def _validate_runtime_for_throughput_probe(runtime: StreamingLlamaRuntime) -> None:
+    errors = runtime.validate_throughput_probe()
+    if errors:
+        formatted = "; ".join(errors)
+        raise RuntimeError(f"throughput probe is not on the 3.3 fast path: {formatted}")
+
+
+def _normalize_throughput_contract(raw_value: str | None) -> str:
+    value = str(raw_value or "off").strip().lower() or "off"
+    if value in {"off", "none", "false", "0"}:
+        return "off"
+    if value in {"probe", "fast_path"}:
+        return "probe"
+    if value in {"strict", "enforce"}:
+        return "strict"
+    raise RuntimeError("throughput-contract must be one of: off, probe, strict")
+
+
+def _build_contract_check(*, name: str, passed: bool, actual: Any, expected: Any) -> dict[str, Any]:
+    return {
+        "name": str(name),
+        "passed": bool(passed),
+        "actual": actual,
+        "expected": expected,
+    }
+
+
+def _build_throughput_contract_report(row: dict[str, Any]) -> dict[str, Any]:
+    runtime_status = dict(row.get("runtime_status", {}) or {})
+    traffic = dict(row.get("traffic", {}) or {})
+    decode_traffic = dict(traffic.get("decode", {}) or {})
+    new_tokens = int(row.get("new_tokens", 0))
+    expected_layer_visits = int(runtime_status.get("num_layers", 0)) * new_tokens
+    actual_layer_visits = int(decode_traffic.get("layer_visits", 0))
+    checks = [
+        _build_contract_check(
+            name="decode_tok_s",
+            passed=float(row.get("decode_tok_s", 0.0)) >= _THROUGHPUT_CONTRACT_TARGETS["decode_tok_s"],
+            actual=float(row.get("decode_tok_s", 0.0)),
+            expected=f">={_THROUGHPUT_CONTRACT_TARGETS['decode_tok_s']}",
+        ),
+        _build_contract_check(
+            name="mean_decode_ms_per_token",
+            passed=float(row.get("mean_decode_ms_per_token", float("inf"))) <= _THROUGHPUT_CONTRACT_TARGETS["mean_decode_ms_per_token"],
+            actual=float(row.get("mean_decode_ms_per_token", 0.0)),
+            expected=f"<={_THROUGHPUT_CONTRACT_TARGETS['mean_decode_ms_per_token']}",
+        ),
+        _build_contract_check(
+            name="decode_avg_mb_per_layer",
+            passed=float(row.get("decode_avg_mb_per_layer", float("inf"))) <= _THROUGHPUT_CONTRACT_TARGETS["decode_avg_mb_per_layer"],
+            actual=float(row.get("decode_avg_mb_per_layer", 0.0)),
+            expected=f"<={_THROUGHPUT_CONTRACT_TARGETS['decode_avg_mb_per_layer']}",
+        ),
+        _build_contract_check(
+            name="decode_layer_visits",
+            passed=expected_layer_visits > 0 and actual_layer_visits == expected_layer_visits,
+            actual=actual_layer_visits,
+            expected=expected_layer_visits,
+        ),
+        _build_contract_check(
+            name="lm_head_on_gpu",
+            passed=bool(runtime_status.get("lm_head_on_gpu", False)),
+            actual=bool(runtime_status.get("lm_head_on_gpu", False)),
+            expected=True,
+        ),
+        _build_contract_check(
+            name="vram_hot_cache_live_calibrated",
+            passed=bool(runtime_status.get("vram_hot_cache_live_calibrated", False)),
+            actual=bool(runtime_status.get("vram_hot_cache_live_calibrated", False)),
+            expected=True,
+        ),
+        _build_contract_check(
+            name="decode_mlp_cold_blocks_streamed",
+            passed=int(runtime_status.get("decode_mlp_cold_blocks_streamed", 0)) == 0,
+            actual=int(runtime_status.get("decode_mlp_cold_blocks_streamed", 0)),
+            expected=0,
+        ),
+        _build_contract_check(
+            name="decode_down_cold_blocks_streamed",
+            passed=int(runtime_status.get("decode_down_cold_blocks_streamed", 0)) == 0,
+            actual=int(runtime_status.get("decode_down_cold_blocks_streamed", 0)),
+            expected=0,
+        ),
+    ]
+    failed = [check["name"] for check in checks if not bool(check["passed"])]
+    return {
+        "contract": "strict",
+        "passed": len(failed) == 0,
+        "failed_checks": failed,
+        "checks": checks,
+    }
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run greedy decode with layer-by-layer streamed Llama weights.")
     p.add_argument("--model-name", type=str, required=True, help="HF repo id or local snapshot directory")
@@ -61,6 +187,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--taylor-state-decay", type=float, default=1.0)
     p.add_argument("--dump-json", type=str, default="")
     p.add_argument(
+        "--throughput-contract",
+        type=str,
+        default="off",
+        choices=["off", "probe", "strict"],
+        help="Validate the 3.3 tok/s fast path configuration only ('probe') or configuration plus measured decode metrics ('strict').",
+    )
+    p.add_argument(
+        "--throughput-probe",
+        action="store_true",
+        default=False,
+        help=(
+            "Force the README 3.3 tok/s probe regime: sparse-top-k 51, attn heads 5, "
+            "sparse K/V, VRAM hot cache, pre-warm, calibration, and Triton sparse MLP."
+        ),
+    )
+    p.add_argument(
         "--max-runtime-layers",
         type=int,
         default=0,
@@ -83,7 +225,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Path to learned-basis checkpoint (.pt) from init_learned_basis_from_dense_mlp.py. "
-             "Enables sparse MLP routing for output-surrogate or exact intermediate-block execution.",
+             "Enables sparse MLP routing for exact blockwise intermediate-block execution.",
     )
     p.add_argument(
         "--sparse-top-k",
@@ -101,8 +243,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--sparse-mlp-execution",
         type=str,
         default=None,
-        choices=["auto", "exact_intermediate_sparse"],
-        help="Sparse MLP execution mode. auto selects exact_intermediate_sparse for intermediate-router artifacts.",
+        choices=["auto", "exact_blockwise_sparse", "exact_intermediate_sparse"],
+        help="Sparse MLP execution mode. auto selects exact_blockwise_sparse for intermediate-router artifacts.",
     )
     p.add_argument(
         "--sparse-mlp-prefill-mode",
@@ -121,7 +263,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--vram-hot-cache-gb",
         type=float,
         default=None,
-        help="VRAM budget (GB) for persistent NF4 hot-block cache. Default uses STREAMING_VRAM_HOT_CACHE_GB or 6.4 GB.",
+        help="VRAM budget (GB) for persistent NF4 hot-block cache. Default is disabled unless STREAMING_VRAM_HOT_CACHE_GB or --pre-warm is set.",
     )
     p.add_argument(
         "--hot-block-threshold",
@@ -252,6 +394,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable incremental token streaming to stdout and only print the final text after generation.",
     )
+    p.add_argument(
+        "--profile-decode",
+        action="store_true",
+        default=False,
+        help="Capture per-layer decode timings into runtime status and JSON diagnostics.",
+    )
+    p.add_argument(
+        "--profile-max-steps",
+        type=int,
+        default=0,
+        help="Optional cap on retained decode profile steps. 0 keeps all measured decode steps.",
+    )
     return p
 
 
@@ -359,14 +513,23 @@ def _run_single_prompt(
         "decode_tok_s": decode_tok_s,
         "total_tok_s": total_tok_s,
         "prefill_tok_s": prefill_tok_s,
+        "new_tokens": int(new_tokens),
+        "mean_decode_ms_per_token": float(decode_elapsed * 1000.0) / float(max(new_tokens, 1)),
         "text": full_text,
         "completion_text": completion_text,
     }
+    row["runtime_status"] = runtime.get_runtime_status()
+    decode_profile_report = runtime.get_decode_profile_report()
+    if decode_profile_report is not None:
+        row["decode_profile_report"] = decode_profile_report
     traffic = runtime.get_last_traffic_report()
     if traffic is not None:
         row["traffic"] = traffic
         decode = traffic.get("decode", {})
         overall = traffic.get("overall", {})
+        decode_layer_visits = int(decode.get("layer_visits", 0))
+        row["decode_avg_mb_per_layer"] = float(decode.get("avg_mb_per_layer", 0.0))
+        row["decode_ms_per_layer"] = float(decode_elapsed * 1000.0) / float(max(decode_layer_visits, 1))
         print(
             "[traffic] "
             f"decode={float(decode.get('avg_mb_per_layer', 0.0)):.2f} MB/layer "
@@ -378,13 +541,33 @@ def _run_single_prompt(
         f"decode={decode_elapsed:.3f}s | {row['tok_s']:.2f} tok/s "
         f"| total={total_tok_s:.4f} tok/s]\n{completion_text}\n"
     )
+    if str(getattr(args, "throughput_contract", "off")) == "strict":
+        row["throughput_contract"] = _build_throughput_contract_report(row)
+    else:
+        row["throughput_contract"] = {
+            "contract": str(getattr(args, "throughput_contract", "off")),
+            "passed": True,
+            "failed_checks": [],
+            "checks": [],
+        }
     return row
 
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
+    args.throughput_contract = _normalize_throughput_contract(getattr(args, "throughput_contract", "off"))
+    if bool(args.throughput_probe):
+        _apply_throughput_probe_defaults(args)
+        _validate_required_path(args.sparse_basis_path, flag="--sparse-basis-path")
+        _validate_required_path(args.attn_head_importance_path, flag="--attn-head-importance-path")
+        _validate_required_path(args.kv_basis_path, flag="--kv-basis-path")
+        args.disable_triton_fused_sparse_mlp = False
+        if str(args.throughput_contract) == "off":
+            args.throughput_contract = "probe"
     if bool(args.pre_warm):
         args.sparse_mlp_prefill_mode = "hot_cache"
+        if args.vram_hot_cache_gb is None:
+            args.vram_hot_cache_gb = 6.4
     prompts = list(args.prompt) if args.prompt else []
     taylor_layers = _parse_layer_selection(args.taylor_layers)
     runtime_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -432,6 +615,10 @@ def main() -> None:
         kv_basis_path=str(args.kv_basis_path) if args.kv_basis_path else None,
         kv_sparse_top_k=int(args.kv_sparse_top_k) if args.kv_sparse_top_k is not None else None,
     )
+    if bool(args.profile_decode):
+        runtime.enable_decode_profiler(True, max_steps=int(args.profile_max_steps))
+    if str(args.throughput_contract) in {"probe", "strict"}:
+        _validate_runtime_for_throughput_probe(runtime)
     if int(args.max_runtime_layers) > 0:
         runtime.num_layers = min(int(runtime.num_layers), int(args.max_runtime_layers))
         print(f"[smoke] runtime capped to {int(runtime.num_layers)} layers", flush=True)
@@ -470,6 +657,8 @@ def main() -> None:
                 max_tokens=int(args.hot_cache_calibration_tokens),
                 rebuild_cache=True,
             )
+            if str(args.throughput_contract) in {"probe", "strict"}:
+                _validate_runtime_for_throughput_probe(runtime)
         print(f"[pre-warm] startup completed in {_prewarm_time.perf_counter() - _t0:.1f}s", flush=True)
 
     rows: list[dict[str, Any]] = []
@@ -517,10 +706,21 @@ def main() -> None:
         payload = {
             "model_name": str(args.model_name),
             "taylor_layers": list(taylor_layers or []),
+            "throughput_probe": bool(args.throughput_probe),
+            "throughput_contract": str(args.throughput_contract),
+            "runtime_status": runtime.get_runtime_status(),
             "rows": rows,
         }
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"wrote diagnostics: {out_path}")
+    strict_failures = [
+        row for row in rows
+        if str((row.get("throughput_contract", {}) or {}).get("contract", "off")) == "strict"
+        and not bool((row.get("throughput_contract", {}) or {}).get("passed", False))
+    ]
+    if strict_failures:
+        failed = strict_failures[0]["throughput_contract"].get("failed_checks", [])
+        raise RuntimeError(f"strict throughput contract failed: {', '.join(str(x) for x in failed)}")
 
 
 if __name__ == "__main__":

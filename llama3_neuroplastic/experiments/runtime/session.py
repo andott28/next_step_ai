@@ -12,9 +12,139 @@ except Exception:
 
 
 class RuntimeSessionMixin:
+    def reset_decode_profiler(self) -> None:
+        if hasattr(self, "_decode_profile_steps"):
+            self._decode_profile_steps.clear()
+        self._last_decode_profile_report = None
+
+    def enable_decode_profiler(self, enabled: bool = True, *, max_steps: int | None = None) -> None:
+        self._decode_profile_enabled = bool(enabled)
+        if max_steps is not None:
+            self._decode_profile_max_steps = max(0, int(max_steps))
+        self.reset_decode_profiler()
+
+    def _begin_decode_profile_step(self, *, position_index: int) -> dict[str, Any] | None:
+        if not bool(getattr(self, "_decode_profile_enabled", False)):
+            return None
+        if str(getattr(self, "_traffic_current_phase", "idle")) != "decode":
+            return None
+        return {
+            "position_index": int(position_index),
+            "layers": [],
+        }
+
+    def _record_decode_profile_layer(
+        self,
+        step: dict[str, Any] | None,
+        *,
+        layer_idx: int,
+        cpu_ms: float,
+        events: tuple[Any, Any, Any, Any] | None,
+    ) -> None:
+        if step is None:
+            return
+        step["layers"].append(
+            {
+                "layer_idx": int(layer_idx),
+                "cpu_ms": float(cpu_ms),
+                "_events": events,
+            }
+        )
+
+    def _finalize_decode_profile_step(self, step: dict[str, Any] | None) -> dict[str, Any] | None:
+        if step is None:
+            return None
+        if self.device.type == "cuda" and any(layer.get("_events") is not None for layer in step["layers"]):
+            torch.cuda.synchronize(self.device)
+        finalized_layers: list[dict[str, float | int]] = []
+        total_attn_ms = 0.0
+        total_mlp_ms = 0.0
+        total_other_ms = 0.0
+        total_layer_ms = 0.0
+        total_cpu_ms = 0.0
+        for layer in step["layers"]:
+            events = layer.pop("_events", None)
+            if events is not None:
+                ev_start, ev_attn_end, ev_mlp_end, ev_end = events
+                attn_ms = float(ev_start.elapsed_time(ev_attn_end))
+                mlp_ms = float(ev_attn_end.elapsed_time(ev_mlp_end))
+                other_ms = float(ev_mlp_end.elapsed_time(ev_end))
+                total_ms = float(ev_start.elapsed_time(ev_end))
+            else:
+                attn_ms = 0.0
+                mlp_ms = 0.0
+                other_ms = 0.0
+                total_ms = float(layer["cpu_ms"])
+            total_attn_ms += attn_ms
+            total_mlp_ms += mlp_ms
+            total_other_ms += other_ms
+            total_layer_ms += total_ms
+            total_cpu_ms += float(layer["cpu_ms"])
+            finalized_layers.append(
+                {
+                    "layer_idx": int(layer["layer_idx"]),
+                    "load_attn_ms": float(attn_ms),
+                    "mlp_ms": float(mlp_ms),
+                    "other_ms": float(other_ms),
+                    "total_ms": float(total_ms),
+                    "cpu_ms": float(layer["cpu_ms"]),
+                }
+            )
+        finalized = {
+            "position_index": int(step["position_index"]),
+            "layers": finalized_layers,
+            "summary": {
+                "layers": int(len(finalized_layers)),
+                "load_attn_ms": float(total_attn_ms),
+                "mlp_ms": float(total_mlp_ms),
+                "other_ms": float(total_other_ms),
+                "total_ms": float(total_layer_ms),
+                "cpu_ms": float(total_cpu_ms),
+                "mean_layer_total_ms": float(total_layer_ms) / float(max(len(finalized_layers), 1)),
+            },
+        }
+        steps = getattr(self, "_decode_profile_steps", None)
+        if isinstance(steps, list):
+            steps.append(finalized)
+            max_steps = int(getattr(self, "_decode_profile_max_steps", 0) or 0)
+            if max_steps > 0 and len(steps) > max_steps:
+                del steps[:-max_steps]
+        self._last_decode_profile_report = self.get_decode_profile_report()
+        return finalized
+
+    def get_decode_profile_report(self) -> dict[str, Any] | None:
+        steps = list(getattr(self, "_decode_profile_steps", []) or [])
+        if not steps:
+            return None
+        mean_total_ms = sum(float(step["summary"]["total_ms"]) for step in steps) / float(max(len(steps), 1))
+        mean_attn_ms = sum(float(step["summary"]["load_attn_ms"]) for step in steps) / float(max(len(steps), 1))
+        mean_mlp_ms = sum(float(step["summary"]["mlp_ms"]) for step in steps) / float(max(len(steps), 1))
+        mean_other_ms = sum(float(step["summary"]["other_ms"]) for step in steps) / float(max(len(steps), 1))
+        return {
+            "enabled": bool(getattr(self, "_decode_profile_enabled", False)),
+            "steps_recorded": int(len(steps)),
+            "summary": {
+                "mean_total_ms": float(mean_total_ms),
+                "mean_load_attn_ms": float(mean_attn_ms),
+                "mean_mlp_ms": float(mean_mlp_ms),
+                "mean_other_ms": float(mean_other_ms),
+            },
+            "steps": steps,
+        }
+
+    def clear_sparse_transfer_caches(self, *, release_cuda: bool = False) -> None:
+        if hasattr(self, "_sparse_block_transfer_cache"):
+            self._sparse_block_transfer_cache.clear()
+        if hasattr(self, "_downproj_transfer_cache"):
+            self._downproj_transfer_cache.clear()
+        if release_cuda and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
         self._dense_cache = DynamicCache(config=self.config) if DynamicCache is not None else None
+        if hasattr(self, "_compact_attn_cache"):
+            self._compact_attn_cache.clear()
         if self._token_archive is not None:
             self._token_archive.reset()
         if hasattr(self, "_smc_valid"):
@@ -25,6 +155,7 @@ class RuntimeSessionMixin:
             self._sparse_basis_top_k_by_layer.pop(int(_layer_idx), None)
             self._mlp_hot_blocks_by_layer.pop(int(_layer_idx), None)
         self._session_sparse_route_layers.clear()
+        self.clear_sparse_transfer_caches()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -55,11 +186,29 @@ class RuntimeSessionMixin:
         if self.taylor_layer_set:
             return False
         if self._dense_cache is None:
-            return target == 0
-        if hasattr(self._dense_cache, "crop"):
+            dense_ok = target == 0
+        elif hasattr(self._dense_cache, "crop"):
             self._dense_cache.crop(target)
-            return True
-        return False
+            dense_ok = True
+        else:
+            dense_ok = False
+        compact_cache = getattr(self, "_compact_attn_cache", None)
+        if isinstance(compact_cache, dict):
+            for layer_idx, entry in list(compact_cache.items()):
+                if not isinstance(entry, dict):
+                    compact_cache.pop(layer_idx, None)
+                    continue
+                k_tensor = entry.get("k")
+                v_tensor = entry.get("v")
+                if torch.is_tensor(k_tensor) and int(k_tensor.ndim) == 4:
+                    entry["k"] = k_tensor[:, :, :target, :].contiguous()
+                elif k_tensor is not None:
+                    entry["k"] = None
+                if torch.is_tensor(v_tensor) and int(v_tensor.ndim) == 4:
+                    entry["v"] = v_tensor[:, :, :target, :].contiguous()
+                elif v_tensor is not None:
+                    entry["v"] = None
+        return bool(dense_ok)
 
     def _release_dense_cache_for_retrieval_layers(self) -> None:
         if self._dense_cache is None or not self._retrieval_layers:
@@ -99,6 +248,11 @@ class RuntimeSessionMixin:
         self._last_traffic_report = None
         self._first_decode_t = None
         self._decode_done_t = None
+        self._decode_mlp_hot_blocks_hit = 0
+        self._decode_mlp_cold_blocks_streamed = 0
+        self._decode_down_hot_blocks_hit = 0
+        self._decode_down_cold_blocks_streamed = 0
+        self.reset_decode_profiler()
 
     def _set_traffic_phase(self, phase: str) -> None:
         self._traffic_current_phase = str(phase or "other")
@@ -188,6 +342,11 @@ class RuntimeSessionMixin:
                 "avg_mb_per_layer": float(total_bytes) / float(max(total_layer_visits, 1)) / float(1024 ** 2),
             },
         }
+        if hasattr(self, "get_runtime_status"):
+            try:
+                self._last_traffic_report["runtime_status"] = self.get_runtime_status()
+            except Exception:
+                pass
 
     def get_last_traffic_report(self) -> dict[str, Any] | None:
         return self._last_traffic_report

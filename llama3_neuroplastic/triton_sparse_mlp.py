@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 
 try:
     import bitsandbytes.functional as bnb_functional
@@ -25,14 +26,6 @@ _DEFAULT_MAX_FUSED_TOPK = 32
 def triton_sparse_mlp_available() -> bool:
     if not _TRITON_AVAILABLE:
         return False
-    if _env_flag("SCA_TRITON_ALLOW_WINDOWS_PRE_AMPERE", False):
-        return True
-    if os.name == "nt" and torch.cuda.is_available():
-        try:
-            if _is_pre_ampere(torch.device("cuda")):
-                return False
-        except Exception:
-            pass
     return True
 
 
@@ -1083,4 +1076,73 @@ def triton_sparse_output_linear_4bit(
         bias,
         int(block_size),
         quant_weight_ref,
+    )
+
+
+def triton_fused_sparse_mlp_decode_4bit(
+    x_flat: torch.Tensor,
+    active_idx: torch.Tensor,
+    flat_mask: torch.Tensor,
+    *,
+    gate_packed_weight: torch.Tensor,
+    gate_absmax: torch.Tensor,
+    gate_code: torch.Tensor,
+    gate_input_dim: int,
+    gate_quant_block_size: int,
+    gate_bias: torch.Tensor | None,
+    up_packed_weight: torch.Tensor,
+    up_absmax: torch.Tensor,
+    up_code: torch.Tensor,
+    up_input_dim: int,
+    up_quant_block_size: int,
+    up_bias: torch.Tensor | None,
+    down_packed_weight: torch.Tensor,
+    down_absmax: torch.Tensor,
+    down_code: torch.Tensor,
+    down_out_features: int,
+    down_in_features: int,
+    down_quant_block_size: int,
+    down_bias: torch.Tensor | None,
+    block_size: int,
+) -> torch.Tensor:
+    gate = triton_sparse_output_linear_4bit(
+        x_flat,
+        active_idx,
+        flat_mask,
+        packed_weight=gate_packed_weight,
+        absmax=gate_absmax,
+        code=gate_code,
+        input_dim=int(gate_input_dim),
+        quant_block_size=int(gate_quant_block_size),
+        bias=gate_bias,
+        block_size=int(block_size),
+        quant_weight_ref=None,
+    )
+    up = triton_sparse_output_linear_4bit(
+        x_flat,
+        active_idx,
+        flat_mask,
+        packed_weight=up_packed_weight,
+        absmax=up_absmax,
+        code=up_code,
+        input_dim=int(up_input_dim),
+        quant_block_size=int(up_quant_block_size),
+        bias=up_bias,
+        block_size=int(block_size),
+        quant_weight_ref=None,
+    )
+    activated = F.silu(gate)
+    activated.mul_(up)
+    return triton_sparse_input_linear_4bit(
+        activated,
+        active_idx,
+        packed_weight=down_packed_weight,
+        absmax=down_absmax,
+        code=down_code,
+        out_features=int(down_out_features),
+        in_features=int(down_in_features),
+        quant_block_size=int(down_quant_block_size),
+        bias=down_bias,
+        block_size=int(block_size),
+        quant_weight_ref=None,
     )
