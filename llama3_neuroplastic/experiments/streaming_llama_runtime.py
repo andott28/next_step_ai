@@ -4025,35 +4025,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         block_out = int(block_out)
         if hidden_size <= 0 or block_out <= 0:
             raise RuntimeError("Invalid single-kernel scratch dimensions")
-        tiles = (hidden_size + block_out - 1) // block_out
-        needs_alloc = (
+        if (
             self._single_kernel_mlp_out_accum is None
             or int(self._single_kernel_mlp_out_accum.numel()) < hidden_size
-            or self._single_kernel_mlp_tile_state is None
-            or int(self._single_kernel_mlp_tile_state.numel()) < tiles
-            or self._single_kernel_mlp_tile_done is None
-            or int(self._single_kernel_mlp_tile_done.numel()) < tiles
-        )
-        if needs_alloc:
+        ):
             self._single_kernel_mlp_out_accum = torch.zeros(
                 hidden_size,
                 device=self.device,
                 dtype=torch.float32,
             )
-            self._single_kernel_mlp_tile_state = torch.full(
-                (tiles,),
-                -1,
-                device=self.device,
-                dtype=torch.int32,
-            )
-            self._single_kernel_mlp_tile_done = torch.zeros(
-                (tiles,),
-                device=self.device,
-                dtype=torch.int32,
-            )
-        elif int(self._single_kernel_mlp_tile_state.numel()) > tiles:
-            self._single_kernel_mlp_tile_state[tiles:].fill_(-1)
-            self._single_kernel_mlp_tile_done[tiles:].zero_()
         self._single_kernel_mlp_block_out = int(block_out)
 
     def _debug_assert_sparse_attn_qo_zero_inactive(
@@ -4978,10 +4958,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     self._single_kernel_mlp_tile_done.zero_()
                 self._wait_for_h2d_stream()
                 out_buf = torch.empty((1, hidden_size), device=self.device, dtype=torch.float16)
-                active_blocks_gpu = ordered_blocks.to(device=self.device, dtype=torch.int32).contiguous()
                 down_single = triton_sparse_mlp_decode_4bit_single_kernel_sm75(
                     flat_hidden,
-                    active_blocks_gpu,
+                    ordered_blocks,
                     gate_packed_gpu,
                     gate_absmax_gpu,
                     gate_code_gpu,
@@ -4993,9 +4972,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     down_code_gpu,
                     out_buf,
                     self._single_kernel_mlp_out_accum,
-                    self._single_kernel_mlp_tile_state,
-                    self._single_kernel_mlp_tile_done,
-                    int(self._single_kernel_mlp_epoch),
                     hidden_size,
                     int(block_size),
                     int(gate_param["quant_block_size"]),

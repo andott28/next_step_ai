@@ -780,7 +780,6 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _sparse_mlp_decode_4bit_single_kernel_sm75(
         x_ptr,
-        active_blocks_ptr,
         gate_packed_ptr,
         gate_absmax_ptr,
         gate_code_ptr,
@@ -790,11 +789,7 @@ if _TRITON_AVAILABLE:
         down_packed_ptr,
         down_absmax_ptr,
         down_code_ptr,
-        out_ptr,
         out_accum_ptr,
-        tile_state_ptr,
-        tile_done_ptr,
-        epoch,
         hidden_size,
         block_size,
         quant_block_size,
@@ -805,12 +800,12 @@ if _TRITON_AVAILABLE:
         BLOCK_IN: tl.constexpr,
         BLOCK_OUT: tl.constexpr,
     ):
+        # One program per active block (grid = top_k).
+        # out_accum must be zeroed by caller before launch.
+        # Caller copies out_accum -> out after all programs finish (no in-kernel barrier).
         pid = tl.program_id(0)
         if pid >= top_k:
             return
-
-        # Keep the program contract explicit: each program handles one active block slot.
-        _ = tl.load(active_blocks_ptr + pid, mask=pid < top_k, other=0)
 
         offs_block = tl.arange(0, 32)
         valid_block = offs_block < block_size
@@ -867,33 +862,7 @@ if _TRITON_AVAILABLE:
         gate_sigmoid = 1.0 / (1.0 + tl.exp(-gate_acc))
         intermediate = (gate_acc * gate_sigmoid) * up_acc
 
-        ready_state = epoch * 3 + 2
-        init_state = epoch * 3 + 1
-
         for out_start in tl.range(0, hidden_size, BLOCK_OUT, num_stages=1):
-            tile_id = out_start // BLOCK_OUT
-            tile_state = tile_state_ptr + tile_id
-            tile_done = tile_done_ptr + tile_id
-
-            state = tl.load(tile_state)
-            if state != ready_state:
-                if state != init_state:
-                    prev = tl.atomic_cas(tile_state, state, init_state)
-                    if prev == state:
-                        offs_out_init = out_start + tl.arange(0, BLOCK_OUT)
-                        valid_out_init = offs_out_init < hidden_size
-                        tl.store(out_accum_ptr + offs_out_init, 0.0, mask=valid_out_init)
-                        tl.store(tile_done, 0)
-                        tl.store(tile_state, ready_state)
-                    else:
-                        wait_state = tl.load(tile_state)
-                        while wait_state != ready_state:
-                            wait_state = tl.load(tile_state)
-                else:
-                    wait_state = tl.load(tile_state)
-                    while wait_state != ready_state:
-                        wait_state = tl.load(tile_state)
-
             offs_out = out_start + tl.arange(0, BLOCK_OUT)
             valid_out = offs_out < hidden_size
             out_idx = offs_out[:, None]
@@ -916,12 +885,6 @@ if _TRITON_AVAILABLE:
 
             contrib = tl.sum(down_w * intermediate[None, :], axis=1)
             tl.atomic_add(out_accum_ptr + offs_out, contrib, mask=valid_out)
-
-            prev_done = tl.atomic_add(tile_done, 1)
-            done_now = prev_done + 1
-            if done_now == top_k:
-                out_tile = tl.load(out_accum_ptr + offs_out, mask=valid_out, other=0.0)
-                tl.store(out_ptr + offs_out, out_tile.to(tl.float16), mask=valid_out)
 
 
 class _SparseInputLinearFn(torch.autograd.Function):
@@ -1416,9 +1379,6 @@ def triton_sparse_mlp_decode_4bit_single_kernel_sm75(
     down_code: torch.Tensor,
     out: torch.Tensor,
     out_accum: torch.Tensor,
-    tile_state: torch.Tensor,
-    tile_done: torch.Tensor,
-    epoch: int,
     hidden_size: int,
     block_size: int,
     quant_block_size: int,
@@ -1463,10 +1423,7 @@ def triton_sparse_mlp_decode_4bit_single_kernel_sm75(
     down_absmax = down_absmax.to(device=x_flat.device, dtype=torch.float32).contiguous()
     down_code = down_code.to(device=x_flat.device, dtype=torch.float32).contiguous()
 
-    out = out.to(device=x_flat.device, dtype=torch.float16).contiguous()
     out_accum = out_accum.to(device=x_flat.device, dtype=torch.float32).contiguous()
-    tile_state = tile_state.to(device=x_flat.device, dtype=torch.int32).contiguous()
-    tile_done = tile_done.to(device=x_flat.device, dtype=torch.int32).contiguous()
 
     bytes_per_row_gate = hidden_size // 2
     absmax_per_row_gate = hidden_size // quant_block_size
@@ -1506,22 +1463,14 @@ def triton_sparse_mlp_decode_4bit_single_kernel_sm75(
         preferred = 64 if preferred >= 64 else 32
         block_out_candidates = [preferred, 32 if preferred == 64 else 64]
 
+    # Zero accumulator before launch; kernel uses lock-free atomic_add, no in-kernel barrier.
+    out_accum[:hidden_size].zero_()
+
     launch_error: Exception | None = None
-    epoch_i32 = int(epoch)
     for block_out in block_out_candidates:
-        num_tiles = triton.cdiv(hidden_size, int(block_out))
-        if int(tile_state.numel()) < int(num_tiles):
-            raise RuntimeError(
-                f"tile_state scratch has {int(tile_state.numel())} entries, expected >= {int(num_tiles)}"
-            )
-        if int(tile_done.numel()) < int(num_tiles):
-            raise RuntimeError(
-                f"tile_done scratch has {int(tile_done.numel())} entries, expected >= {int(num_tiles)}"
-            )
         try:
             _sparse_mlp_decode_4bit_single_kernel_sm75[(top_k,)](
                 x_vec,
-                active_blocks_i32,
                 gate_packed.reshape(-1),
                 gate_absmax.reshape(-1),
                 gate_code.reshape(-1),
@@ -1531,11 +1480,7 @@ def triton_sparse_mlp_decode_4bit_single_kernel_sm75(
                 down_packed.reshape(-1),
                 down_absmax.reshape(-1),
                 down_code.reshape(-1),
-                out.reshape(-1),
                 out_accum.reshape(-1),
-                tile_state.reshape(-1),
-                tile_done.reshape(-1),
-                epoch_i32,
                 hidden_size,
                 int(block_size),
                 quant_block_size,
@@ -1548,6 +1493,9 @@ def triton_sparse_mlp_decode_4bit_single_kernel_sm75(
                 num_warps=4,
                 num_stages=1,
             )
+            # Copy fp32 accumulator to the fp16 output buffer.
+            out_f16 = out_accum[:hidden_size].to(dtype=torch.float16)
+            out.reshape(-1)[:hidden_size].copy_(out_f16)
             return out.view_as(x_flat)
         except Exception as exc:
             launch_error = exc
