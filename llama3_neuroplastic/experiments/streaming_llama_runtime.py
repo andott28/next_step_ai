@@ -5,6 +5,7 @@ import copy
 import os
 import threading
 import time
+import traceback
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -5013,6 +5014,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     f"[sparse] single-kernel Triton decode failed (attempt {self._single_kernel_fail_count}): {exc}",
                     flush=True,
                 )
+                traceback.print_exc()
                 if self._single_kernel_fail_count >= 3:
                     print("[sparse] disabling single-kernel path after 3 failures", flush=True)
                     self._single_kernel_decode_enabled = False

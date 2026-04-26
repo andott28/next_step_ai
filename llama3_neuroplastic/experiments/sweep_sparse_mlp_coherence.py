@@ -28,6 +28,19 @@ _THROUGHPUT_PROBE_DEFAULTS: dict[str, Any] = {
     "sparse_kv_prefill_mode": "sparse",
 }
 
+# Coherence sweep: top_k in [128,160,192,208], hot cache enabled, 8 tokens, dense attention.
+# Goal: find minimum coherent top_k. active_heads=24 keeps attention dense enough to be coherent.
+_COHERENCE_SWEEP_DEFAULTS: dict[str, Any] = {
+    "top_k_list": "128,160,192,208",
+    "hot_cache_gb_list": "4.0,4.5,5.0",
+    "max_new_tokens": 8,
+    "attn_active_heads": 24,
+    "attn_min_active_heads": 24,
+    "attn_max_active_heads": 24,
+    "sparse_mlp_prefill_mode": "dense",
+    "stop_after_first_match": False,
+}
+
 
 def _parse_int_list(raw: str, *, name: str, minimum: int = 1) -> list[int]:
     values: list[int] = []
@@ -79,6 +92,23 @@ def _encode_prompt(tokenizer: Any, prompt: str, prompt_format: str) -> torch.Lon
     else:
         encoded = tokenizer(str(prompt), return_tensors="pt")
     return encoded["input_ids"].to(dtype=torch.long)
+
+
+def _edit_distance(a: list[int], b: list[int]) -> int:
+    """Token-level Levenshtein edit distance."""
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[lb]
 
 
 def _release_cuda() -> None:
@@ -269,11 +299,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-triton-fused-sparse-mlp", action="store_true", default=False)
     parser.add_argument("--disable-cuda-h2d-overlap", action="store_true", default=False)
     parser.add_argument("--throughput-probe", action="store_true", default=False)
+    parser.add_argument("--coherence-sweep", action="store_true", default=False,
+                        help="Preset for coherence sweep: top_k=[128,160,192,208], hot_cache=[4,4.5,5], 8 tokens")
     parser.add_argument("--stop-after-first-match", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--skip-dense", action="store_true", default=False)
     parser.add_argument("--dense-json", type=str, default="")
     parser.add_argument("--output-json", type=str, required=True)
     return parser
+
+
+def _is_coherent(run: dict[str, Any]) -> bool:
+    if bool(run.get("completion_identical", False)):
+        return True
+    ed = run.get("completion_edit_distance")
+    return ed is not None and int(ed) <= 1
 
 
 def _update_best_coherent(report: dict[str, Any]) -> None:
@@ -282,7 +321,7 @@ def _update_best_coherent(report: dict[str, Any]) -> None:
     for run in report.get("runs", []):
         if not isinstance(run, dict):
             continue
-        coherent = bool(run.get("completion_identical", False))
+        coherent = _is_coherent(run)
         if not coherent:
             continue
         tps = float(run.get("decode_tok_s", 0.0))
@@ -303,6 +342,9 @@ def main() -> int:
     args = _build_parser().parse_args()
     if bool(args.throughput_probe):
         _apply_throughput_probe_defaults(args)
+    if bool(args.coherence_sweep):
+        for key, value in _COHERENCE_SWEEP_DEFAULTS.items():
+            setattr(args, key, value)
     output_path = Path(args.output_json)
     top_k_values = _parse_int_list(str(args.top_k_list), name="top-k", minimum=1)
     hot_cache_values = _parse_float_list(str(args.hot_cache_gb_list), name="hot-cache-gb", minimum=0.0)
@@ -417,6 +459,9 @@ def main() -> int:
                 )
                 sparse_result["identical"] = list(sparse_result["generated_ids"]) == dense_ids
                 sparse_result["completion_identical"] = list(sparse_result["completion_ids"]) == dense_completion_ids
+                sparse_result["completion_edit_distance"] = _edit_distance(
+                    list(sparse_result["completion_ids"]), dense_completion_ids
+                )
 
                 report.setdefault("runs", []).append(sparse_result)
                 if sparse_result["identical"] and report.get("first_identical_config") is None:
@@ -425,25 +470,28 @@ def main() -> int:
                         "vram_hot_cache_gb": float(hot_cache_gb),
                         "attn_active_heads": active_heads,
                     }
-                if sparse_result["completion_identical"] and report.get("first_completion_identical_config") is None:
+                if _is_coherent(sparse_result) and report.get("first_completion_identical_config") is None:
                     report["first_completion_identical_config"] = {
                         "sparse_top_k": int(top_k),
                         "vram_hot_cache_gb": float(hot_cache_gb),
                         "attn_active_heads": active_heads,
+                        "completion_edit_distance": sparse_result.get("completion_edit_distance"),
                     }
 
                 _update_best_coherent(report)
                 _write_report(output_path, report)
+                ed = sparse_result.get("completion_edit_distance", "?")
                 print(
                     "[sweep] top_k="
                     f"{int(top_k)} hot_cache_gb={float(hot_cache_gb):.2f} active_heads={active_heads} "
                     f"completion_identical={bool(sparse_result['completion_identical'])} "
+                    f"edit_distance={ed} "
                     f"decode_tok_s={float(sparse_result['decode_tok_s']):.4f} "
                     f"mean_mlp_ms={float(sparse_result['mean_mlp_ms']):.2f} "
                     f"mean_load_attn_ms={float(sparse_result['mean_load_attn_ms']):.2f}",
                     flush=True,
                 )
-                if bool(args.stop_after_first_match) and bool(sparse_result["completion_identical"]):
+                if bool(args.stop_after_first_match) and _is_coherent(sparse_result):
                     stop_requested = True
                     break
             if stop_requested:
