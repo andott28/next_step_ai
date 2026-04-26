@@ -18,41 +18,31 @@ from transformers import AutoTokenizer
 from llama3_neuroplastic.layer_selection import parse_layer_selection
 
 try:
+    from .contracts import (
+        apply_throughput_probe_defaults as _apply_throughput_probe_defaults,
+    )
+    from .contracts import (
+        build_throughput_contract_report,
+    )
+    from .contracts import (
+        normalize_throughput_contract as _normalize_throughput_contract,
+    )
     from .streaming_llama_runtime import StreamingLlamaRuntime
 except ImportError:
+    from contracts import (
+        apply_throughput_probe_defaults as _apply_throughput_probe_defaults,
+    )
+    from contracts import (
+        build_throughput_contract_report,
+    )
+    from contracts import (
+        normalize_throughput_contract as _normalize_throughput_contract,
+    )
     from streaming_llama_runtime import StreamingLlamaRuntime
 
 
 def _parse_layer_selection(spec: str | None) -> list[int] | None:
     return parse_layer_selection(spec, all_as_none=True, allow_none_token=True)
-
-
-_THROUGHPUT_PROBE_DEFAULTS: dict[str, Any] = {
-    "sparse_top_k": 208,
-    "sparse_basis_top_k": 64,
-    "sparse_mlp_execution": "exact_blockwise_sparse",
-    "sparse_mlp_prefill_mode": "hot_cache",
-    "vram_hot_cache_gb": 5.25,
-    "pre_warm": True,
-    "calibrate_hot_cache": True,
-    "hot_cache_calibration_tokens": 64,
-    "attn_active_heads": 5,
-    "attn_min_active_heads": 5,
-    "attn_max_active_heads": 5,
-    "sparse_attn_prefill_mode": "sparse",
-    "sparse_kv_prefill_mode": "sparse",
-}
-
-_THROUGHPUT_CONTRACT_TARGETS: dict[str, float] = {
-    "decode_tok_s": 3.30,
-    "mean_decode_ms_per_token": 303.0,
-    "decode_avg_mb_per_layer": 23.0,
-}
-
-
-def _apply_throughput_probe_defaults(args: Any) -> None:
-    for key, value in _THROUGHPUT_PROBE_DEFAULTS.items():
-        setattr(args, key, value)
 
 
 def _validate_required_path(path_value: str | None, *, flag: str) -> None:
@@ -67,114 +57,8 @@ def _validate_runtime_for_throughput_probe(runtime: StreamingLlamaRuntime) -> No
         raise RuntimeError(f"throughput probe is not on the 3.3 fast path: {formatted}")
 
 
-def _normalize_throughput_contract(raw_value: str | None) -> str:
-    value = str(raw_value or "off").strip().lower() or "off"
-    if value in {"off", "none", "false", "0"}:
-        return "off"
-    if value in {"probe", "fast_path"}:
-        return "probe"
-    if value in {"strict", "enforce"}:
-        return "strict"
-    raise RuntimeError("throughput-contract must be one of: off, probe, strict")
-
-
-def _build_contract_check(*, name: str, passed: bool, actual: Any, expected: Any) -> dict[str, Any]:
-    return {
-        "name": str(name),
-        "passed": bool(passed),
-        "actual": actual,
-        "expected": expected,
-    }
-
-
 def _build_throughput_contract_report(row: dict[str, Any]) -> dict[str, Any]:
-    runtime_status = dict(row.get("runtime_status", {}) or {})
-    traffic = dict(row.get("traffic", {}) or {})
-    decode_traffic = dict(traffic.get("decode", {}) or {})
-    new_tokens = int(row.get("new_tokens", 0))
-    expected_layer_visits = int(runtime_status.get("num_layers", 0)) * new_tokens
-    actual_layer_visits = int(decode_traffic.get("layer_visits", 0))
-    checks = [
-        _build_contract_check(
-            name="decode_tok_s",
-            passed=float(row.get("decode_tok_s", 0.0)) >= _THROUGHPUT_CONTRACT_TARGETS["decode_tok_s"],
-            actual=float(row.get("decode_tok_s", 0.0)),
-            expected=f">={_THROUGHPUT_CONTRACT_TARGETS['decode_tok_s']}",
-        ),
-        _build_contract_check(
-            name="mean_decode_ms_per_token",
-            passed=float(row.get("mean_decode_ms_per_token", float("inf"))) <= _THROUGHPUT_CONTRACT_TARGETS["mean_decode_ms_per_token"],
-            actual=float(row.get("mean_decode_ms_per_token", 0.0)),
-            expected=f"<={_THROUGHPUT_CONTRACT_TARGETS['mean_decode_ms_per_token']}",
-        ),
-        _build_contract_check(
-            name="decode_avg_mb_per_layer",
-            passed=float(row.get("decode_avg_mb_per_layer", float("inf"))) <= _THROUGHPUT_CONTRACT_TARGETS["decode_avg_mb_per_layer"],
-            actual=float(row.get("decode_avg_mb_per_layer", 0.0)),
-            expected=f"<={_THROUGHPUT_CONTRACT_TARGETS['decode_avg_mb_per_layer']}",
-        ),
-        _build_contract_check(
-            name="decode_layer_visits",
-            passed=expected_layer_visits > 0 and actual_layer_visits == expected_layer_visits,
-            actual=actual_layer_visits,
-            expected=expected_layer_visits,
-        ),
-        _build_contract_check(
-            name="lm_head_on_gpu",
-            passed=bool(runtime_status.get("lm_head_on_gpu", False)),
-            actual=bool(runtime_status.get("lm_head_on_gpu", False)),
-            expected=True,
-        ),
-        _build_contract_check(
-            name="lm_head_mode",
-            passed=str(runtime_status.get("lm_head_mode", "")) == "gpu_nf4",
-            actual=str(runtime_status.get("lm_head_mode", "")),
-            expected="gpu_nf4",
-        ),
-        _build_contract_check(
-            name="decode_backend",
-            passed=str(runtime_status.get("decode_backend", "")) == "single_kernel_sparse_decode_sm75",
-            actual=str(runtime_status.get("decode_backend", "")),
-            expected="single_kernel_sparse_decode_sm75",
-        ),
-        _build_contract_check(
-            name="attn_backend_decode",
-            passed=str(runtime_status.get("attn_backend_decode", "")) == "compact_sparse_v1",
-            actual=str(runtime_status.get("attn_backend_decode", "")),
-            expected="compact_sparse_v1",
-        ),
-        _build_contract_check(
-            name="compact_sparse_attention_steps",
-            passed=int(runtime_status.get("compact_sparse_attention_steps", 0)) > 0,
-            actual=int(runtime_status.get("compact_sparse_attention_steps", 0)),
-            expected=">0",
-        ),
-        _build_contract_check(
-            name="vram_hot_cache_live_calibrated",
-            passed=bool(runtime_status.get("vram_hot_cache_live_calibrated", False)),
-            actual=bool(runtime_status.get("vram_hot_cache_live_calibrated", False)),
-            expected=True,
-        ),
-        _build_contract_check(
-            name="decode_mlp_cold_blocks_streamed",
-            passed=int(runtime_status.get("decode_mlp_cold_blocks_streamed", 0)) == 0,
-            actual=int(runtime_status.get("decode_mlp_cold_blocks_streamed", 0)),
-            expected=0,
-        ),
-        _build_contract_check(
-            name="decode_down_cold_blocks_streamed",
-            passed=int(runtime_status.get("decode_down_cold_blocks_streamed", 0)) == 0,
-            actual=int(runtime_status.get("decode_down_cold_blocks_streamed", 0)),
-            expected=0,
-        ),
-    ]
-    failed = [check["name"] for check in checks if not bool(check["passed"])]
-    return {
-        "contract": "strict",
-        "passed": len(failed) == 0,
-        "failed_checks": failed,
-        "checks": checks,
-    }
+    return build_throughput_contract_report(row)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -398,6 +282,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Disable dedicated H2D CUDA stream overlap for sparse weight transfers.",
+    )
+    p.add_argument(
+        "--hard-cuda-cache-flush",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable torch.cuda.empty_cache() during normal cache resets. Disabled by default for stable throughput.",
     )
     p.add_argument(
         "--kv-basis-path",
@@ -638,6 +528,7 @@ def main() -> None:
         enable_cuda_h2d_overlap=not bool(args.disable_cuda_h2d_overlap),
         kv_basis_path=str(args.kv_basis_path) if args.kv_basis_path else None,
         kv_sparse_top_k=int(args.kv_sparse_top_k) if args.kv_sparse_top_k is not None else None,
+        hard_cuda_cache_flush=bool(args.hard_cuda_cache_flush),
     )
     if bool(args.profile_decode):
         runtime.enable_decode_profiler(True, max_steps=int(args.profile_max_steps))

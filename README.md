@@ -28,7 +28,7 @@ next_step_ai/
 ├── legacy/
 │   └── older experimental full-model/SCA code and one-off diagnostics
 ├── tests/
-│   └── test_streaming_llama_runtime.py
+│   └── test_throughput_contract.py
 ├── pyproject.toml
 ├── requirements.txt
 └── README.md
@@ -58,7 +58,11 @@ pip install -e ".[triton]"
 pip install -e ".[eval]"
 ```
 
-Requirements: Python 3.10+, PyTorch with CUDA, `bitsandbytes`, `transformers`, and enough host RAM for the selected cache settings.
+Requirements: Python 3.10+, PyTorch with CUDA, `bitsandbytes`, `transformers`, and enough host RAM for the selected cache settings. `pyproject.toml` is the canonical package metadata for editable installs and CI. `requirements.txt` is a pinned reproduction environment for local research reruns; prefer it only when reproducing an existing probe exactly.
+
+## JSON Schemas
+
+Inference and benchmark outputs use `decode_tok_s` as the canonical decode throughput field, `traffic` for traffic accounting, `runtime_status` for execution-mode state, and `throughput_contract` for pass/fail checks. `benchmark.py` may also emit legacy aliases such as `decode_tokens_per_second` and `traffic_report` for compatibility, but new tooling should consume the canonical fields.
 
 ## Fit Sparse MLP Basis
 

@@ -184,6 +184,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         attn_retrieval_r_query: int = 6,
         attn_retrieval_token_topk: int = 8,
         attn_retrieval_archive_capacity: int = 16384,
+        hard_cuda_cache_flush: bool = False,
     ) -> None:
         self.snapshot_dir = _resolve_snapshot_dir(model_name_or_path, local_files_only=bool(local_files_only))
         self.config = AutoConfig.from_pretrained(str(self.snapshot_dir), local_files_only=bool(local_files_only))
@@ -192,6 +193,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
+        self._hard_cuda_cache_flush = bool(hard_cuda_cache_flush)
+        self._runtime_events: list[dict[str, Any]] = []
+        self._runtime_events_max = 128
 
 
 
@@ -362,9 +366,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         }
         self._single_kernel_decode_enabled = bool(self._triton_fused_sparse_mlp) and not _disable_single_kernel
         self._single_kernel_mlp_out_accum: torch.Tensor | None = None
-        self._single_kernel_mlp_tile_state: torch.Tensor | None = None
-        self._single_kernel_mlp_tile_done: torch.Tensor | None = None
-        self._single_kernel_mlp_epoch: int = 0
         self._single_kernel_mlp_block_out: int = 64
         self._decode_backend_name: str = (
             "fused_sparse_decode_v1" if bool(self._triton_fused_sparse_mlp) else "dequant_sparse_fallback"
@@ -1703,6 +1704,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 if decode_profile_report is not None
                 else {}
             ),
+            "runtime_events": self.get_runtime_events(),
         }
 
     def validate_throughput_probe(self) -> list[str]:
@@ -4949,13 +4951,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 if block_out not in {32, 64}:
                     block_out = 64
                 self._ensure_single_kernel_mlp_scratch(hidden_size=hidden_size, block_out=block_out)
-                if self._single_kernel_mlp_out_accum is None or self._single_kernel_mlp_tile_state is None:
+                if self._single_kernel_mlp_out_accum is None:
                     raise RuntimeError("single-kernel sparse MLP scratch allocation failed")
-                self._single_kernel_mlp_epoch = int(self._single_kernel_mlp_epoch) + 1
-                if self._single_kernel_mlp_epoch >= 700_000_000:
-                    self._single_kernel_mlp_epoch = 1
-                    self._single_kernel_mlp_tile_state.fill_(-1)
-                    self._single_kernel_mlp_tile_done.zero_()
                 self._wait_for_h2d_stream()
                 out_buf = torch.empty((1, hidden_size), device=self.device, dtype=torch.float16)
                 down_single = triton_sparse_mlp_decode_4bit_single_kernel_sm75(

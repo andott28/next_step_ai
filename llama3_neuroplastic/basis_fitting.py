@@ -49,10 +49,13 @@ def _fit_incremental_pca(
     batch_size = int(max(batch_rows, rank_eff, 1))
     ipca = IncrementalPCA(n_components=int(rank_eff), batch_size=batch_size)
     y_cpu = y_centered.detach().to(device="cpu", dtype=torch.float32)
-    for start in range(0, int(y_cpu.shape[0]), batch_size):
-        chunk = y_cpu[start : start + batch_size]
+    fit_chunks = [y_cpu[start : start + batch_size] for start in range(0, int(y_cpu.shape[0]), batch_size)]
+    if len(fit_chunks) > 1 and int(fit_chunks[-1].shape[0]) < int(rank_eff):
+        fit_chunks[-2] = torch.cat([fit_chunks[-2], fit_chunks[-1]], dim=0)
+        fit_chunks.pop()
+    for chunk in fit_chunks:
         if int(chunk.shape[0]) < int(rank_eff):
-            break
+            raise RuntimeError("incremental PCA received fewer rows than the effective rank")
         ipca.partial_fit(chunk.contiguous().numpy())
     components = torch.from_numpy(ipca.components_.copy()).to(dtype=torch.float32)
     v = components.transpose(0, 1).contiguous()
@@ -142,7 +145,14 @@ def fit_layer_basis(
     decoder_blocks = basis.view(int(basis_rank), num_blocks, int(block_size)).permute(1, 0, 2).contiguous()
     decoder_bias = y_mean.view(num_blocks, int(block_size)).contiguous()
 
+    if decoder_blocks.shape != (num_blocks, int(basis_rank), int(block_size)):
+        raise RuntimeError(f"Shape mismatch: decoder_blocks shape {decoder_blocks.shape} != {(num_blocks, int(basis_rank), int(block_size))}")
+
+    if decoder_blocks.shape != (num_blocks, int(basis_rank), int(block_size)):
+        raise RuntimeError(f"Shape mismatch: decoder_blocks shape {decoder_blocks.shape} != {(num_blocks, int(basis_rank), int(block_size))}")
+
     return {
+        "schema_version": 1,
         "encoder_weight": enc_w_eff.detach().cpu().float(),
         "encoder_bias": enc_b_eff.detach().cpu().float(),
         "decoder_blocks": decoder_blocks.detach().cpu().float(),
@@ -202,7 +212,14 @@ def fit_block_score_basis(
     score_weight = basis.transpose(0, 1).contiguous()
     block_importance = scores_cpu.mean(dim=0).contiguous()
 
+    if score_weight.shape != (num_blocks, int(basis_rank)):
+        raise RuntimeError(f"Shape mismatch: score_weight shape {score_weight.shape} != {(num_blocks, int(basis_rank))}")
+
+    if score_weight.shape != (num_blocks, int(basis_rank)):
+        raise RuntimeError(f"Shape mismatch: score_weight shape {score_weight.shape} != {(num_blocks, int(basis_rank))}")
+
     return {
+        "schema_version": 1,
         "encoder_weight": enc_w_eff.detach().cpu().float(),
         "encoder_bias": enc_b_eff.detach().cpu().float(),
         "score_weight": score_weight.detach().cpu().float(),

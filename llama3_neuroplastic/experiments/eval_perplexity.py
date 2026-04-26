@@ -164,26 +164,9 @@ def _run_forward_only(
     This bypasses the generate() sampling loop and uses the runtime prefill
     façade before replaying token logits for perplexity scoring.
     """
-    runtime.reset_caches()
-    seq_len = int(input_ids.shape[1])
-    if seq_len <= 1:
-        return None
     try:
         with torch.no_grad():
-            runtime.begin_traffic_phase("prefill")
-            runtime.prefill_logits(input_ids.to(runtime.device))
-
-
-
-
-        runtime.reset_caches()
-        logits_list = []
-        runtime.begin_traffic_phase("decode")
-        for pos in range(seq_len - 1):
-            tok = input_ids[:, pos : pos + 1].to(runtime.device)
-            logits_step = runtime.decode_token_logits(tok, position_index=pos)
-            logits_list.append(logits_step.cpu())
-        return torch.cat(logits_list, dim=1)
+            return runtime.score_window_logits(input_ids).detach().cpu()
     except Exception as exc:
         print(f"[ppl] forward pass error: {type(exc).__name__}: {exc}", flush=True)
         return None
@@ -203,6 +186,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--stride", type=int, default=512)
     parser.add_argument("--context-len", type=int, default=2048)
     parser.add_argument("--vram-hot-cache-gb", type=float, default=4.0)
+    parser.add_argument("--hard-cuda-cache-flush", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--output-json", default=None)
     args = parser.parse_args(argv)
 
@@ -231,6 +215,7 @@ def main(argv: list[str] | None = None) -> None:
         attn_head_importance_path=args.attn_head_importance_path,
         kv_basis_path=args.kv_basis_path,
         vram_hot_cache_gb=args.vram_hot_cache_gb,
+        hard_cuda_cache_flush=bool(args.hard_cuda_cache_flush),
     )
 
     print(f"[ppl] Evaluating perplexity (stride={args.stride}, context={args.context_len}) ...", flush=True)

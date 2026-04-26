@@ -47,6 +47,9 @@ class RuntimeLmHeadMixin:
                 total_bytes += int(tensor.numel()) * int(tensor.element_size())
         return float(total_bytes) / float(1024 ** 3)
 
+    def get_execution_plan(self) -> dict[str, Any]:
+        return {"lm_head": self.get_lm_head_status()}
+
     def get_lm_head_status(self) -> dict[str, Any]:
         if not bool(getattr(self, "_materialize_lm_head", True)):
             return {
@@ -328,13 +331,7 @@ class RuntimeLmHeadMixin:
             free_bytes, total_bytes = 0, 0
         if free_bytes > 0 and (int(free_bytes) - int(required_bytes)) < int(required_residual_bytes):
             self._lm_head_gpu_last_failure = "insufficient_free_vram_for_nf4"
-            print(
-                f"[lm_head] staying off dense GPU load; free={float(free_bytes) / (1024 ** 3):.2f} GiB "
-                f"nf4={float(required_bytes) / (1024 ** 3):.2f} GiB "
-                f"reserve_after_load={float(required_residual_bytes) / (1024 ** 3):.2f} GiB "
-                f"total={float(total_bytes) / (1024 ** 3):.2f} GiB",
-                flush=True,
-            )
+            self._record_runtime_event("lm_head_decision", action="staying_off_dense_gpu", free_bytes=free_bytes, required_bytes=required_bytes)
             return False
 
         try:
@@ -354,14 +351,8 @@ class RuntimeLmHeadMixin:
             }
             self._lm_head_gpu_last_failure = None
             if quantized_from_dense:
-                print(
-                    "[lm_head] source weight had no NF4 metadata; quantized dense LM head to NF4 on CPU before GPU upload",
-                    flush=True,
-                )
-            print(
-                f"[lm_head] resident on GPU as NF4: {self._lm_head_quantized_weight_gb(self._lm_head_nf4_meta_gpu):.2f} GiB",
-                flush=True,
-            )
+                self._record_runtime_event("lm_head_decision", action="quantized_dense_to_nf4_on_cpu")
+            self._record_runtime_event("lm_head_decision", action="resident_on_gpu_nf4", weight_gb=self._lm_head_quantized_weight_gb(self._lm_head_nf4_meta_gpu))
             return True
         except Exception as exc:
             self._lm_head_nf4_meta_gpu = None
@@ -371,11 +362,7 @@ class RuntimeLmHeadMixin:
                     raise RuntimeError(
                         "STREAMING_GPU_LM_HEAD was explicitly enabled, but GPU NF4 LM-head materialization OOMed."
                     ) from exc
-                print(
-                    f"[lm_head] GPU NF4 materialization failed; continuing without quantized hot path: "
-                    f"{type(exc).__name__}: {str(exc)[:200]}",
-                    flush=True,
-                )
+                self._record_runtime_event("lm_head_decision", action="nf4_materialization_failed", error=str(exc))
                 return False
             raise
 
@@ -427,13 +414,7 @@ class RuntimeLmHeadMixin:
             free_bytes, total_bytes = 0, 0
         if free_bytes > 0 and (int(free_bytes) - int(required_bytes)) < int(required_residual_bytes):
             self._lm_head_gpu_last_failure = "insufficient_free_vram"
-            print(
-                f"[lm_head] staying on CPU; free={float(free_bytes) / (1024 ** 3):.2f} GiB "
-                f"lm_head={float(required_bytes) / (1024 ** 3):.2f} GiB "
-                f"reserve_after_load={float(required_residual_bytes) / (1024 ** 3):.2f} GiB "
-                f"need_total={float(required_bytes + required_residual_bytes) / (1024 ** 3):.2f} GiB",
-                flush=True,
-            )
+            self._record_runtime_event("lm_head_decision", action="staying_on_cpu", free_bytes=free_bytes, required_bytes=required_bytes)
             return
 
         try:
@@ -453,10 +434,7 @@ class RuntimeLmHeadMixin:
                         flush=True,
                     )
                 except Exception:
-                    print(
-                        f"[lm_head] resident on GPU: {float(required_bytes) / (1024 ** 3):.2f} GiB",
-                        flush=True,
-                    )
+                    self._record_runtime_event("lm_head_decision", action="resident_on_gpu", required_bytes=required_bytes)
         except Exception as exc:
             self._lm_head_weight_gpu = None
             self._lm_head_gpu_last_failure = f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -465,10 +443,7 @@ class RuntimeLmHeadMixin:
                     raise RuntimeError(
                         "STREAMING_GPU_LM_HEAD was explicitly enabled, but GPU LM-head materialization OOMed."
                     ) from exc
-                print(
-                    f"[lm_head] GPU materialization failed; keeping CPU path: {type(exc).__name__}: {str(exc)[:200]}",
-                    flush=True,
-                )
+                self._record_runtime_event("lm_head_decision", action="materialization_failed", error=str(exc))
             else:
                 raise
 
@@ -480,8 +455,9 @@ class RuntimeLmHeadMixin:
             hidden_flat = hidden.view(-1, hidden.shape[-1]).to(device=self.device, dtype=self.dtype).contiguous()
             rows = int(hidden_flat.shape[0])
             active_idx = nf4_meta["active_idx"]
-            if rows != int(active_idx.shape[0]):
-                active_idx = active_idx.expand(rows, -1).contiguous()
+            if getattr(self, "_lm_head_active_idx_cache", None) is None or self._lm_head_active_idx_cache.shape[0] < rows:
+                self._lm_head_active_idx_cache = active_idx.expand(rows, -1).contiguous()
+            active_idx = self._lm_head_active_idx_cache[:rows]
             logits_flat = triton_sparse_input_linear_4bit(
                 hidden_flat,
                 active_idx,

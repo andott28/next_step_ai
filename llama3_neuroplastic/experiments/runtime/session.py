@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+from contextlib import suppress
 from typing import Any
 
 import torch
@@ -12,6 +13,19 @@ except Exception:
 
 
 class RuntimeSessionMixin:
+    def _record_runtime_event(self, name: str, **fields: Any) -> None:
+        events = getattr(self, "_runtime_events", None)
+        if not isinstance(events, list):
+            self._runtime_events = []
+            events = self._runtime_events
+        events.append({"name": str(name), **fields})
+        max_events = int(getattr(self, "_runtime_events_max", 128) or 128)
+        if len(events) > max_events:
+            del events[:-max_events]
+
+    def get_runtime_events(self) -> list[dict[str, Any]]:
+        return list(getattr(self, "_runtime_events", []) or [])
+
     def reset_decode_profiler(self) -> None:
         if hasattr(self, "_decode_profile_steps"):
             self._decode_profile_steps.clear()
@@ -139,8 +153,9 @@ class RuntimeSessionMixin:
             self._downproj_transfer_cache.clear()
         if hasattr(self, "_mlp_prefetch_active_blocks"):
             self._mlp_prefetch_active_blocks.clear()
-        if release_cuda and torch.cuda.is_available():
+        if release_cuda and bool(getattr(self, "_hard_cuda_cache_flush", False)) and torch.cuda.is_available():
             torch.cuda.empty_cache()
+            self._record_runtime_event("cuda_empty_cache", reason="clear_sparse_transfer_caches")
 
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
@@ -169,8 +184,9 @@ class RuntimeSessionMixin:
         self._session_sparse_route_layers.clear()
         self.clear_sparse_transfer_caches()
         gc.collect()
-        if torch.cuda.is_available():
+        if bool(getattr(self, "_hard_cuda_cache_flush", False)) and torch.cuda.is_available():
             torch.cuda.empty_cache()
+            self._record_runtime_event("cuda_empty_cache", reason="reset_caches")
 
     def clear_session_state(self) -> None:
         self._session_token_ids_cpu = None
@@ -355,10 +371,8 @@ class RuntimeSessionMixin:
             },
         }
         if hasattr(self, "get_runtime_status"):
-            try:
+            with suppress(Exception):
                 self._last_traffic_report["runtime_status"] = self.get_runtime_status()
-            except Exception:
-                pass
 
     def get_last_traffic_report(self) -> dict[str, Any] | None:
         return self._last_traffic_report
@@ -384,6 +398,15 @@ class RuntimeSessionMixin:
             position_index=int(position_offset),
         )
         return logits
+
+    def score_window_logits(self, token_ids: torch.LongTensor) -> torch.Tensor:
+        if token_ids.ndim != 2 or int(token_ids.shape[0]) != 1:
+            raise RuntimeError("score_window_logits currently supports batch_size=1 only")
+        if int(token_ids.shape[1]) <= 1:
+            raise RuntimeError("Need at least 2 tokens for window scoring")
+        self.reset_caches()
+        self.begin_traffic_phase("prefill")
+        return self.prefill_logits(token_ids.to(self.device))
 
     def decode_token_logits(
         self,

@@ -124,14 +124,18 @@ class TokenPostingArchive:
         self.archive_k_cpu: dict[int, torch.Tensor] = {}
         self.archive_v_cpu: dict[int, torch.Tensor] = {}
         self.archive_count: dict[int, int] = {}
+        self.archive_generation: dict[int, np.ndarray] = {}
 
 
 
 
 
-        self._post_tok: dict[int, list[list[list[int]]]] = {}
-        self._post_coeff: dict[int, list[list[list[int]]]] = {}
-        self._post_scale: dict[int, list[list[list[float]]]] = {}
+        self._post_tok: dict[int, np.ndarray] = {}
+        self._post_gen: dict[int, np.ndarray] = {}
+        self._post_coeff: dict[int, np.ndarray] = {}
+        self._post_scale: dict[int, np.ndarray] = {}
+        self._post_head: dict[int, np.ndarray] = {}
+        self._post_count: dict[int, np.ndarray] = {}
 
 
 
@@ -177,11 +181,15 @@ class TokenPostingArchive:
             self.archive_k_cpu[layer_idx] = _try_pin(torch.zeros(AC, G, D, dtype=torch.float16))
             self.archive_v_cpu[layer_idx] = _try_pin(torch.zeros(AC, G, D, dtype=torch.float16))
             self.archive_count[layer_idx] = 0
+            self.archive_generation[layer_idx] = np.full(AC, -1, dtype=np.int64)
 
 
-            self._post_tok[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_coeff[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_scale[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+            self._post_tok[layer_idx] = np.zeros((G, R, AC), dtype=np.int32)
+            self._post_gen[layer_idx] = np.zeros((G, R, AC), dtype=np.int64)
+            self._post_coeff[layer_idx] = np.zeros((G, R, AC), dtype=np.int8)
+            self._post_scale[layer_idx] = np.zeros((G, R, AC), dtype=np.float32)
+            self._post_head[layer_idx] = np.zeros((G, R), dtype=np.int32)
+            self._post_count[layer_idx] = np.zeros((G, R), dtype=np.int32)
 
 
             self._score_buf[layer_idx] = [np.zeros(AC, dtype=np.float32) for _ in range(G)]
@@ -224,9 +232,13 @@ class TokenPostingArchive:
             self.ring_head[layer_idx] = 0
             self.ring_count[layer_idx] = 0
             self.archive_count[layer_idx] = 0
-            self._post_tok[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_coeff[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
-            self._post_scale[layer_idx] = [[[] for _ in range(R)] for _ in range(G)]
+            self.archive_generation[layer_idx].fill(-1)
+            self._post_tok[layer_idx] = np.zeros((G, R, self.archive_capacity), dtype=np.int32)
+            self._post_gen[layer_idx] = np.zeros((G, R, self.archive_capacity), dtype=np.int64)
+            self._post_coeff[layer_idx] = np.zeros((G, R, self.archive_capacity), dtype=np.int8)
+            self._post_scale[layer_idx] = np.zeros((G, R, self.archive_capacity), dtype=np.float32)
+            self._post_head[layer_idx] = np.zeros((G, R), dtype=np.int32)
+            self._post_count[layer_idx] = np.zeros((G, R), dtype=np.int32)
             for g in range(G):
                 self._stamp_buf[layer_idx][g].fill(-1)
                 self._score_buf[layer_idx][g].fill(0.0)
@@ -293,11 +305,11 @@ class TokenPostingArchive:
         """Write a token into the CPU archive and update posting lists."""
         n = self.archive_count[layer_idx]
         write_pos = n % self.archive_capacity
-        self.archive_count[layer_idx] = n + 1
 
 
         self.archive_k_cpu[layer_idx][write_pos].copy_(k_cpu.half())
         self.archive_v_cpu[layer_idx][write_pos].copy_(v_cpu.half())
+        self.archive_generation[layer_idx][write_pos] = int(n)
 
 
         k_f32 = k_cpu.float().numpy()
@@ -325,9 +337,13 @@ class TokenPostingArchive:
             for r in top_coords.tolist():
                 coeff = int(alpha_q8[r])
                 if coeff != 0:
-                    self._post_tok[layer_idx][g][r].append(n)
-                    self._post_coeff[layer_idx][g][r].append(coeff)
-                    self._post_scale[layer_idx][g][r].append(max_abs)
+                    head = self._post_head[layer_idx][g, r]
+                    self._post_tok[layer_idx][g, r, head] = write_pos
+                    self._post_gen[layer_idx][g, r, head] = n
+                    self._post_coeff[layer_idx][g, r, head] = coeff
+                    self._post_scale[layer_idx][g, r, head] = max_abs
+                    self._post_head[layer_idx][g, r] = (head + 1) % self.archive_capacity
+                    self._post_count[layer_idx][g, r] += 1
 
         self.archive_count[layer_idx] = n + 1
 
@@ -363,16 +379,29 @@ class TokenPostingArchive:
 
         for r in top_r.tolist():
             beta_r = float(weighted[r])
-            tok_list = self._post_tok[layer_idx][group_idx][r]
-            coeff_list = self._post_coeff[layer_idx][group_idx][r]
-            scale_list = self._post_scale[layer_idx][group_idx][r]
-            for i in range(len(tok_list)):
-                t = tok_list[i]
-                if stamp_buf[t] != step:
-                    stamp_buf[t] = step
-                    score_buf[t] = 0.0
-                    touched.append(t)
-                score_buf[t] += beta_r * (float(coeff_list[i]) / 127.0) * float(scale_list[i])
+            limit = min(self._post_count[layer_idx][group_idx, r], self.archive_capacity)
+            if limit == 0:
+                continue
+                
+            tok_arr = self._post_tok[layer_idx][group_idx, r, :limit]
+            gen_arr = self._post_gen[layer_idx][group_idx, r, :limit]
+            coeff_arr = self._post_coeff[layer_idx][group_idx, r, :limit]
+            scale_arr = self._post_scale[layer_idx][group_idx, r, :limit]
+            
+            valid_mask = (self.archive_generation[layer_idx][tok_arr] == gen_arr)
+            
+            valid_toks = tok_arr[valid_mask]
+            valid_coeffs = coeff_arr[valid_mask]
+            valid_scales = scale_arr[valid_mask]
+            
+            new_mask = stamp_buf[valid_toks] != step
+            if new_mask.any():
+                new_toks = valid_toks[new_mask]
+                stamp_buf[new_toks] = step
+                score_buf[new_toks] = 0.0
+                touched.extend(new_toks.tolist())
+                
+            score_buf[valid_toks] += beta_r * (valid_coeffs.astype(np.float32) / 127.0) * valid_scales
 
         return touched
 
@@ -390,10 +419,16 @@ class TokenPostingArchive:
         n_arch = self.archive_count[layer_idx]
         if n_arch == 0:
             return np.empty(0, dtype=np.int32)
+        valid_count = min(int(n_arch), int(self.archive_capacity))
 
         basis_g = self.basis[layer_idx][group_idx]
         if basis_g is None:
-            return np.arange(min(M, n_arch), dtype=np.int32)
+            first_generation = max(0, int(n_arch) - valid_count)
+            slots = np.asarray(
+                [generation % int(self.archive_capacity) for generation in range(first_generation, int(n_arch))],
+                dtype=np.int32,
+            )
+            return slots[: min(int(M), int(slots.size))]
 
         mean_g = self.key_mean[layer_idx][group_idx]
         q_centred = q_cpu - mean_g
@@ -493,9 +528,6 @@ class TokenPostingArchive:
         if not parts_k:
             empty = torch.zeros(0, self.head_dim, dtype=self.dtype, device=self.device)
             return empty, empty
-
-        if self.device.type == "cuda":
-            torch.cuda.synchronize()
 
         k_all = torch.cat(parts_k, dim=0)
         v_all = torch.cat(parts_v, dim=0)

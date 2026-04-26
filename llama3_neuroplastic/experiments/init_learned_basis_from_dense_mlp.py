@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,18 @@ def _layers_for_output_save(
     output_layers = {int(idx) for idx in selected_layers}
     output_layers.update(int(idx) for idx in layer_states)
     return sorted(output_layers)
+
+
+def group_tokenized_texts(examples: dict[str, list], *, seq_len: int) -> dict[str, Any]:
+    ids = list(chain.from_iterable(examples["input_ids"]))
+    total = (len(ids) // int(seq_len)) * int(seq_len)
+    if total == 0:
+        return {"input_ids": [], "attention_mask": []}
+    chunks = [ids[i : i + int(seq_len)] for i in range(0, total, int(seq_len))]
+    return {
+        "input_ids": chunks,
+        "attention_mask": [[1] * int(seq_len) for _ in chunks],
+    }
 
 
 def _build_dataloader(
@@ -122,15 +135,7 @@ def _build_dataloader(
     _seq_len = int(max_seq_length)
 
     def group_texts(examples: dict[str, list]) -> dict[str, Any]:
-        ids = sum(examples["input_ids"], [])
-        total = (len(ids) // _seq_len) * _seq_len
-        if total == 0:
-            return {"input_ids": [], "attention_mask": []}
-        return {
-            "input_ids": [ids[i : i + _seq_len] for i in range(0, total, _seq_len)],
-
-            "attention_mask": [[1] * _seq_len for _ in range(0, total, _seq_len)],
-        }
+        return group_tokenized_texts(examples, seq_len=_seq_len)
 
     grouped = tokenized.map(
         group_texts,
@@ -412,7 +417,7 @@ def _save_basis_resume(
     if bool(include_buffers):
         payload["layer_x"] = {idx: layer_x[idx] for idx in selected_layers if layer_x[idx]}
         payload["layer_y"] = {idx: layer_y[idx] for idx in selected_layers if layer_y[idx]}
-    if layer_kv_x is not None:
+    if bool(include_buffers) and layer_kv_x is not None:
         payload["layer_kv_x"] = {idx: layer_kv_x[idx] for idx in selected_layers if layer_kv_x.get(idx)}
     if layer_kv_rows is not None:
         payload["layer_kv_rows"] = dict(layer_kv_rows)
@@ -479,6 +484,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dataloader-persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--dense-rollout-tokens", type=int, default=8)
     p.add_argument("--resume-save-every-batches", type=int, default=1)
+    p.add_argument(
+        "--resume-save-buffers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Persist raw collected activation buffers in .resume.pt files. Disabled by default.",
+    )
     p.add_argument("--write-partial-output-every-batches", type=int, default=1)
     p.add_argument("--max-batches", type=int, default=0)
     p.add_argument("--only-missing-from-output", action=argparse.BooleanOptionalAction, default=False)
@@ -867,7 +878,7 @@ def main() -> None:
 
 
 
-    _EVR_LOW: float = 0.0
+    _EVR_LOW: float = 0.65
     _EVR_HIGH: float = 0.85
     _layer_next_fit_at: dict[int, int] = {int(idx): _fit_threshold for idx in selected_layers}
 
@@ -955,7 +966,7 @@ def main() -> None:
                 layer_x=layer_x,
                 layer_y=layer_y,
                 selected_layers=selected_layers,
-                include_buffers=True,
+                include_buffers=bool(args.resume_save_buffers),
                 layer_kv_x=layer_kv_x if _do_kv else None,
                 layer_kv_rows=layer_kv_rows if _do_kv else None,
             )
@@ -1046,7 +1057,7 @@ def main() -> None:
                     layer_x=layer_x,
                     layer_y=layer_y,
                     selected_layers=selected_layers,
-                    include_buffers=True,
+                    include_buffers=bool(args.resume_save_buffers),
                     layer_kv_x=layer_kv_x if _do_kv else None,
                     layer_kv_rows=layer_kv_rows if _do_kv else None,
                 )

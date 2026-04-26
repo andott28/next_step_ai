@@ -10,6 +10,8 @@ def parse_layer_selection(
 ) -> list[int] | None:
     stripped = "" if spec is None else str(spec).strip()
     if stripped == "" or stripped.lower() == "all":
+        if not all_as_none and total_layers is None:
+            raise ValueError("Ambiguous layer selection: 'all' requested but total_layers is not provided.")
         return None if all_as_none else list(range(int(total_layers or 0)))
     if allow_none_token and stripped.lower() in {"none", "off", "disable", "disabled"}:
         return []
@@ -30,5 +32,8 @@ def parse_layer_selection(
             selected.add(int(token))
 
     if total_layers is not None:
-        return sorted(idx for idx in selected if 0 <= idx < int(total_layers))
+        for idx in selected:
+            if idx < 0 or idx >= int(total_layers):
+                raise ValueError(f"Layer index out of bounds: {idx}. Valid range is 0 to {int(total_layers) - 1}.")
+
     return sorted(selected)

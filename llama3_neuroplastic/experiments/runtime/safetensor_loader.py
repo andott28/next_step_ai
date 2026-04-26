@@ -18,7 +18,6 @@ from safetensors import safe_open
 
 from ._helpers import (
     _SAFETENSORS_DTYPE_TO_TORCH,
-    _add_offset_inplace_gpu,
     _assert_bnb_ready,
     _readinto_cpu_tensor,
     _resolve_pin_ram_cache_default,
@@ -509,76 +508,6 @@ class ShardedSafetensorLoader:
                 byte_counter(int(traffic_bytes))
             del absmax
             return
-
-        if absmax_staging is not None:
-            quant_state_cpu = bnb_functional.QuantState.from_dict(quant_aux, device=torch.device("cpu"))
-            if quant_state_cpu.nested:
-                traffic_bytes += int(quant_state_cpu.absmax.numel() * quant_state_cpu.absmax.element_size())
-                traffic_bytes += int(
-                    quant_state_cpu.state2.absmax.numel() * quant_state_cpu.state2.absmax.element_size()
-                )
-                traffic_bytes += int(quant_state_cpu.state2.code.numel() * quant_state_cpu.state2.code.element_size())
-                if (
-                    nested_absmax_staging is not None
-                    and state2_absmax_staging is not None
-                    and code_staging is not None
-                ):
-                    n_nested = quant_state_cpu.absmax.numel()
-                    nested_gpu = nested_absmax_staging[:n_nested]
-                    _copy_cpu_into(nested_gpu, quant_state_cpu.absmax, dtype=nested_gpu.dtype)
-
-                    n_s2 = quant_state_cpu.state2.absmax.numel()
-                    s2_gpu = state2_absmax_staging[:n_s2]
-                    _copy_cpu_into(s2_gpu, quant_state_cpu.state2.absmax, dtype=s2_gpu.dtype)
-
-                    _copy_cpu_into(
-                        code_staging[: quant_state_cpu.state2.code.numel()],
-                        quant_state_cpu.state2.code,
-                        dtype=code_staging.dtype,
-                    )
-                    code_gpu = code_staging[: quant_state_cpu.state2.code.numel()]
-
-                    absmax = absmax_staging[:n_nested]
-                    bnb_functional.dequantize_blockwise(
-                        nested_gpu,
-                        absmax=s2_gpu,
-                        code=code_gpu,
-                        out=absmax,
-                        blocksize=quant_state_cpu.state2.blocksize,
-                    )
-                    _add_offset_inplace_gpu(absmax.reshape(-1), quant_state_cpu.offset)
-                else:
-                    quant_state_cpu = None
-            else:
-                traffic_bytes += int(quant_state_cpu.absmax.numel() * quant_state_cpu.absmax.element_size())
-                n_abs = quant_state_cpu.absmax.numel()
-                absmax = absmax_staging[:n_abs]
-                _copy_cpu_into(absmax, quant_state_cpu.absmax, dtype=absmax.dtype)
-                if absmax.dtype != torch.float32:
-                    absmax = absmax.float()
-
-            if quant_state_cpu is not None:
-                if n * 2 != out.numel():
-                    raise RuntimeError(
-                        f"Shape mismatch for '{full_name}': {n} NF4 bytes -> {n * 2} elements "
-                        f"but out has {out.numel()} elements (shape {out.shape})"
-                    )
-
-                _assert_bnb_ready(weight_gpu, f"{full_name}/weight_gpu", expected_device=out.device)
-                _assert_bnb_ready(absmax, f"{full_name}/absmax_staging", expected_device=out.device)
-                _bnb_dequant_impl(
-                    weight_gpu,
-                    absmax,
-                    quant_state_cpu.blocksize,
-                    quant_state_cpu.quant_type,
-                    quant_state_cpu.dtype,
-                    out=out,
-                )
-                if byte_counter is not None:
-                    byte_counter(int(traffic_bytes))
-                del absmax, quant_state_cpu
-                return
-
 
         quant_state = bnb_functional.QuantState.from_dict(quant_aux, device=out.device)
         traffic_bytes += int(quant_state.absmax.numel() * quant_state.absmax.element_size())
