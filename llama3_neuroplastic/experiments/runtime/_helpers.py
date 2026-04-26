@@ -50,14 +50,23 @@ _SAFETENSORS_DTYPE_TO_TORCH: dict[str, torch.dtype] = {
 }
 
 _DEFAULT_SPARSE_BASIS_TOP_K = 8
-_SPARSE_MLP_EXECUTION_CHOICES = {"auto", "exact_intermediate_sparse"}
+_SPARSE_MLP_EXECUTION_CANONICAL = "exact_blockwise_sparse"
+_SPARSE_MLP_EXECUTION_ALIASES = {
+    "exact_intermediate_sparse": _SPARSE_MLP_EXECUTION_CANONICAL,
+}
+_SPARSE_MLP_EXECUTION_CHOICES = {
+    "auto",
+    _SPARSE_MLP_EXECUTION_CANONICAL,
+    *_SPARSE_MLP_EXECUTION_ALIASES.keys(),
+}
 
 
 def _normalize_sparse_mlp_execution(mode: str | None) -> str:
     normalized = str(mode or "auto").strip().lower() or "auto"
+    normalized = _SPARSE_MLP_EXECUTION_ALIASES.get(normalized, normalized)
     if normalized not in _SPARSE_MLP_EXECUTION_CHOICES:
         raise RuntimeError(
-            "Sparse MLP execution must be one of: auto, exact_intermediate_sparse"
+            "Sparse MLP execution must be one of: auto, exact_blockwise_sparse, exact_intermediate_sparse"
         )
     return normalized
 

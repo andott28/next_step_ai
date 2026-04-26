@@ -226,7 +226,7 @@ def _artifact_target_to_recommended_execution(artifact_target: str) -> str:
     if target == "output_reconstruction":
         return "output_basis_surrogate"
     if target == "intermediate_block_scores":
-        return "exact_intermediate_sparse"
+        return "exact_blockwise_sparse"
     raise ValueError(f"Unsupported artifact target: {artifact_target}")
 
 

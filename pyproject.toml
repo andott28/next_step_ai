@@ -45,9 +45,6 @@ fit-token-posting = "llama3_neuroplastic.experiments.init_attn_token_posting_bas
 where = ["."]
 include = ["llama3_neuroplastic*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-
 [tool.ruff]
 line-length = 120
 target-version = "py310"

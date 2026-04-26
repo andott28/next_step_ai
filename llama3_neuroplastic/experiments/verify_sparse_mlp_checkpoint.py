@@ -251,10 +251,11 @@ def main() -> int:
     recommended_execution = str(config.get("recommended_execution", "")).strip().lower()
     if artifact_target == "intermediate_block_scores" and recommended_execution not in {
         "",
+        "exact_blockwise_sparse",
         "exact_intermediate_sparse",
     }:
         errors.append(
-            f"recommended_execution={recommended_execution!r}, expected 'exact_intermediate_sparse' "
+            f"recommended_execution={recommended_execution!r}, expected 'exact_blockwise_sparse' "
             "for intermediate_block_scores"
         )
     if artifact_target == "output_reconstruction" and recommended_execution not in {

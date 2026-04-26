@@ -50,13 +50,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sparse-mlp-execution",
         type=str,
-        default="exact_intermediate_sparse",
+        default="exact_blockwise_sparse",
         choices=[
             "auto",
-            "output_basis_surrogate",
-            "routed_output_blocks",
+            "exact_blockwise_sparse",
             "exact_intermediate_sparse",
-            "exact_intermediate_sparse_oracle",
         ],
     )
     parser.add_argument("--sparse-mlp-prefill-mode", type=str, default="dense", choices=["dense", "sparse"])
