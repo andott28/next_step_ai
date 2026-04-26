@@ -48,7 +48,7 @@ _DEFAULT_PROMPT = (
 )
 
 _THROUGHPUT_PROBE_DEFAULTS: dict[str, Any] = {
-    "sparse_top_k": 51,
+    "sparse_top_k": 208,
     "sparse_basis_top_k": 64,
     "sparse_mlp_execution": "exact_blockwise_sparse",
     "sparse_mlp_prefill_mode": "hot_cache",
@@ -162,6 +162,30 @@ def _build_throughput_contract_report(results: dict[str, Any]) -> dict[str, Any]
             passed=bool(runtime_status.get("lm_head_on_gpu", False)),
             actual=bool(runtime_status.get("lm_head_on_gpu", False)),
             expected=True,
+        ),
+        _build_contract_check(
+            name="lm_head_mode",
+            passed=str(runtime_status.get("lm_head_mode", "")) == "gpu_nf4",
+            actual=str(runtime_status.get("lm_head_mode", "")),
+            expected="gpu_nf4",
+        ),
+        _build_contract_check(
+            name="decode_backend",
+            passed=str(runtime_status.get("decode_backend", "")) == "single_kernel_sparse_decode_sm75",
+            actual=str(runtime_status.get("decode_backend", "")),
+            expected="single_kernel_sparse_decode_sm75",
+        ),
+        _build_contract_check(
+            name="attn_backend_decode",
+            passed=str(runtime_status.get("attn_backend_decode", "")) == "compact_sparse_v1",
+            actual=str(runtime_status.get("attn_backend_decode", "")),
+            expected="compact_sparse_v1",
+        ),
+        _build_contract_check(
+            name="compact_sparse_attention_steps",
+            passed=int(runtime_status.get("compact_sparse_attention_steps", 0)) > 0,
+            actual=int(runtime_status.get("compact_sparse_attention_steps", 0)),
+            expected=">0",
         ),
         _build_contract_check(
             name="vram_hot_cache_live_calibrated",

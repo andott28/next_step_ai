@@ -134,9 +134,132 @@ class RuntimeLmHeadMixin:
         if bool(getattr(self, "_explicit_gpu_lm_head", False)):
             return int(256 * (1024 ** 2))
         safety_margin_bytes = int(256 * (1024 ** 2))
-        hot_cache_reserve_bytes = int(self._vram_hot_cache_limit_bytes or 0)
         sparse_reserve_bytes = self._estimate_sparse_gpu_working_set_bytes()
-        return int(max(safety_margin_bytes, self._vram_hot_cache_margin_bytes)) + hot_cache_reserve_bytes + sparse_reserve_bytes
+        # The hot cache is self-limiting via _can_reserve_vram_hot_cache (which
+        # uses the 1-GB margin + driver free-bytes).  Do NOT add hot_cache_limit
+        # to the residual here — that would double-count it and prevent the NF4
+        # LM head from loading on 8 GB GPUs (2 GB NF4 + 5.25 GB cache > 8 GB).
+        return int(max(safety_margin_bytes, self._vram_hot_cache_margin_bytes)) + sparse_reserve_bytes
+
+    @staticmethod
+    def _resolve_lm_head_nf4_quant_rows(out_features: int) -> int:
+        raw_override = os.getenv("STREAMING_GPU_LM_HEAD_QUANT_ROWS", "").strip()
+        if raw_override:
+            try:
+                value = int(raw_override)
+            except ValueError:
+                value = 0
+            if value > 0:
+                return int(min(max(1, value), int(out_features)))
+        return int(min(max(1, 1024), int(out_features)))
+
+    @staticmethod
+    def _resolve_lm_head_nf4_quant_block_size(in_features: int) -> int:
+        raw_override = os.getenv("STREAMING_GPU_LM_HEAD_NF4_BLOCK_SIZE", "").strip()
+        if raw_override:
+            try:
+                value = int(raw_override)
+            except ValueError:
+                value = 0
+            if value > 0 and int(in_features) % int(value) == 0:
+                return int(value)
+        for candidate in (64, 128, 256, 32):
+            if int(in_features) % int(candidate) == 0:
+                return int(candidate)
+        raise RuntimeError(
+            f"Unable to select an NF4 quant block size for in_features={int(in_features)}; "
+            "set STREAMING_GPU_LM_HEAD_NF4_BLOCK_SIZE to a positive divisor."
+        )
+
+    def _quantize_dense_lm_head_nf4_cpu(
+        self,
+        dense_weight_cpu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+        if bnb_functional is None or not hasattr(bnb_functional, "quantize_4bit"):
+            raise RuntimeError("bitsandbytes.quantize_4bit is unavailable")
+        if dense_weight_cpu.ndim != 2:
+            raise RuntimeError(
+                f"Expected a rank-2 dense LM head weight, got shape {tuple(dense_weight_cpu.shape)}"
+            )
+        if dense_weight_cpu.device.type != "cpu":
+            dense_weight_cpu = dense_weight_cpu.to(device=torch.device("cpu"))
+        dense_weight_cpu = dense_weight_cpu.contiguous()
+
+        out_features = int(dense_weight_cpu.shape[0])
+        in_features = int(dense_weight_cpu.shape[1])
+        quant_block_size = self._resolve_lm_head_nf4_quant_block_size(in_features)
+        total_elements = int(out_features) * int(in_features)
+        if total_elements % 2 != 0:
+            raise RuntimeError(
+                f"Dense LM head element count must be even for packed NF4 bytes, got {total_elements}"
+            )
+        if total_elements % int(quant_block_size) != 0:
+            raise RuntimeError(
+                f"Dense LM head element count {total_elements} must be divisible by quant block size {int(quant_block_size)}"
+            )
+
+        packed_cpu = torch.empty(total_elements // 2, dtype=torch.uint8, device=torch.device("cpu"))
+        absmax_cpu = torch.empty(total_elements // int(quant_block_size), dtype=torch.float32, device=torch.device("cpu"))
+        code_cpu: torch.Tensor | None = None
+
+        rows_per_chunk = self._resolve_lm_head_nf4_quant_rows(out_features)
+        packed_offset = 0
+        absmax_offset = 0
+        for row_start in range(0, out_features, rows_per_chunk):
+            row_stop = min(row_start + rows_per_chunk, out_features)
+            chunk = dense_weight_cpu[row_start:row_stop]
+            if chunk.dtype not in {torch.float16, torch.float32, torch.bfloat16}:
+                chunk = chunk.to(dtype=torch.float16)
+            elif chunk.dtype == torch.bfloat16:
+                chunk = chunk.to(dtype=torch.float16)
+            if not chunk.is_contiguous():
+                chunk = chunk.contiguous()
+
+            chunk_packed, chunk_state = bnb_functional.quantize_4bit(
+                chunk,
+                blocksize=int(quant_block_size),
+                compress_statistics=False,
+                quant_type="nf4",
+                quant_storage=torch.uint8,
+            )
+            chunk_packed_flat = chunk_packed.reshape(-1).to(device=torch.device("cpu"), dtype=torch.uint8).contiguous()
+            packed_next = packed_offset + int(chunk_packed_flat.numel())
+            packed_cpu[packed_offset:packed_next].copy_(chunk_packed_flat, non_blocking=False)
+            packed_offset = packed_next
+
+            chunk_absmax = chunk_state.absmax
+            if bool(getattr(chunk_state, "nested", False)):
+                chunk_absmax = bnb_functional.dequantize_blockwise(chunk_state.absmax, chunk_state.state2)
+                chunk_absmax = chunk_absmax + chunk_state.offset
+            chunk_absmax_flat = chunk_absmax.reshape(-1).to(device=torch.device("cpu"), dtype=torch.float32).contiguous()
+            absmax_next = absmax_offset + int(chunk_absmax_flat.numel())
+            absmax_cpu[absmax_offset:absmax_next].copy_(chunk_absmax_flat, non_blocking=False)
+            absmax_offset = absmax_next
+
+            chunk_code = chunk_state.code.reshape(-1).to(device=torch.device("cpu"), dtype=torch.float32).contiguous()
+            if code_cpu is None:
+                code_cpu = chunk_code
+            elif int(code_cpu.numel()) != int(chunk_code.numel()) or not torch.equal(code_cpu, chunk_code):
+                raise RuntimeError("Inconsistent NF4 codebook across dense LM-head quantization chunks")
+
+        if packed_offset != int(packed_cpu.numel()):
+            raise RuntimeError(
+                f"Packed NF4 write underflow: wrote {packed_offset}, expected {int(packed_cpu.numel())}"
+            )
+        if absmax_offset != int(absmax_cpu.numel()):
+            raise RuntimeError(
+                f"Absmax write underflow: wrote {absmax_offset}, expected {int(absmax_cpu.numel())}"
+            )
+        if code_cpu is None:
+            raise RuntimeError("Dense LM-head quantization produced no NF4 codebook")
+        return (
+            packed_cpu,
+            absmax_cpu,
+            code_cpu,
+            int(out_features),
+            int(in_features),
+            int(quant_block_size),
+        )
 
     def _materialize_lm_head_nf4_on_gpu(self) -> bool:
         if getattr(self, "_lm_head_nf4_meta_gpu", None) is not None:
@@ -155,23 +278,40 @@ class RuntimeLmHeadMixin:
         except Exception as exc:
             self._lm_head_gpu_last_failure = f"{type(exc).__name__}: {str(exc)[:200]}"
             return False
-        if not quant_aux:
-            self._lm_head_gpu_last_failure = "lm_head_not_nf4"
-            return False
 
-        quant_state = bnb_functional.QuantState.from_dict(quant_aux, device=torch.device("cpu"))
-        absmax = quant_state.absmax
-        if quant_state.nested:
-            absmax = bnb_functional.dequantize_blockwise(quant_state.absmax, quant_state.state2)
-            absmax = absmax + quant_state.offset
+        packed_cpu: torch.Tensor
+        absmax_cpu: torch.Tensor
+        code_cpu: torch.Tensor
+        out_features: int
+        in_features: int
+        quant_block_size: int
+        quantized_from_dense = False
+        if quant_aux:
+            quant_state = bnb_functional.QuantState.from_dict(quant_aux, device=torch.device("cpu"))
+            absmax = quant_state.absmax
+            if quant_state.nested:
+                absmax = bnb_functional.dequantize_blockwise(quant_state.absmax, quant_state.state2)
+                absmax = absmax + quant_state.offset
+            out_features = int(quant_state.shape[0])
+            in_features = int(quant_state.shape[1])
+            quant_block_size = int(quant_state.blocksize)
+            packed_cpu = raw_weight.reshape(-1).to(dtype=torch.uint8).contiguous()
+            absmax_cpu = absmax.to(dtype=torch.float32).contiguous()
+            code_cpu = quant_state.code.to(dtype=torch.float32).contiguous()
+        else:
+            try:
+                packed_cpu, absmax_cpu, code_cpu, out_features, in_features, quant_block_size = (
+                    self._quantize_dense_lm_head_nf4_cpu(
+                        raw_weight.to(device=torch.device("cpu"))
+                    )
+                )
+                quantized_from_dense = True
+            except Exception as exc:
+                self._lm_head_gpu_last_failure = f"dense_lm_head_nf4_quantization_failed:{type(exc).__name__}:{str(exc)[:160]}"
+                return False
 
-        out_features = int(quant_state.shape[0])
-        in_features = int(quant_state.shape[1])
         block_size = self._resolve_lm_head_block_size(in_features)
         num_blocks = max(1, int(in_features) // int(block_size))
-        packed_cpu = raw_weight.reshape(-1).to(dtype=torch.uint8).contiguous()
-        absmax_cpu = absmax.to(dtype=torch.float32).contiguous()
-        code_cpu = quant_state.code.to(dtype=torch.float32).contiguous()
         required_bytes = (
             int(packed_cpu.numel()) * int(packed_cpu.element_size())
             + int(absmax_cpu.numel()) * int(absmax_cpu.element_size())
@@ -208,11 +348,16 @@ class RuntimeLmHeadMixin:
                 "code": code_gpu,
                 "out_features": int(out_features),
                 "in_features": int(in_features),
-                "quant_block_size": int(quant_state.blocksize),
+                "quant_block_size": int(quant_block_size),
                 "block_size": int(block_size),
                 "active_idx": active_idx,
             }
             self._lm_head_gpu_last_failure = None
+            if quantized_from_dense:
+                print(
+                    "[lm_head] source weight had no NF4 metadata; quantized dense LM head to NF4 on CPU before GPU upload",
+                    flush=True,
+                )
             print(
                 f"[lm_head] resident on GPU as NF4: {self._lm_head_quantized_weight_gb(self._lm_head_nf4_meta_gpu):.2f} GiB",
                 flush=True,
@@ -258,12 +403,17 @@ class RuntimeLmHeadMixin:
             self._lm_head_gpu_last_failure = None
             return
 
+        self._lm_head_gpu_attempted = True
+        if not bool(getattr(self, "_allow_dense_gpu_lm_head", True)):
+            if not str(getattr(self, "_lm_head_gpu_last_failure", "") or "").strip():
+                self._lm_head_gpu_last_failure = "dense_gpu_lm_head_blocked_on_pre_ampere"
+            return
+
         lm_head_weight_cpu = self._ensure_lm_head_weight_cpu()
         if lm_head_weight_cpu is None:
             return
         if self._lm_head_weight_gpu is not None:
             return
-        self._lm_head_gpu_attempted = True
 
         required_bytes = int(lm_head_weight_cpu.numel()) * int(lm_head_weight_cpu.element_size())
         required_residual_bytes = self._gpu_lm_head_reserve_bytes()

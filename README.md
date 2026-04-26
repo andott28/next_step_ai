@@ -34,7 +34,7 @@ next_step_ai/
 └── README.md
 ```
 
-Anything under `legacy/` is not part of the supported runtime surface.
+The duplicate-project `legacy/` and `tests/` trees were removed from this pivot folder; the maintained surface is the runtime and experiment scripts under `llama3_neuroplastic/`.
 
 ## Core Idea
 
@@ -42,13 +42,13 @@ Standard 405B inference does not fit in 8 GB VRAM. This runtime reduces resident
 
 1. Layer streaming: every generated token still traverses all 126 transformer layers, but only the active decoder layer is materialized on GPU.
 2. Learned-basis MLP routing: covered layers route to selected FFN intermediate blocks and execute the original `SiLU(gate) * up -> down` math for those blocks.
-3. Sparse attention and sparse K/V loading: attention artifacts reduce q/o and k/v transfer inside each layer.
+3. Sparse attention and sparse K/V loading: attention artifacts reduce q/o and k/v transfer inside each layer, but current quality probes keep this experimental rather than part of the default coherent path.
 4. NF4 hot-block caching: frequently used packed NF4 MLP blocks stay in VRAM to reduce repeated PCIe transfer.
 5. Decode-time cache adaptation: cold MLP blocks and down-proj columns that are actually used during decode are promoted into the VRAM hot cache when budget remains, so calibration misses do not stay permanent misses.
 
 Sparse execution here means less work inside each layer, not skipping transformer layers. Whole-layer skipping is not part of the maintained generation path because skipped layers would miss residual updates and K/V cache state.
 
-The preferred sparse MLP artifact target is `intermediate_block_scores`; legacy `output_reconstruction` artifacts are approximate and should be treated as compatibility mode only. `exact_intermediate_sparse` requires an intermediate artifact with `score_weight` and `score_bias`; it will fail on legacy output artifacts with `decoder_blocks`.
+The preferred sparse MLP artifact target is `intermediate_block_scores`; legacy `output_reconstruction` artifacts are approximate and should be treated as compatibility mode only. `exact_blockwise_sparse` requires an intermediate artifact with `score_weight` and `score_bias`; it will fail on legacy output artifacts with `decoder_blocks`.
 
 ## Install
 
@@ -85,33 +85,33 @@ The non-streaming legacy fitting path is intentionally unsupported. Use `--use-s
 python -m llama3_neuroplastic.experiments.run_streaming_inference \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
     --local-files-only \
+    --taylor-layers none \
     --sparse-basis-path results/mlp_basis_intermediate_full126.pt \
-    --sparse-mlp-execution auto \
-    --sparse-top-k 51 \
-    --attn-head-importance-path results/attn_head_importance_405b.pt \
-    --attn-active-heads 9 \
-    --attn-min-active-heads 9 \
-    --attn-max-active-heads 9 \
-    --kv-basis-path results/kv_basis_r32.pt \
-    --sparse-kv-prefill-mode sparse \
-    --sparse-attn-prefill-mode sparse \
-    --vram-hot-cache-gb 2.0 \
-    --pre-warm \
-    --calibrate-hot-cache \
-    --hot-cache-calibration-tokens 64 \
+    --sparse-mlp-execution exact_blockwise_sparse \
+    --sparse-top-k 208 \
+    --sparse-basis-top-k 64 \
+    --sparse-mlp-prefill-mode dense \
+    --vram-hot-cache-gb 0 \
     --prompt-format chat \
+    --max-new-tokens 64 \
+    --no-stream-output \
+    --dump-json results/blockwise_sparse_probe.json \
     --prompt "What is the capital of France?"
 ```
 
-Use `--pre-warm` when you want the VRAM hot cache loaded before the first prompt. Add `--calibrate-hot-cache` for throughput probes: it first loads the static hot cache, runs a short live sparse-routing pass from the actual prompt positions, replaces the hot-block map with the blocks that are actually selected by `_route_sparse_mlp(...)`, then rebuilds the VRAM cache. This intentionally makes startup longer so decode traffic is lower.
+This is the fast-start coherence command. It keeps dense prompt prefill, disables the VRAM hot cache, and uses the exact blockwise MLP runtime for decode. Do not add sparse attention or sparse K/V to this command when checking text quality; those are separate throughput approximations. On the RTX 2080 probe system, `--sparse-top-k 208` was the smallest tested MLP setting that completed the QA answer coherently; `104` failed.
 
-The runtime also adapts during decode. If a calibrated MLP block is missing from the VRAM hot cache, the first cold load still completes the token, then the loaded gate/up block or down-proj column is promoted into the hot cache if the budget allows. Sparse attention Q/O hot-cache reads also support partial hits: cached heads are used immediately and only missing heads take the cold path.
+Use `--pre-warm` only when you want the VRAM hot cache loaded before the first prompt. Add `--calibrate-hot-cache` for throughput probes: it first loads the static hot cache, runs a short live sparse-routing pass from the actual prompt positions, replaces the hot-block map with the blocks that are actually selected by `_route_sparse_mlp(...)`, then rebuilds the VRAM cache. This intentionally makes startup longer so decode traffic is lower.
+
+The runtime also adapts during decode when the VRAM hot cache is explicitly enabled. If a calibrated MLP block is missing from the VRAM hot cache, the first cold load still completes the token, then the loaded gate/up block or down-proj column is promoted into the hot cache if the budget allows. Sparse attention Q/O hot-cache reads also support partial hits: cached heads are used immediately and only missing heads take the cold path.
 
 ## 3.3 tok/s Probe
 
+Current RTX 2080 measurements do not reach this target on the coherent full-126-layer path. Dense attention plus blockwise MLP at `top_k=208` produced coherent QA text at about `0.0069 tok/s`; sparse attention reduced traffic but produced corrupted completions in the tested configurations. Treat the command in this section as an experimental throughput probe, not as the default quality path.
+
 The 3.3 tok/s decode path assumes all 126 layers are still visited. The target comes from lowering per-layer traffic, not from reducing layer count. At about 23 MiB/layer, one token transfers about 2.8 GiB across all layers; on a roughly 9.3 GiB/s PCIe path, that is about 0.30 s/token, or 3.3 tok/s.
 
-This path needs the intermediate sparse MLP artifact, sparse attention, sparse K/V prefill, live-route hot-cache calibration, decode-time hot-cache promotion, GPU LM head, and the Triton sparse MLP kernels. Do not use `results/mlp_basis_full126.pt` for this path; that file is a legacy `output_reconstruction` artifact with 512 output blocks and cannot run `exact_intermediate_sparse`.
+This path needs the intermediate sparse MLP artifact, sparse attention, sparse K/V prefill, live-route hot-cache calibration, decode-time hot-cache promotion, GPU LM head, and the Triton sparse MLP kernels. Do not use `results/mlp_basis_full126.pt` for this path; that file is a legacy `output_reconstruction` artifact with 512 output blocks and cannot run `exact_blockwise_sparse`.
 
 Validated intermediate artifact shape:
 
@@ -119,7 +119,7 @@ Validated intermediate artifact shape:
 checkpoint = results/mlp_basis_intermediate_full126.pt
 artifact_target = intermediate_block_scores
 block_domain = intermediate
-recommended_execution = exact_intermediate_sparse
+recommended_execution = exact_blockwise_sparse
 layers = 126
 num_blocks = 1664
 ```
@@ -140,7 +140,7 @@ python -m llama3_neuroplastic.experiments.verify_sparse_mlp_checkpoint \
 Run the throughput probe:
 
 ```powershell
-if (Test-Path .\verification_env\Scripts\Activate.ps1) { . .\verification_env\Scripts\Activate.ps1 }; $env:STREAMING_GPU_LM_HEAD="1"; $env:STREAMING_BACKGROUND_PREFETCH="1"; $env:STREAMING_WINDOWS_BATCH_PRELOAD="1"; $env:STREAMING_SHOW_PROGRESS="1"; $env:STREAMING_VRAM_HOT_CACHE_GB="5.25"; python -m llama3_neuroplastic.experiments.run_streaming_inference --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" --local-files-only --taylor-layers none --sparse-basis-path results/mlp_basis_intermediate_full126.pt --sparse-mlp-execution exact_intermediate_sparse --sparse-top-k 51 --sparse-basis-top-k 64 --sparse-mlp-prefill-mode hot_cache --vram-hot-cache-gb 5.25 --pre-warm --calibrate-hot-cache --hot-cache-calibration-tokens 64 --attn-head-importance-path results/attn_head_importance_405b.pt --attn-active-heads 5 --attn-min-active-heads 5 --attn-max-active-heads 5 --sparse-attn-prefill-mode sparse --kv-basis-path results/kv_basis_r32.pt --sparse-kv-prefill-mode sparse --prompt-format chat --max-new-tokens 64 --no-stream-output --dump-json results/throughput_3_3_probe.json --prompt "What is the capital of France?"
+if (Test-Path .\verification_env\Scripts\Activate.ps1) { . .\verification_env\Scripts\Activate.ps1 }; $env:STREAMING_GPU_LM_HEAD="1"; $env:STREAMING_BACKGROUND_PREFETCH="1"; $env:STREAMING_WINDOWS_BATCH_PRELOAD="1"; $env:STREAMING_SHOW_PROGRESS="1"; $env:STREAMING_VRAM_HOT_CACHE_GB="5.25"; python -m llama3_neuroplastic.experiments.run_streaming_inference --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" --local-files-only --taylor-layers none --sparse-basis-path results/mlp_basis_intermediate_full126.pt --sparse-mlp-execution exact_blockwise_sparse --sparse-top-k 51 --sparse-basis-top-k 64 --sparse-mlp-prefill-mode hot_cache --vram-hot-cache-gb 5.25 --pre-warm --calibrate-hot-cache --hot-cache-calibration-tokens 64 --attn-head-importance-path results/attn_head_importance_405b.pt --attn-active-heads 5 --attn-min-active-heads 5 --attn-max-active-heads 5 --sparse-attn-prefill-mode sparse --kv-basis-path results/kv_basis_r32.pt --sparse-kv-prefill-mode sparse --prompt-format chat --max-new-tokens 64 --no-stream-output --dump-json results/throughput_3_3_probe.json --prompt "What is the capital of France?"
 ```
 
 Pass conditions:
@@ -237,21 +237,15 @@ python -m llama3_neuroplastic.experiments.verify_sparse_mlp_runtime_summary \
     --model-name "unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit" \
     --sparse-basis-path results/mlp_basis_intermediate_full126.pt \
     --sparse-mlp-execution auto \
-    --expect-execution exact_intermediate_sparse
-```
-
-## Run Tests
-
-```bash
-pytest tests/ -v
+    --expect-execution exact_blockwise_sparse
 ```
 
 ## Key Environment Variables
 
 | Variable | Effect |
 | --- | --- |
-| `STREAMING_SPARSE_BASIS_EXECUTION` | `auto`, `output_basis_surrogate`, `routed_output_blocks`, `exact_intermediate_sparse`, or `exact_intermediate_sparse_oracle` |
+| `STREAMING_SPARSE_BASIS_EXECUTION` | `auto`, `exact_blockwise_sparse`, or `exact_intermediate_sparse` (compatibility alias) |
 | `STREAMING_SPARSE_MLP_PREFILL_MODE` | `dense`, `sparse`, or `hot_cache` |
-| `STREAMING_VRAM_HOT_CACHE_GB` | Default VRAM hot-cache budget |
+| `STREAMING_VRAM_HOT_CACHE_GB` | Opt-in VRAM hot-cache budget. Unset means no hot cache unless `--pre-warm` supplies the CLI default. |
 | `STREAMING_RAM_CACHE_MAX_GB` | Host RAM cache cap |
 | `STREAMING_ALLOW_TAYLOR_WITH_SPARSE_ATTN` | Allows Taylor-SSD with sparse attention despite known divergence risk |

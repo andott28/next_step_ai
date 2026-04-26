@@ -137,6 +137,8 @@ class RuntimeSessionMixin:
             self._sparse_block_transfer_cache.clear()
         if hasattr(self, "_downproj_transfer_cache"):
             self._downproj_transfer_cache.clear()
+        if hasattr(self, "_mlp_prefetch_active_blocks"):
+            self._mlp_prefetch_active_blocks.clear()
         if release_cuda and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -147,8 +149,18 @@ class RuntimeSessionMixin:
             self._compact_attn_cache.clear()
         if self._token_archive is not None:
             self._token_archive.reset()
+        if hasattr(self, "_single_kernel_mlp_out_accum"):
+            self._single_kernel_mlp_out_accum = None
+        if hasattr(self, "_single_kernel_mlp_tile_state"):
+            self._single_kernel_mlp_tile_state = None
+        if hasattr(self, "_single_kernel_mlp_tile_done"):
+            self._single_kernel_mlp_tile_done = None
+        if hasattr(self, "_single_kernel_mlp_epoch"):
+            self._single_kernel_mlp_epoch = 0
         if hasattr(self, "_smc_valid"):
             self._smc_valid.fill_(False)
+        if hasattr(self, "_smc_attn_valid"):
+            self._smc_attn_valid.fill_(False)
         for _layer_idx in list(self._session_sparse_route_layers):
             self._sparse_routing.pop(int(_layer_idx), None)
             self._sparse_top_k_by_layer.pop(int(_layer_idx), None)

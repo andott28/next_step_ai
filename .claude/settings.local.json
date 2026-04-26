@@ -12,7 +12,17 @@
       "Bash(xargs ls:*)",
       "Bash(./verification_env/Scripts/python.exe -c ':*)",
       "Bash(.verification_envScriptspython.exe -c ':*)",
-      "Bash(verification_env/Scripts/python.exe -c ':*)"
+      "Bash(verification_env/Scripts/python.exe -c ':*)",
+      "Bash(verification_env/Scripts/python.exe -c ' *)",
+      "Bash(\"/c/Users/andre/Desktop/Overføre/next_step_ai/verification_env/Scripts/python.exe\" -u -m llama3_neuroplastic.experiments.run_streaming_inference --model-name \"unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit\" --local-files-only --sparse-basis-path results/mlp_basis_full126_v2.pt --sparse-top-k 51 --attn-head-importance-path results/attn_head_importance_405b.pt --attn-active-heads 9 --attn-min-active-heads 9 --attn-max-active-heads 9 --vram-hot-cache-gb 1.2 --hot-block-threshold 0.0 --pre-warm --max-new-tokens 4 --prompt \"Q: What is the capital of France? A:\")",
+      "Bash(ls results/)",
+      "Bash(ls *.pt)",
+      "Bash(python3 -)",
+      "Bash(verification_env/Scripts/python.exe -m llama3_neuroplastic.experiments.benchmark --model-name \"unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit\" --sparse-basis-path results/mlp_basis_intermediate_full126.pt --attn-head-importance-path results/attn_head_importance_405b.pt --taylor-layers none --max-new-tokens 5 --warmup-tokens 2 --output-json results/benchmark.json)",
+      "Bash(python -m llama3_neuroplastic.experiments.verify_sparse_mlp_generation_pair --help)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\andre\\.claude\\plans"
     ]
   }
 }

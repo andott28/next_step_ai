@@ -54,6 +54,10 @@ def test_benchmark_contract_report_passes_when_all_targets_met() -> None:
             "runtime_status": {
                 "num_layers": 126,
                 "lm_head_on_gpu": True,
+                "lm_head_mode": "gpu_nf4",
+                "decode_backend": "single_kernel_sparse_decode_sm75",
+                "attn_backend_decode": "compact_sparse_v1",
+                "compact_sparse_attention_steps": 8,
                 "vram_hot_cache_live_calibrated": True,
                 "decode_mlp_cold_blocks_streamed": 0,
                 "decode_down_cold_blocks_streamed": 0,
@@ -83,6 +87,10 @@ def test_benchmark_contract_report_flags_gpu_and_cold_block_failures() -> None:
             "runtime_status": {
                 "num_layers": 126,
                 "lm_head_on_gpu": False,
+                "lm_head_mode": "cpu_dense",
+                "decode_backend": "fused_sparse_decode_v1",
+                "attn_backend_decode": "dense",
+                "compact_sparse_attention_steps": 0,
                 "vram_hot_cache_live_calibrated": False,
                 "decode_mlp_cold_blocks_streamed": 4,
                 "decode_down_cold_blocks_streamed": 9,
@@ -175,6 +183,50 @@ def test_lm_head_forward_uses_nf4_backend(monkeypatch: pytest.MonkeyPatch) -> No
 
     assert tuple(logits.shape) == (1, 1, 5)
     assert logits[0, 0, 4].item() == 4
+
+
+def test_materialize_lm_head_blocks_dense_gpu_when_not_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    runtime = _DummyLmHead()
+    runtime._lm_head_gpu_attempted = False
+    runtime._materialize_lm_head = True
+    runtime._prefer_gpu_lm_head = True
+    runtime._prefer_gpu_quant_lm_head = True
+    runtime._allow_dense_gpu_lm_head = False
+    runtime._explicit_gpu_lm_head = False
+    runtime._lm_head_gpu_last_failure = ""
+    runtime._lm_head_nf4_meta_gpu = None
+    runtime._lm_head_weight_gpu = None
+    runtime.device = torch.device("cuda")
+    runtime.dtype = torch.float16
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (7, 5))
+
+    def _nf4_fail() -> bool:
+        runtime._lm_head_gpu_last_failure = "lm_head_not_nf4"
+        return False
+
+    runtime._materialize_lm_head_nf4_on_gpu = _nf4_fail  # type: ignore[method-assign]
+    runtime._ensure_lm_head_weight_cpu = lambda: torch.empty((2, 2), dtype=torch.float16)  # type: ignore[method-assign]
+
+    runtime._materialize_lm_head_on_gpu()
+
+    assert runtime._lm_head_gpu_attempted is True
+    assert runtime._lm_head_weight_gpu is None
+    assert runtime._lm_head_gpu_last_failure == "lm_head_not_nf4"
+
+
+def test_quantize_dense_lm_head_nf4_cpu_shapes() -> None:
+    runtime = _DummyLmHead()
+    dense = torch.randn((2, 64), dtype=torch.float16)
+
+    packed, absmax, code, out_features, in_features, quant_block_size = runtime._quantize_dense_lm_head_nf4_cpu(dense)
+
+    assert out_features == 2
+    assert in_features == 64
+    assert quant_block_size == 64
+    assert int(packed.numel()) == 64
+    assert int(absmax.numel()) == 2
+    assert int(code.numel()) == 16
 
 
 def test_decode_profiler_records_cpu_only_layers() -> None:

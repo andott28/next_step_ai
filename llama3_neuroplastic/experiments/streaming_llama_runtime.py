@@ -45,6 +45,7 @@ except ImportError:
 try:
     from ..triton_sparse_mlp import (
         triton_fused_sparse_mlp_decode_4bit,
+        triton_sparse_mlp_decode_4bit_single_kernel_sm75,
         triton_sparse_input_linear_4bit,
         triton_sparse_mlp_available,
         triton_sparse_output_linear_4bit,
@@ -53,19 +54,21 @@ except Exception:
     try:
         from triton_sparse_mlp import (
             triton_fused_sparse_mlp_decode_4bit,
+            triton_sparse_mlp_decode_4bit_single_kernel_sm75,
             triton_sparse_input_linear_4bit,
             triton_sparse_mlp_available,
             triton_sparse_output_linear_4bit,
         )
     except Exception:
         triton_fused_sparse_mlp_decode_4bit = None
+        triton_sparse_mlp_decode_4bit_single_kernel_sm75 = None
         triton_sparse_input_linear_4bit = None
         triton_sparse_output_linear_4bit = None
         import warnings as _warnings
         _warnings.warn(
             "[StreamingLlamaRuntime] Triton sparse MLP kernels are unavailable on this platform. "
             "All sparse MLP layers will fall back to the PyTorch path, which is 3-5x slower. "
-            "On Windows, ensure triton-windows is installed and CUDA compute capability >= 8.0 (Ampere+).",
+            "On Windows, ensure triton-windows is installed and CUDA compute capability >= 7.5 (Turing+).",
             RuntimeWarning,
             stacklevel=1,
         )
@@ -255,7 +258,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             raise RuntimeError(
                 "STREAMING_SPARSE_KV_PREFILL_MODE must be one of: dense, sparse"
             )
-        _attn_head_selection_mode_raw = os.getenv("STREAMING_SPARSE_ATTN_HEAD_SELECTION", "topk")
+        _attn_head_selection_mode_raw = os.getenv("STREAMING_SPARSE_ATTN_HEAD_SELECTION", "balanced_gqa")
         self._attn_head_selection_mode = str(_attn_head_selection_mode_raw).strip().lower() or "topk"
         _attn_head_selection_aliases = {
             "topk": "topk",
@@ -287,8 +290,11 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._prefer_gpu_lm_head = _resolve_gpu_lm_head_default()
         _gpu_lm_head_raw = os.getenv("STREAMING_GPU_LM_HEAD", "").strip().lower()
         self._explicit_gpu_lm_head = _gpu_lm_head_raw in {"1", "true", "yes", "on", "force"}
-        if _is_windows_pre_ampere_cuda(self.device) and not self._explicit_gpu_lm_head:
-            self._prefer_gpu_lm_head = False
+        _gpu_lm_head_dense_raw = os.getenv("STREAMING_GPU_LM_HEAD_DENSE", "").strip().lower()
+        self._explicit_dense_gpu_lm_head = _gpu_lm_head_dense_raw in {"1", "true", "yes", "on", "force"}
+        self._allow_dense_gpu_lm_head = True
+        if _is_windows_pre_ampere_cuda(self.device) and not self._explicit_dense_gpu_lm_head:
+            self._allow_dense_gpu_lm_head = False
         self.loader = ShardedSafetensorLoader(self.snapshot_dir, pin_ram_cache=ram_cache_pinned)
         self.loader._ram_cache_enabled = bool(ram_cache)
         self._enable_background_prefetch = bool(ram_cache) and _resolve_background_prefetch_default()
@@ -346,6 +352,21 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             and triton_sparse_mlp_available()
             and torch.cuda.is_available()
             and self.device.type == "cuda"
+        )
+        _disable_single_kernel = os.getenv("SCA_TRITON_DISABLE_SINGLE_KERNEL_MLP", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._single_kernel_decode_enabled = bool(self._triton_fused_sparse_mlp) and not _disable_single_kernel
+        self._single_kernel_mlp_out_accum: torch.Tensor | None = None
+        self._single_kernel_mlp_tile_state: torch.Tensor | None = None
+        self._single_kernel_mlp_tile_done: torch.Tensor | None = None
+        self._single_kernel_mlp_epoch: int = 0
+        self._single_kernel_mlp_block_out: int = 64
+        self._decode_backend_name: str = (
+            "fused_sparse_decode_v1" if bool(self._triton_fused_sparse_mlp) else "dequant_sparse_fallback"
         )
         if self._triton_fused_sparse_mlp and _is_windows_pre_ampere_cuda(self.device):
             print(
@@ -408,6 +429,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._h2d_stage_slots: dict[str, int] = defaultdict(int)
         self._sparse_block_transfer_cache: dict[tuple[str, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
         self._downproj_transfer_cache: dict[tuple[str, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
+        # Phase 4: pre-routed MLP block indices (keyed by layer_idx) for H2D prefetch overlap
+        self._mlp_prefetch_active_blocks: dict[int, torch.Tensor] = {}
         _target_layer_mb_raw = os.getenv("STREAMING_TARGET_LAYER_MB", "").strip()
         try:
             self._target_layer_traffic_mb = float(_target_layer_mb_raw) if _target_layer_mb_raw else 30.0
@@ -659,10 +682,20 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._mlp_static_skip_mask: torch.Tensor | None = None
         self._mlp_static_skip_set: set[int] = set()
         _hidden = int(getattr(self.config, "hidden_size", 16384))
-        self._smc_x_in  = torch.zeros(self.num_layers, _hidden, device=self.device, dtype=self.dtype)
-        self._smc_out   = torch.zeros(self.num_layers, _hidden, device=self.device, dtype=self.dtype)
+        _smc_raw = os.getenv("STREAMING_ENABLE_SMC", "").strip().lower()
+        self._enable_smc = _smc_raw in {"1", "true", "yes", "on"}
+        self._smc_x_in = torch.zeros(self.num_layers, _hidden, device=self.device, dtype=self.dtype)
+        self._smc_out = torch.zeros(self.num_layers, _hidden, device=self.device, dtype=self.dtype)
         self._smc_valid = torch.zeros(self.num_layers, dtype=torch.bool, device=self.device)
         self._smc_threshold = float(os.getenv("STREAMING_SMC_THRESHOLD", "0.04"))
+        # SMC for attention: separate state (attention is more sensitive than MLP)
+        self._smc_attn_x_in = torch.zeros(self.num_layers, _hidden, device=self.device, dtype=self.dtype)
+        self._smc_attn_out = torch.zeros(self.num_layers, _hidden, device=self.device, dtype=self.dtype)
+        self._smc_attn_valid = torch.zeros(self.num_layers, dtype=torch.bool, device=self.device)
+        self._smc_attn_threshold = float(os.getenv("STREAMING_SMC_ATTN_THRESHOLD", "0.03"))
+        # Boundary layers that are never skipped (first 8 and last 8 of 126)
+        _n = int(self.num_layers)
+        self._smc_attn_protected: frozenset[int] = frozenset({*range(min(8, _n)), *range(max(0, _n - 8), _n)})
         self._sparse_routing: dict[int, dict[str, Any]] = {}
         self._sparse_top_k: int = 0
         self._sparse_runtime_top_k: int = 0
@@ -1105,6 +1138,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._attn_loaded_q_rows: torch.Tensor | None = None
         self._attn_loaded_o_cols: torch.Tensor | None = None
         self._attn_qo_state: str = "unknown"
+        self._debug_assert_sparse_attn_qo_zero = (
+            os.getenv("STREAMING_DEBUG_ASSERT_SPARSE_ATTN_QO_ZERO", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self._cpu_scratch: dict[str, torch.Tensor] = {}
 
         self._attn_q_head_staging: torch.Tensor | None = None
@@ -1600,14 +1637,18 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             "triton_sparse_mlp_requested": bool(self._triton_sparse_mlp_requested),
             "triton_sparse_mlp_available": bool(triton_sparse_mlp_available()),
             "triton_sparse_mlp_enabled": bool(self._triton_fused_sparse_mlp),
-            "decode_backend": "fused_sparse_decode_v1" if bool(self._triton_fused_sparse_mlp) else "dequant_sparse_fallback",
+            "decode_backend": str(getattr(self, "_decode_backend_name", "dequant_sparse_fallback")),
             "lm_head_enabled": bool(lm_head_status.get("enabled", False)),
             "lm_head_mode": str(lm_head_status.get("mode", "disabled")),
             "lm_head_on_gpu": bool(lm_head_status.get("on_gpu", False)),
             "lm_head_dtype": lm_head_status.get("dtype"),
             "lm_head_gpu_attempted": bool(lm_head_status.get("gpu_attempted", False)),
             "lm_head_gpu_preferred": bool(lm_head_status.get("gpu_preferred", False)),
-            "lm_head_last_failure": str(lm_head_status.get("last_failure", "") or ""),
+            "lm_head_last_failure": (
+                None
+                if not str(lm_head_status.get("last_failure", "") or "").strip()
+                else str(lm_head_status.get("last_failure"))
+            ),
             "lm_head_weight_gb": float(lm_head_status.get("weight_gb", 0.0) or 0.0),
             "sparse_mlp_layers": int(sparse_summary.get("layers", 0)),
             "sparse_mlp_top_k": int(getattr(self, "_sparse_top_k", 0) or 0),
@@ -1674,10 +1715,18 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             errors.append("sparse-top-k is not active")
         if not bool(status.get("triton_sparse_mlp_enabled", False)):
             errors.append("Triton sparse MLP fast path is disabled")
+        if str(status.get("decode_backend", "")) != "single_kernel_sparse_decode_sm75":
+            errors.append(
+                f"decode backend is {status.get('decode_backend')!r}, expected 'single_kernel_sparse_decode_sm75'"
+            )
         if not bool(status.get("vram_hot_cache_enabled", False)):
             errors.append("VRAM hot cache is disabled")
         if str(status.get("sparse_mlp_prefill_mode", "dense")) != "hot_cache":
             errors.append(f"sparse MLP prefill mode is {status.get('sparse_mlp_prefill_mode')!r}, expected 'hot_cache'")
+        if str(status.get("lm_head_mode", "")) != "gpu_nf4":
+            errors.append(f"lm_head_mode is {status.get('lm_head_mode')!r}, expected 'gpu_nf4'")
+        if not bool(status.get("lm_head_on_gpu", False)):
+            errors.append("LM head is not on GPU")
         if not bool(status.get("sparse_kv_enabled_for_decode", False)):
             errors.append("sparse K/V routing is disabled")
         if str(status.get("sparse_kv_prefill_mode", "dense")) != "sparse":
@@ -1688,6 +1737,12 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             )
         if int(status.get("attn_active_heads_static", 0)) <= 0:
             errors.append("attn-active-heads is not active")
+        if str(status.get("attn_backend_decode", "")) != "compact_sparse_v1":
+            errors.append(
+                f"attn backend is {status.get('attn_backend_decode')!r}, expected 'compact_sparse_v1'"
+            )
+        if int(status.get("compact_sparse_attention_steps", 0)) <= 0:
+            errors.append("compact sparse attention decode steps did not advance")
         return errors
 
     def _schedule_prefetch_layer(self, layer_idx: int) -> None:
@@ -2100,6 +2155,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         *,
         max_tokens: int = 64,
         rebuild_cache: bool = True,
+        generate_decode_tokens: int = 0,
     ) -> dict[str, Any]:
         if not self._vram_hot_cache_enabled:
             print("[hot-cache-calibration] VRAM hot-cache is disabled; skipping.", flush=True)
@@ -2112,8 +2168,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         token_count = min(max(1, int(max_tokens)), int(token_ids.shape[1]))
         calibration_ids = token_ids[:, -token_count:].detach().to(device=torch.device("cpu"), dtype=torch.long).contiguous()
+        n_decode = max(0, int(generate_decode_tokens))
         print(
-            f"[hot-cache-calibration] collecting live MLP routes from {token_count} token(s)",
+            f"[hot-cache-calibration] collecting live MLP routes from {token_count} prompt token(s)"
+            + (f" + {n_decode} decode token(s)" if n_decode > 0 else ""),
             flush=True,
         )
 
@@ -2127,7 +2185,19 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             self._set_traffic_phase("prefill")
             self._sparse_mlp_prefill_mode = "sparse"
             with torch.no_grad():
-                self._forward_prefill(calibration_ids, compute_logits=False)
+                logits_calib = self._forward_prefill(calibration_ids.to(self.device), compute_logits=(n_decode > 0))
+            if n_decode > 0 and logits_calib is not None:
+                self._set_traffic_phase("decode")
+                seq_gpu = calibration_ids.to(self.device)
+                with torch.no_grad():
+                    for _d in range(n_decode):
+                        next_tok = self._sample_next_token(
+                            logits_calib[:, -1, :],
+                            do_sample=False, temperature=1.0, top_k=None, top_p=1.0,
+                        ).view(1, 1).to(device=self.device)
+                        pos = int(seq_gpu.shape[1])
+                        seq_gpu = torch.cat([seq_gpu, next_tok], dim=-1)
+                        logits_calib, _ = self.forward_token(next_tok, position_index=pos)
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)
         finally:
@@ -3947,6 +4017,77 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         active_blocks = scores.topk(k_runtime, dim=-1).indices
         return active_blocks
 
+    def _ensure_single_kernel_mlp_scratch(self, *, hidden_size: int, block_out: int) -> None:
+        if self.device.type != "cuda":
+            raise RuntimeError("Single-kernel sparse MLP scratch requires CUDA")
+        hidden_size = int(hidden_size)
+        block_out = int(block_out)
+        if hidden_size <= 0 or block_out <= 0:
+            raise RuntimeError("Invalid single-kernel scratch dimensions")
+        tiles = (hidden_size + block_out - 1) // block_out
+        needs_alloc = (
+            self._single_kernel_mlp_out_accum is None
+            or int(self._single_kernel_mlp_out_accum.numel()) < hidden_size
+            or self._single_kernel_mlp_tile_state is None
+            or int(self._single_kernel_mlp_tile_state.numel()) < tiles
+            or self._single_kernel_mlp_tile_done is None
+            or int(self._single_kernel_mlp_tile_done.numel()) < tiles
+        )
+        if needs_alloc:
+            self._single_kernel_mlp_out_accum = torch.zeros(
+                hidden_size,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._single_kernel_mlp_tile_state = torch.full(
+                (tiles,),
+                -1,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self._single_kernel_mlp_tile_done = torch.zeros(
+                (tiles,),
+                device=self.device,
+                dtype=torch.int32,
+            )
+        elif int(self._single_kernel_mlp_tile_state.numel()) > tiles:
+            self._single_kernel_mlp_tile_state[tiles:].fill_(-1)
+            self._single_kernel_mlp_tile_done[tiles:].zero_()
+        self._single_kernel_mlp_block_out = int(block_out)
+
+    def _debug_assert_sparse_attn_qo_zero_inactive(
+        self,
+        *,
+        q_skel: torch.Tensor,
+        o_skel: torch.Tensor,
+    ) -> None:
+        if not bool(getattr(self, "_debug_assert_sparse_attn_qo_zero", False)):
+            return
+        loaded_q = getattr(self, "_attn_loaded_q_rows", None)
+        loaded_o = getattr(self, "_attn_loaded_o_cols", None)
+        with torch.no_grad():
+            q_row_energy = q_skel.abs().sum(dim=1)
+            if loaded_q is not None and int(loaded_q.numel()) > 0:
+                loaded_q_u = loaded_q.to(device=q_skel.device, dtype=torch.long).unique(sorted=True)
+                q_row_energy.index_fill_(0, loaded_q_u, 0)
+            bad_q = torch.nonzero(q_row_energy > 0, as_tuple=False).reshape(-1)
+            if int(bad_q.numel()) > 0:
+                raise RuntimeError(
+                    f"Sparse attention q_proj skeleton has non-zero inactive rows "
+                    f"(first offending row={int(bad_q[0].item())})."
+                )
+
+            o_col_energy = o_skel.abs().sum(dim=0)
+            if loaded_o is not None and int(loaded_o.numel()) > 0:
+                loaded_o_u = loaded_o.to(device=o_skel.device, dtype=torch.long).unique(sorted=True)
+                o_col_energy.index_fill_(0, loaded_o_u, 0)
+            bad_o = torch.nonzero(o_col_energy > 0, as_tuple=False).reshape(-1)
+            if int(bad_o.numel()) > 0:
+                raise RuntimeError(
+                    f"Sparse attention o_proj skeleton has non-zero inactive columns "
+                    f"(first offending col={int(bad_o[0].item())})."
+                )
+
     def _ensure_mlp_proj_staging(self) -> bool:
         if self._mlp_proj_staging is not None:
             return True
@@ -4341,6 +4482,54 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         ).reshape(-1)
         return ordered_blocks, active_local, flat_mask.contiguous(), active_neurons.contiguous()
 
+    def _prefetch_mlp_blocks_for_layer(
+        self,
+        layer_idx: int,
+        active_blocks: torch.Tensor,
+    ) -> None:
+        """Start H2D transfer for MLP gate+up blocks on _h2d_stream before attention runs.
+
+        Results are stored in _sparse_block_transfer_cache so the call inside
+        _sparse_mlp_forward_fast gets a cache hit — the transfer already finished.
+        Only has effect if _h2d_stream is available (H2D overlap enabled).
+        """
+        if self._h2d_stream is None:
+            return
+        prefix = f"model.layers.{int(layer_idx)}.mlp."
+        try:
+            gate_param = self._get_sparse_4bit_param(f"{prefix}gate_proj.weight", require_raw=False)
+            up_param = self._get_sparse_4bit_param(f"{prefix}up_proj.weight", require_raw=False)
+        except Exception:
+            return
+        if gate_param is None or up_param is None:
+            return
+        max_valid_blocks = min(
+            int(gate_param.get("blocks_per_col", 0)),
+            int(up_param.get("blocks_per_col", 0)),
+        )
+        if max_valid_blocks <= 0:
+            return
+
+        # Build ordered_blocks (CPU tensor ops — same logic as _build_sparse_active_layout)
+        active_blocks_cpu = active_blocks.detach().to(device=torch.device("cpu"), dtype=torch.long).reshape(-1)
+        ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, active_blocks_cpu)
+        ordered_blocks = ordered_blocks[(ordered_blocks >= 0) & (ordered_blocks < int(max_valid_blocks))]
+        ordered_blocks = ordered_blocks.unique(sorted=False).to(dtype=torch.long, device=torch.device("cpu")).contiguous()
+        ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, ordered_blocks).contiguous()
+        if int(ordered_blocks.numel()) == 0:
+            return
+
+        try:
+            self._prepare_sparse_blocks_for_param_pair(
+                gate_param,
+                up_param,
+                ordered_blocks=ordered_blocks,
+                layer_idx=int(layer_idx),
+                tag_prefix="mlp_sparse_gate_up",
+            )
+        except Exception:
+            pass  # Non-fatal: actual call in _sparse_mlp_forward_fast will re-try
+
     def _sparse_mlp_forward_fast(
         self,
         layer_idx: int,
@@ -4586,6 +4775,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         triton_out = self._sparse_mlp_forward_fast_triton(
             hidden=hidden,
             flat_hidden=flat_hidden,
+            ordered_blocks=ordered_blocks,
             active_local=active_local,
             flat_mask=flat_mask,
             active_neurons=active_neurons,
@@ -4722,6 +4912,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         *,
         hidden: torch.Tensor,
         flat_hidden: torch.Tensor,
+        ordered_blocks: torch.Tensor,
         active_local: torch.Tensor,
         flat_mask: torch.Tensor,
         active_neurons: torch.Tensor,
@@ -4738,6 +4929,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         down_packed_gpu: torch.Tensor | None,
         down_absmax_gpu: torch.Tensor | None,
     ) -> torch.Tensor | None:
+        self._decode_backend_name = "dequant_sparse_fallback"
         if not self._triton_fused_sparse_mlp:
             return None
         if triton_fused_sparse_mlp_decode_4bit is None:
@@ -4745,8 +4937,87 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         if down_packed_gpu is None or down_absmax_gpu is None:
             return None
 
+        block_size = int(self._sparse_block_size)
+        hidden_size = int(flat_hidden.shape[-1])
+        top_k = int(ordered_blocks.numel())
+        rows = int(flat_hidden.shape[0])
+        gate_code_gpu = gate_param.get("code_gpu")
+        if gate_code_gpu is None:
+            gate_code_gpu = gate_param["code"].to(device=self.device, dtype=torch.float32)
+        up_code_gpu = up_param.get("code_gpu")
+        if up_code_gpu is None:
+            up_code_gpu = up_param["code"].to(device=self.device, dtype=torch.float32)
+        down_code_gpu = down_param.get("code_gpu")
+        if down_code_gpu is None:
+            down_code_gpu = down_param["code"].to(device=self.device, dtype=torch.float32)
+
+        can_use_single_kernel = bool(
+            self._single_kernel_decode_enabled
+            and triton_sparse_mlp_decode_4bit_single_kernel_sm75 is not None
+            and self.device.type == "cuda"
+            and torch.cuda.get_device_capability(self.device) == (7, 5)
+            and rows == 1
+            and int(block_size) == 32
+            and top_k > 0
+            and int(active_local.numel()) > 0
+            and bool((active_local >= 0).all().item())
+        )
+        if can_use_single_kernel:
+            try:
+                block_out = int(self._single_kernel_mlp_block_out or 64)
+                if block_out not in {32, 64}:
+                    block_out = 64
+                self._ensure_single_kernel_mlp_scratch(hidden_size=hidden_size, block_out=block_out)
+                if self._single_kernel_mlp_out_accum is None or self._single_kernel_mlp_tile_state is None:
+                    raise RuntimeError("single-kernel sparse MLP scratch allocation failed")
+                self._single_kernel_mlp_epoch = int(self._single_kernel_mlp_epoch) + 1
+                if self._single_kernel_mlp_epoch >= 700_000_000:
+                    self._single_kernel_mlp_epoch = 1
+                    self._single_kernel_mlp_tile_state.fill_(-1)
+                    self._single_kernel_mlp_tile_done.zero_()
+                self._wait_for_h2d_stream()
+                out_buf = torch.empty((1, hidden_size), device=self.device, dtype=torch.float16)
+                active_blocks_gpu = ordered_blocks.to(device=self.device, dtype=torch.int32).contiguous()
+                down_single = triton_sparse_mlp_decode_4bit_single_kernel_sm75(
+                    flat_hidden,
+                    active_blocks_gpu,
+                    gate_packed_gpu,
+                    gate_absmax_gpu,
+                    gate_code_gpu,
+                    up_packed_gpu,
+                    up_absmax_gpu,
+                    up_code_gpu,
+                    down_packed_gpu,
+                    down_absmax_gpu,
+                    down_code_gpu,
+                    out_buf,
+                    self._single_kernel_mlp_out_accum,
+                    self._single_kernel_mlp_tile_state,
+                    self._single_kernel_mlp_tile_done,
+                    int(self._single_kernel_mlp_epoch),
+                    hidden_size,
+                    int(block_size),
+                    int(gate_param["quant_block_size"]),
+                    int(top_k),
+                )
+                if down_bias is not None:
+                    down_bias_gpu = down_bias.to(device=self.device, dtype=down_single.dtype)
+                    down_single = down_single + down_bias_gpu.view(1, -1)
+                self._decode_backend_name = "single_kernel_sparse_decode_sm75"
+                return down_single.view_as(hidden).to(dtype=hidden.dtype)
+            except Exception as exc:
+                if not hasattr(self, "_single_kernel_fail_count"):
+                    self._single_kernel_fail_count = 0
+                self._single_kernel_fail_count += 1
+                print(
+                    f"[sparse] single-kernel Triton decode failed (attempt {self._single_kernel_fail_count}): {exc}",
+                    flush=True,
+                )
+                if self._single_kernel_fail_count >= 3:
+                    print("[sparse] disabling single-kernel path after 3 failures", flush=True)
+                    self._single_kernel_decode_enabled = False
+
         try:
-            block_size = int(self._sparse_block_size)
             active_dim = int(flat_mask.shape[1])
 
             gate_bias_gpu = None
@@ -4758,15 +5029,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             down_bias_gpu = None
             if down_bias is not None:
                 down_bias_gpu = down_bias.to(device=self.device, dtype=flat_hidden.dtype)
-            gate_code_gpu = gate_param.get("code_gpu")
-            if gate_code_gpu is None:
-                gate_code_gpu = gate_param["code"].to(device=self.device, dtype=torch.float32)
-            up_code_gpu = up_param.get("code_gpu")
-            if up_code_gpu is None:
-                up_code_gpu = up_param["code"].to(device=self.device, dtype=torch.float32)
-            down_code_gpu = down_param.get("code_gpu")
-            if down_code_gpu is None:
-                down_code_gpu = down_param["code"].to(device=self.device, dtype=torch.float32)
 
             self._wait_for_h2d_stream()
             down = triton_fused_sparse_mlp_decode_4bit(
@@ -4794,10 +5056,12 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 down_bias=down_bias_gpu,
                 block_size=block_size,
             )
+            self._decode_backend_name = "fused_sparse_decode_v1"
             return down.view_as(hidden).to(dtype=hidden.dtype)
         except Exception as exc:
             print(f"[sparse] Triton fused 4-bit path failed; falling back to dequant path: {exc}", flush=True)
             self._triton_fused_sparse_mlp = False
+            self._decode_backend_name = "dequant_sparse_fallback"
             return None
     def _dense_mlp_forward_streaming_fast_details(
         self,
@@ -5168,7 +5432,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         _lidx = int(layer_idx)
         if (
-            str(self._traffic_current_phase or "idle") == "decode"
+            bool(getattr(self, "_enable_smc", False))
+            and str(self._traffic_current_phase or "idle") == "decode"
             and bool(self._smc_valid[_lidx].item())
             and _lidx not in self._mlp_static_skip_set
             and mlp_input.ndim >= 1
@@ -5211,6 +5476,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     f"Layer {int(layer_idx)} does not provide intermediate FFN routing data required for "
                     f"{_EXACT_BLOCKWISE_SPARSE} execution."
                 )
+            # Always route from mlp_input (post-attention) for correctness.
+            # Pre-routed blocks (from hidden_norm pre-attention) are in
+            # _sparse_block_transfer_cache as H2D cache hits when routing matches.
+            self._mlp_prefetch_active_blocks.pop(int(layer_idx), None)
             active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
             if active_blocks is None:
                 raise RuntimeError(f"Sparse basis routing disappeared for layer {int(layer_idx)}")
@@ -5220,7 +5489,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             _mlp_out = self._dense_guard_mlp_forward_exact_chunked_4bit(layer_idx, layer.mlp, mlp_input)
 
 
-        if str(self._traffic_current_phase or "idle") == "decode":
+        if bool(getattr(self, "_enable_smc", False)) and str(self._traffic_current_phase or "idle") == "decode":
             self._smc_x_in[_lidx].copy_(mlp_input.view(-1), non_blocking=True)
             self._smc_out[_lidx].copy_(_mlp_out.view(-1), non_blocking=True)
             self._smc_valid[_lidx] = True
@@ -5939,14 +6208,16 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         meta_q = self._get_sparse_4bit_attn_meta(q_name, head_dim=head_dim)
         meta_o = self._get_sparse_4bit_attn_meta(o_name, head_dim=head_dim)
 
-        active_cpu = active_heads.to(device=torch.device("cpu"), dtype=torch.long)
+        active_cpu = active_heads.to(device=torch.device("cpu"), dtype=torch.long).unique(sorted=True)
         [int(v) for v in active_cpu.tolist()]
         K = int(active_cpu.shape[0])
 
 
         q_skel = self._layer_skeleton.self_attn.q_proj.weight
         o_skel = self._layer_skeleton.self_attn.o_proj.weight
-        self._clear_sparse_attn_qo_buffers(q_skel=q_skel, o_skel=o_skel)
+        # Always do a full zero-fill on entry so no stale rows from a previous
+        # token's hot-head cache short-circuit can corrupt the current token.
+        self._clear_sparse_attn_qo_buffers(q_skel=q_skel, o_skel=o_skel, force_full=True)
         loaded_q_rows: list[torch.Tensor] = []
         loaded_o_cols: list[torch.Tensor] = []
 
@@ -6008,6 +6279,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
                 self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
                 self._attn_qo_state = "sparse"
+                self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
                 return
             active_cpu = active_cpu[lookup < 0].contiguous()
             active_heads = active_cpu.to(device=active_heads.device, dtype=torch.long)
@@ -6016,6 +6288,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
                 self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
                 self._attn_qo_state = "sparse"
+                self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
                 return
 
 
@@ -6142,6 +6415,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
         self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
         self._attn_qo_state = "sparse"
+        self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
 
     def _bootstrap_compact_attn_cache(self, layer_idx: int) -> dict[str, torch.Tensor | None]:
         cache = getattr(self, "_compact_attn_cache", None)
@@ -6215,6 +6489,11 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         )
         if int(active_heads_gpu.numel()) <= 0:
             return torch.zeros_like(hidden_norm)
+        if int(active_heads_gpu[-1].item()) >= int(num_heads):
+            raise RuntimeError(
+                f"Layer {int(layer_idx)} sparse-attention head index {int(active_heads_gpu[-1].item())} "
+                f"is out of range for num_heads={int(num_heads)}."
+            )
 
         self._wait_for_h2d_stream()
         flat_hidden = hidden_norm.view(-1, hidden_norm.shape[-1]).to(device=self.device, dtype=self.dtype).contiguous()
@@ -6222,6 +6501,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             active_heads_gpu.unsqueeze(-1) * int(head_dim)
             + torch.arange(int(head_dim), device=self.device, dtype=torch.long)
         ).reshape(-1)
+        if int(head_offsets.numel()) != int(active_heads_gpu.numel()) * int(head_dim):
+            raise RuntimeError("Sparse-attention head offsets are inconsistent with active head count")
         q_weight = layer.self_attn.q_proj.weight.index_select(0, head_offsets)
         q_bias_full = getattr(layer.self_attn.q_proj, "bias", None)
         q_bias = None
@@ -6251,6 +6532,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         queries_per_group = max(1, int(num_heads) // max(1, int(num_kv_heads)))
         kv_group_idx = torch.div(active_heads_gpu, queries_per_group, rounding_mode="floor").clamp_(0, max(0, int(num_kv_heads) - 1))
         attn_out = torch.empty_like(q)
+        if int(kv_group_idx.numel()) != int(active_heads_gpu.numel()):
+            raise RuntimeError("Sparse-attention KV group mapping is inconsistent with active heads")
         for group_idx in kv_group_idx.unique(sorted=True).tolist():
             group_mask = kv_group_idx == int(group_idx)
             q_group = q[:, group_mask, :, :]
@@ -6266,6 +6549,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         compact_hidden = attn_out.transpose(1, 2).reshape(int(hidden_norm.shape[0]), int(hidden_norm.shape[1]), -1)
         o_weight = layer.self_attn.o_proj.weight.index_select(1, head_offsets)
+        if int(o_weight.shape[1]) != int(head_offsets.numel()):
+            raise RuntimeError("Sparse-attention o_proj gather shape does not match active-head ordering")
         o_bias = getattr(layer.self_attn.o_proj, "bias", None)
         if o_bias is not None:
             o_bias = o_bias.to(device=self.device, dtype=compact_hidden.dtype)
@@ -6745,65 +7030,110 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             if _active_kv_blocks is not None:
                 self._populate_sparse_kv_skeleton(layer_idx, _active_kv_blocks, layer)
 
-            if layer_idx in self.taylor_layer_set and use_attention_cache:
-                if self._debug_steps:
-                    print(f"[debug] layer {layer_idx}: build_taylor", flush=True)
-                taylor_attn = self._shared_taylor_attn
-                taylor_attn.layer_idx = layer_idx
-                if self._debug_steps:
-                    print(f"[debug] layer {layer_idx}: attn_forward_taylor", flush=True)
-                attn_out, _attn_weights, present = taylor_attn(
-                    hidden_states=hidden_norm,
-                    position_ids=position_ids,
-                    position_embeddings=rope,
-                    past_key_value=self._taylor_caches[layer_idx],
-                    use_cache=True,
-                )
-                self._taylor_caches[layer_idx] = present
-            elif (
-                layer_idx in self._retrieval_layers
-                and self._token_archive is not None
-                and use_attention_cache
+            # Phase 4: pre-transfer cold MLP blocks to GPU while attention runs.
+            # Route from hidden_norm (pre-attention) as a proxy to predict which blocks
+            # will be needed; blocks go into _sparse_block_transfer_cache as H2D cache
+            # hits.  Actual routing in _mlp_forward_dispatch always uses mlp_input
+            # (post-attention) for correctness — the dict is discarded there.
+            if (
+                layer_idx in self._sparse_routing
+                and str(self._traffic_current_phase or "idle") == "decode"
+                and self._h2d_stream is not None
             ):
-                if self._debug_steps:
-                    print(f"[debug] layer {layer_idx}: attn_forward_retrieval", flush=True)
-                attn_out = self._forward_retrieval_attn(
-                    layer_idx=layer_idx,
-                    layer=layer,
-                    hidden_norm=hidden_norm,
-                    rope=rope,
-                    position_index=int(position_ids.view(-1)[0].item()),
-                    active_heads=_active_attn_heads,
+                _prefetch_blocks = self._route_sparse_mlp(hidden_norm, layer_idx)
+                if _prefetch_blocks is not None:
+                    self._mlp_prefetch_active_blocks[layer_idx] = _prefetch_blocks
+                    self._prefetch_mlp_blocks_for_layer(layer_idx, _prefetch_blocks)
+
+            # Phase 5.2: SMC for attention — skip dense attention if hidden state unchanged
+            _lidx = int(layer_idx)
+            _is_dense_attn_path = (
+                not (layer_idx in self.taylor_layer_set and use_attention_cache)
+                and not (layer_idx in self._retrieval_layers and self._token_archive is not None and use_attention_cache)
+                and not self._should_use_compact_sparse_attention(
+                    layer_idx=_lidx, active_heads=_active_attn_heads,
+                    use_attention_cache=bool(use_attention_cache), use_shared_attn=bool(_use_shared_attn),
                 )
-            elif self._should_use_compact_sparse_attention(
-                layer_idx=int(layer_idx),
-                active_heads=_active_attn_heads,
-                use_attention_cache=bool(use_attention_cache),
-                use_shared_attn=bool(_use_shared_attn),
+            )
+            _smc_attn_used = False
+            if (
+                bool(getattr(self, "_enable_smc", False))
+                and str(self._traffic_current_phase or "idle") == "decode"
+                and _lidx not in self._smc_attn_protected
+                and bool(self._smc_attn_valid[_lidx].item())
+                and _is_dense_attn_path
             ):
-                if self._debug_steps:
-                    print(f"[debug] layer {layer_idx}: attn_forward_compact_sparse", flush=True)
-                attn_out = self._forward_compact_sparse_attn(
-                    layer_idx=int(layer_idx),
-                    layer=layer,
-                    hidden_norm=hidden_norm,
-                    rope=rope,
-                    active_heads=_active_attn_heads,
-                    use_attention_cache=bool(use_attention_cache),
-                )
-            else:
-                if self._debug_steps:
-                    print(f"[debug] layer {layer_idx}: attn_forward_dense", flush=True)
+                _x_flat = hidden_norm.view(-1)
+                _ref = self._smc_attn_x_in[_lidx]
+                _delta = (_x_flat - _ref).norm()
+                _ref_norm = _ref.norm().clamp(min=1e-6)
+                if (_delta / _ref_norm).item() < self._smc_attn_threshold:
+                    attn_out = self._smc_attn_out[_lidx].view_as(hidden_norm)
+                    _smc_attn_used = True
 
+            if not _smc_attn_used:
+                if layer_idx in self.taylor_layer_set and use_attention_cache:
+                    if self._debug_steps:
+                        print(f"[debug] layer {layer_idx}: build_taylor", flush=True)
+                    taylor_attn = self._shared_taylor_attn
+                    taylor_attn.layer_idx = layer_idx
+                    if self._debug_steps:
+                        print(f"[debug] layer {layer_idx}: attn_forward_taylor", flush=True)
+                    attn_out, _attn_weights, present = taylor_attn(
+                        hidden_states=hidden_norm,
+                        position_ids=position_ids,
+                        position_embeddings=rope,
+                        past_key_value=self._taylor_caches[layer_idx],
+                        use_cache=True,
+                    )
+                    self._taylor_caches[layer_idx] = present
+                elif (
+                    layer_idx in self._retrieval_layers
+                    and self._token_archive is not None
+                    and use_attention_cache
+                ):
+                    if self._debug_steps:
+                        print(f"[debug] layer {layer_idx}: attn_forward_retrieval", flush=True)
+                    attn_out = self._forward_retrieval_attn(
+                        layer_idx=layer_idx,
+                        layer=layer,
+                        hidden_norm=hidden_norm,
+                        rope=rope,
+                        position_index=int(position_ids.view(-1)[0].item()),
+                        active_heads=_active_attn_heads,
+                    )
+                elif not _is_dense_attn_path:
+                    if self._debug_steps:
+                        print(f"[debug] layer {layer_idx}: attn_forward_compact_sparse", flush=True)
+                    attn_out = self._forward_compact_sparse_attn(
+                        layer_idx=_lidx,
+                        layer=layer,
+                        hidden_norm=hidden_norm,
+                        rope=rope,
+                        active_heads=_active_attn_heads,
+                        use_attention_cache=bool(use_attention_cache),
+                    )
+                else:
+                    if self._debug_steps:
+                        print(f"[debug] layer {layer_idx}: attn_forward_dense", flush=True)
+                    attn_out, _attn_weights = layer.self_attn(
+                        hidden_states=hidden_norm,
+                        position_embeddings=rope,
+                        attention_mask=None,
+                        past_key_values=self._dense_cache if use_attention_cache else None,
+                        cache_position=position_ids.view(-1),
+                    )
+                # Update SMC attn state for non-protected dense layers
+                if (
+                    bool(getattr(self, "_enable_smc", False))
+                    and str(self._traffic_current_phase or "idle") == "decode"
+                    and _is_dense_attn_path
+                    and _lidx not in self._smc_attn_protected
+                ):
+                    self._smc_attn_x_in[_lidx].copy_(hidden_norm.view(-1), non_blocking=True)
+                    self._smc_attn_out[_lidx].copy_(attn_out.view(-1), non_blocking=True)
+                    self._smc_attn_valid[_lidx] = True
 
-
-                attn_out, _attn_weights = layer.self_attn(
-                    hidden_states=hidden_norm,
-                    position_embeddings=rope,
-                    attention_mask=None,
-                    past_key_values=self._dense_cache if use_attention_cache else None,
-                    cache_position=position_ids.view(-1),
-                )
             if ev_attn_end is not None:
                 ev_attn_end.record()
 
@@ -7070,8 +7400,11 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             group_to_heads[h // queries_per_group].append(h)
 
 
-        step = archive.step
-        archive.step += 1
+        # Derive a unique dedup stamp from (position, layer) so it is always
+        # monotonically increasing and aligned with the actual sequence position.
+        # Multiplier 200 > max number of retrieval layers (126), guaranteeing
+        # per-(position, layer) uniqueness without a mutable global counter.
+        step = position_index * 200 + layer_idx
 
         out_by_head: dict[int, torch.Tensor] = {}
 
@@ -7176,7 +7509,12 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     and prompt_len > 0
                     and not bool(getattr(self, "_vram_hot_cache_live_calibrated", False))
                 ):
-                    self.calibrate_vram_hot_cache(prompt_ids_cpu, max_tokens=16, rebuild_cache=True)
+                    self.calibrate_vram_hot_cache(
+                        prompt_ids_cpu,
+                        max_tokens=16,
+                        rebuild_cache=True,
+                        generate_decode_tokens=50,
+                    )
                 self._set_traffic_phase("prefill")
                 if prompt_len > 1:
                     print(f"[prompt] batched prefill: {prompt_len} tokens × 1 layer pass", flush=True)

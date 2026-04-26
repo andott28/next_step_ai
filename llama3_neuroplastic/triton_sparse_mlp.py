@@ -64,6 +64,11 @@ def _is_pre_ampere(device: torch.device) -> bool:
     return major != 0 and major < 8
 
 
+def _is_sm75(device: torch.device) -> bool:
+    major, minor = _cuda_capability(device)
+    return major == 7 and minor == 5
+
+
 def _preferred_compute_dtype(tensor: torch.Tensor) -> torch.dtype:
     dtype = tensor.dtype
     if tensor.device.type == "cuda" and _is_pre_ampere(tensor.device) and dtype == torch.bfloat16:
@@ -237,11 +242,25 @@ if _TRITON_AVAILABLE:
         triton.Config({"BLOCK_OUT": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_OUT": 128}, num_warps=4, num_stages=1),
     ]
+    # SM75 (Turing) configs: no BLOCK_OUT=128 (register spill), more warp options for occupancy
+    _INPUT_4BIT_TILE_CONFIGS_SM75 = [
+        triton.Config({"BLOCK_OUT": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_OUT": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_OUT": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_OUT": 64}, num_warps=8, num_stages=1),
+    ]
     _OUTPUT_4BIT_TILE_CONFIGS = [
         triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 32}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_OUT": 128, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+    ]
+    # SM75: num_stages=1 only — no async copy benefit, double-buffering wastes registers
+    _OUTPUT_4BIT_TILE_CONFIGS_SM75 = [
+        triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 64}, num_warps=4, num_stages=1),
     ]
 
     @triton.autotune(configs=_INPUT_TILE_CONFIGS, key=["out_features", "block_size", "top_k"])
@@ -611,6 +630,300 @@ if _TRITON_AVAILABLE:
         tl.store(out_ptrs, acc, mask=valid_out)
 
 
+    # SM75 (Turing) variant: num_stages=1 in inner loop — no async copy, saves register budget
+    @triton.autotune(configs=_OUTPUT_4BIT_TILE_CONFIGS_SM75, key=["input_dim", "block_size", "quant_block_size"])
+    @triton.jit
+    def _sparse_output_linear_4bit_kernel_sm75(
+        x_ptr,
+        active_idx_ptr,
+        packed_weight_ptr,
+        absmax_ptr,
+        code_ptr,
+        bias_ptr,
+        out_ptr,
+        rows,
+        input_dim,
+        top_k,
+        block_size,
+        quant_block_size,
+        stride_x_row,
+        stride_idx_row,
+        stride_idx_col,
+        stride_out_row,
+        BLOCK_OUT: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ):
+        pid_pair = tl.program_id(0)
+        pid_tile = tl.program_id(1)
+
+        row = pid_pair // top_k
+        if row >= rows:
+            return
+
+        slot = pid_pair % top_k
+        block_idx = tl.load(active_idx_ptr + row * stride_idx_row + slot * stride_idx_col)
+        if block_idx < 0:
+            return
+
+        offs_out = pid_tile * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+        output_idx = block_idx * block_size + offs_out
+        valid_out = offs_out < block_size
+
+        if HAS_BIAS:
+            acc = tl.load(bias_ptr + output_idx, mask=valid_out, other=0.0).to(tl.float32)
+        else:
+            acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+
+        out_idx = output_idx[:, None]
+        # num_stages=1: Turing has no async copy; double-buffering (stages=2) wastes registers
+        for k_start in tl.range(0, input_dim, BLOCK_K, num_stages=1):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            valid_k = offs_k < input_dim
+
+            x_ptrs = x_ptr + row * stride_x_row + offs_k
+            x = tl.load(x_ptrs, mask=valid_k, other=0.0).to(tl.float32)
+
+            elem_idx = out_idx * input_dim + offs_k[None, :]
+            pair_idx = elem_idx >> 1
+            valid = valid_out[:, None] & valid_k[None, :]
+
+            packed = tl.load(packed_weight_ptr + pair_idx, mask=valid, other=0)
+            low_nibble = packed & 0x0F
+            high_nibble = packed >> 4
+            nibble_idx = tl.where((elem_idx & 1) == 0, high_nibble, low_nibble).to(tl.int32)
+            quant = tl.load(code_ptr + nibble_idx, mask=valid, other=0.0)
+
+            abs_idx = elem_idx // quant_block_size
+            scale = tl.load(absmax_ptr + abs_idx, mask=valid, other=0.0)
+            w = quant.to(tl.float32) * scale.to(tl.float32)
+            acc += tl.sum(w * x[None, :], axis=1)
+
+        out_ptrs = out_ptr + row * stride_out_row + output_idx
+        tl.store(out_ptrs, acc, mask=valid_out)
+
+
+    # SM75 variant of tiled input kernel with SM75-optimized autotune configs
+    @triton.autotune(configs=_INPUT_4BIT_TILE_CONFIGS_SM75, key=["out_features", "block_size", "top_k"])
+    @triton.jit
+    def _sparse_input_linear_4bit_tiled_kernel_sm75(
+        x_ptr,
+        active_idx_ptr,
+        packed_weight_ptr,
+        absmax_ptr,
+        code_ptr,
+        bias_ptr,
+        out_ptr,
+        rows,
+        out_features,
+        in_features,
+        top_k,
+        block_size,
+        quant_block_size,
+        stride_x_row,
+        stride_idx_row,
+        stride_idx_col,
+        stride_out_row,
+        TOPK_MAX: tl.constexpr,
+        BLOCK_IN: tl.constexpr,
+        BLOCK_OUT: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        if row >= rows:
+            return
+
+        offs_out = pid_n * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
+        offs_in = tl.arange(0, BLOCK_IN)
+        out_mask = offs_out < out_features
+
+        if HAS_BIAS:
+            acc = tl.load(bias_ptr + offs_out, mask=out_mask, other=0.0).to(tl.float32)
+        else:
+            acc = tl.zeros((BLOCK_OUT,), dtype=tl.float32)
+
+        out_idx = offs_out[:, None]
+        for slot in range(TOPK_MAX):
+            block_idx = tl.load(
+                active_idx_ptr + row * stride_idx_row + slot * stride_idx_col,
+                mask=slot < top_k,
+                other=-1,
+            )
+            if block_idx >= 0:
+                block_base = block_idx * block_size
+                in_idx = block_base + offs_in
+                in_valid = offs_in < block_size
+
+                x_ptrs = x_ptr + row * stride_x_row + in_idx
+                x = tl.load(x_ptrs, mask=in_valid, other=0.0).to(tl.float32)
+
+                elem_idx = out_idx * in_features + in_idx[None, :]
+                pair_idx = elem_idx >> 1
+                valid = out_mask[:, None] & in_valid[None, :]
+
+                packed = tl.load(packed_weight_ptr + pair_idx, mask=valid, other=0)
+                low_nibble = packed & 0x0F
+                high_nibble = packed >> 4
+                nibble_idx = tl.where((elem_idx & 1) == 0, high_nibble, low_nibble).to(tl.int32)
+                quant = tl.load(code_ptr + nibble_idx, mask=valid, other=0.0)
+
+                abs_idx = elem_idx // quant_block_size
+                scale = tl.load(absmax_ptr + abs_idx, mask=valid, other=0.0)
+                w = quant.to(tl.float32) * scale.to(tl.float32)
+                acc += tl.sum(w * x[None, :], axis=1)
+
+        out_ptrs = out_ptr + row * stride_out_row + offs_out
+        tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _sparse_mlp_decode_4bit_single_kernel_sm75(
+        x_ptr,
+        active_blocks_ptr,
+        gate_packed_ptr,
+        gate_absmax_ptr,
+        gate_code_ptr,
+        up_packed_ptr,
+        up_absmax_ptr,
+        up_code_ptr,
+        down_packed_ptr,
+        down_absmax_ptr,
+        down_code_ptr,
+        out_ptr,
+        out_accum_ptr,
+        tile_state_ptr,
+        tile_done_ptr,
+        epoch,
+        hidden_size,
+        block_size,
+        quant_block_size,
+        top_k,
+        bytes_per_row_gate,
+        absmax_per_row_gate,
+        bytes_per_cblk_down,
+        BLOCK_IN: tl.constexpr,
+        BLOCK_OUT: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= top_k:
+            return
+
+        # Keep the program contract explicit: each program handles one active block slot.
+        _ = tl.load(active_blocks_ptr + pid, mask=pid < top_k, other=0)
+
+        offs_block = tl.arange(0, 32)
+        valid_block = offs_block < block_size
+        gate_acc = tl.zeros((32,), dtype=tl.float32)
+        up_acc = tl.zeros((32,), dtype=tl.float32)
+
+        for k_start in tl.range(0, hidden_size, BLOCK_IN, num_stages=1):
+            offs_k = k_start + tl.arange(0, BLOCK_IN)
+            valid_k = offs_k < hidden_size
+            x = tl.load(x_ptr + offs_k, mask=valid_k, other=0.0).to(tl.float32)
+
+            row_idx = offs_block[:, None]
+            col_idx = offs_k[None, :]
+            valid = valid_block[:, None] & valid_k[None, :]
+
+            gate_pair_idx = (
+                pid * block_size * bytes_per_row_gate
+                + row_idx * bytes_per_row_gate
+                + (col_idx >> 1)
+            )
+            gate_packed = tl.load(gate_packed_ptr + gate_pair_idx, mask=valid, other=0)
+            gate_low = gate_packed & 0x0F
+            gate_high = gate_packed >> 4
+            gate_nibble = tl.where((col_idx & 1) == 0, gate_high, gate_low).to(tl.int32)
+            gate_quant = tl.load(gate_code_ptr + gate_nibble, mask=valid, other=0.0)
+            gate_abs_idx = (
+                pid * block_size * absmax_per_row_gate
+                + row_idx * absmax_per_row_gate
+                + (col_idx // quant_block_size)
+            )
+            gate_scale = tl.load(gate_absmax_ptr + gate_abs_idx, mask=valid, other=0.0)
+            gate_w = gate_quant.to(tl.float32) * gate_scale.to(tl.float32)
+            gate_acc += tl.sum(gate_w * x[None, :], axis=1)
+
+            up_pair_idx = (
+                pid * block_size * bytes_per_row_gate
+                + row_idx * bytes_per_row_gate
+                + (col_idx >> 1)
+            )
+            up_packed = tl.load(up_packed_ptr + up_pair_idx, mask=valid, other=0)
+            up_low = up_packed & 0x0F
+            up_high = up_packed >> 4
+            up_nibble = tl.where((col_idx & 1) == 0, up_high, up_low).to(tl.int32)
+            up_quant = tl.load(up_code_ptr + up_nibble, mask=valid, other=0.0)
+            up_abs_idx = (
+                pid * block_size * absmax_per_row_gate
+                + row_idx * absmax_per_row_gate
+                + (col_idx // quant_block_size)
+            )
+            up_scale = tl.load(up_absmax_ptr + up_abs_idx, mask=valid, other=0.0)
+            up_w = up_quant.to(tl.float32) * up_scale.to(tl.float32)
+            up_acc += tl.sum(up_w * x[None, :], axis=1)
+
+        gate_sigmoid = 1.0 / (1.0 + tl.exp(-gate_acc))
+        intermediate = (gate_acc * gate_sigmoid) * up_acc
+
+        ready_state = epoch * 3 + 2
+        init_state = epoch * 3 + 1
+
+        for out_start in tl.range(0, hidden_size, BLOCK_OUT, num_stages=1):
+            tile_id = out_start // BLOCK_OUT
+            tile_state = tile_state_ptr + tile_id
+            tile_done = tile_done_ptr + tile_id
+
+            state = tl.load(tile_state)
+            if state != ready_state:
+                if state != init_state:
+                    prev = tl.atomic_cas(tile_state, state, init_state)
+                    if prev == state:
+                        offs_out_init = out_start + tl.arange(0, BLOCK_OUT)
+                        valid_out_init = offs_out_init < hidden_size
+                        tl.store(out_accum_ptr + offs_out_init, 0.0, mask=valid_out_init)
+                        tl.store(tile_done, 0)
+                        tl.store(tile_state, ready_state)
+                    else:
+                        wait_state = tl.load(tile_state)
+                        while wait_state != ready_state:
+                            wait_state = tl.load(tile_state)
+                else:
+                    wait_state = tl.load(tile_state)
+                    while wait_state != ready_state:
+                        wait_state = tl.load(tile_state)
+
+            offs_out = out_start + tl.arange(0, BLOCK_OUT)
+            valid_out = offs_out < hidden_size
+            out_idx = offs_out[:, None]
+            block_col = offs_block[None, :]
+            valid_down = valid_out[:, None] & valid_block[None, :]
+
+            down_pair_idx = (
+                out_idx * (top_k * bytes_per_cblk_down)
+                + pid * bytes_per_cblk_down
+                + (block_col >> 1)
+            )
+            down_packed = tl.load(down_packed_ptr + down_pair_idx, mask=valid_down, other=0)
+            down_low = down_packed & 0x0F
+            down_high = down_packed >> 4
+            down_nibble = tl.where((block_col & 1) == 0, down_high, down_low).to(tl.int32)
+            down_quant = tl.load(down_code_ptr + down_nibble, mask=valid_down, other=0.0)
+            down_abs_idx = out_idx * top_k + pid
+            down_scale = tl.load(down_absmax_ptr + down_abs_idx, mask=valid_out[:, None], other=0.0)
+            down_w = down_quant.to(tl.float32) * down_scale.to(tl.float32)
+
+            contrib = tl.sum(down_w * intermediate[None, :], axis=1)
+            tl.atomic_add(out_accum_ptr + offs_out, contrib, mask=valid_out)
+
+            prev_done = tl.atomic_add(tile_done, 1)
+            done_now = prev_done + 1
+            if done_now == top_k:
+                out_tile = tl.load(out_accum_ptr + offs_out, mask=valid_out, other=0.0)
+                tl.store(out_ptr + offs_out, out_tile.to(tl.float16), mask=valid_out)
+
+
 class _SparseInputLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -862,6 +1175,9 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
             device=x_flat.device,
         )
 
+        major, _minor = _cuda_capability(x_flat.device)
+        _is_sm75 = (0 < major < 8)
+
         if top_k == 0:
             if has_bias:
                 out.copy_(bias.unsqueeze(0).expand_as(out))
@@ -871,7 +1187,8 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
             topk_max = _next_power_of_two(top_k)
             def grid(META):
                 return (rows, triton.cdiv(int(out_features), META['BLOCK_OUT']))
-            _sparse_input_linear_4bit_tiled_kernel[grid](
+            _tiled_kernel = _sparse_input_linear_4bit_tiled_kernel_sm75 if _is_sm75 else _sparse_input_linear_4bit_tiled_kernel
+            _tiled_kernel[grid](
                 x_flat,
                 active_idx,
                 packed_weight,
@@ -897,7 +1214,10 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
             out.zero_()
             if has_bias:
                 out += bias.unsqueeze(0)
-            grid = (rows * top_k, triton.cdiv(int(out_features), 64))
+            # SM75: smaller BLOCK_OUT (32 vs 64) improves SM occupancy; fewer regs per warp
+            _atomic_block_out = 32 if _is_sm75 else 64
+            _atomic_warps = 2 if _is_sm75 else 4
+            grid = (rows * top_k, triton.cdiv(int(out_features), _atomic_block_out))
             _sparse_input_linear_4bit_atomic_kernel[grid](
                 x_flat,
                 active_idx,
@@ -916,8 +1236,8 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
                 active_idx.stride(1),
                 out.stride(0),
                 BLOCK_IN=block_in,
-                BLOCK_OUT=64,
-                num_warps=4,
+                BLOCK_OUT=_atomic_block_out,
+                num_warps=_atomic_warps,
                 num_stages=1,
             )
 
@@ -963,9 +1283,12 @@ class _SparseOutputLinear4bitFn(torch.autograd.Function):
         out = torch.zeros((rows, hidden_size), device=x_flat.device, dtype=x_flat.dtype)
 
         if rows > 0 and top_k > 0:
+            major, _minor = _cuda_capability(x_flat.device)
+            _is_sm75 = (0 < major < 8)
+            _out_kernel = _sparse_output_linear_4bit_kernel_sm75 if _is_sm75 else _sparse_output_linear_4bit_kernel
             def grid(META):
                 return (rows * top_k, triton.cdiv(int(block_size), META['BLOCK_OUT']))
-            _sparse_output_linear_4bit_kernel[grid](
+            _out_kernel[grid](
                 x_flat,
                 active_idx,
                 packed_weight,
@@ -1077,6 +1400,162 @@ def triton_sparse_output_linear_4bit(
         int(block_size),
         quant_weight_ref,
     )
+
+
+def triton_sparse_mlp_decode_4bit_single_kernel_sm75(
+    x_flat: torch.Tensor,
+    active_blocks: torch.Tensor,
+    gate_packed: torch.Tensor,
+    gate_absmax: torch.Tensor,
+    gate_code: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_absmax: torch.Tensor,
+    up_code: torch.Tensor,
+    down_packed: torch.Tensor,
+    down_absmax: torch.Tensor,
+    down_code: torch.Tensor,
+    out: torch.Tensor,
+    out_accum: torch.Tensor,
+    tile_state: torch.Tensor,
+    tile_done: torch.Tensor,
+    epoch: int,
+    hidden_size: int,
+    block_size: int,
+    quant_block_size: int,
+    top_k: int,
+) -> torch.Tensor:
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Single-kernel sparse MLP decode requires Triton")
+    if x_flat.device.type != "cuda":
+        raise RuntimeError("Single-kernel sparse MLP decode requires CUDA")
+    if not _is_sm75(x_flat.device):
+        raise RuntimeError("Single-kernel sparse MLP decode is only enabled for SM75 (Turing)")
+    if int(block_size) != 32:
+        raise RuntimeError("Single-kernel sparse MLP decode currently requires block_size=32")
+    if int(top_k) <= 0:
+        raise RuntimeError("Single-kernel sparse MLP decode requires top_k > 0")
+
+    hidden_size = int(hidden_size)
+    quant_block_size = int(quant_block_size)
+    top_k = int(top_k)
+    if hidden_size <= 0 or quant_block_size <= 0:
+        raise RuntimeError("hidden_size and quant_block_size must be positive")
+
+    x_vec = x_flat.reshape(-1).to(device=x_flat.device, dtype=torch.float16).contiguous()
+    if int(x_vec.numel()) != hidden_size:
+        raise RuntimeError(
+            f"x_flat has {int(x_vec.numel())} elements but hidden_size={hidden_size}"
+        )
+
+    active_blocks_i32 = active_blocks.reshape(-1).to(device=x_flat.device, dtype=torch.int32).contiguous()
+    if int(active_blocks_i32.numel()) != top_k:
+        raise RuntimeError(
+            f"active_blocks has {int(active_blocks_i32.numel())} entries but top_k={top_k}"
+        )
+
+    gate_packed = gate_packed.to(device=x_flat.device, dtype=torch.uint8).contiguous()
+    gate_absmax = gate_absmax.to(device=x_flat.device, dtype=torch.float32).contiguous()
+    gate_code = gate_code.to(device=x_flat.device, dtype=torch.float32).contiguous()
+    up_packed = up_packed.to(device=x_flat.device, dtype=torch.uint8).contiguous()
+    up_absmax = up_absmax.to(device=x_flat.device, dtype=torch.float32).contiguous()
+    up_code = up_code.to(device=x_flat.device, dtype=torch.float32).contiguous()
+    down_packed = down_packed.to(device=x_flat.device, dtype=torch.uint8).contiguous()
+    down_absmax = down_absmax.to(device=x_flat.device, dtype=torch.float32).contiguous()
+    down_code = down_code.to(device=x_flat.device, dtype=torch.float32).contiguous()
+
+    out = out.to(device=x_flat.device, dtype=torch.float16).contiguous()
+    out_accum = out_accum.to(device=x_flat.device, dtype=torch.float32).contiguous()
+    tile_state = tile_state.to(device=x_flat.device, dtype=torch.int32).contiguous()
+    tile_done = tile_done.to(device=x_flat.device, dtype=torch.int32).contiguous()
+
+    bytes_per_row_gate = hidden_size // 2
+    absmax_per_row_gate = hidden_size // quant_block_size
+    if bytes_per_row_gate <= 0 or absmax_per_row_gate <= 0:
+        raise RuntimeError("Invalid hidden_size/quant_block_size for NF4 decode")
+    if int(gate_packed.numel()) != int(top_k * block_size * bytes_per_row_gate):
+        raise RuntimeError(
+            "gate_packed size does not match [top_k, block_size, hidden_size/2] layout"
+        )
+    if int(up_packed.numel()) != int(top_k * block_size * bytes_per_row_gate):
+        raise RuntimeError(
+            "up_packed size does not match [top_k, block_size, hidden_size/2] layout"
+        )
+    if int(gate_absmax.numel()) != int(top_k * block_size * absmax_per_row_gate):
+        raise RuntimeError(
+            "gate_absmax size does not match [top_k, block_size, hidden_size/quant_block_size] layout"
+        )
+    if int(up_absmax.numel()) != int(top_k * block_size * absmax_per_row_gate):
+        raise RuntimeError(
+            "up_absmax size does not match [top_k, block_size, hidden_size/quant_block_size] layout"
+        )
+    if int(down_absmax.numel()) != int(hidden_size * top_k):
+        raise RuntimeError("down_absmax size does not match [hidden_size, top_k] layout")
+    bytes_per_cblk_down = block_size // 2
+    if int(down_packed.numel()) != int(hidden_size * top_k * bytes_per_cblk_down):
+        raise RuntimeError("down_packed size does not match [hidden_size, top_k, block_size/2] layout")
+    if int(out_accum.numel()) < hidden_size:
+        raise RuntimeError("out_accum scratch is smaller than hidden_size")
+
+    block_out_candidates = [64, 32]
+    env_block_out = os.getenv("SCA_TRITON_SINGLE_KERNEL_BLOCK_OUT", "").strip()
+    if env_block_out:
+        try:
+            preferred = int(env_block_out)
+        except ValueError:
+            preferred = 64
+        preferred = 64 if preferred >= 64 else 32
+        block_out_candidates = [preferred, 32 if preferred == 64 else 64]
+
+    launch_error: Exception | None = None
+    epoch_i32 = int(epoch)
+    for block_out in block_out_candidates:
+        num_tiles = triton.cdiv(hidden_size, int(block_out))
+        if int(tile_state.numel()) < int(num_tiles):
+            raise RuntimeError(
+                f"tile_state scratch has {int(tile_state.numel())} entries, expected >= {int(num_tiles)}"
+            )
+        if int(tile_done.numel()) < int(num_tiles):
+            raise RuntimeError(
+                f"tile_done scratch has {int(tile_done.numel())} entries, expected >= {int(num_tiles)}"
+            )
+        try:
+            _sparse_mlp_decode_4bit_single_kernel_sm75[(top_k,)](
+                x_vec,
+                active_blocks_i32,
+                gate_packed.reshape(-1),
+                gate_absmax.reshape(-1),
+                gate_code.reshape(-1),
+                up_packed.reshape(-1),
+                up_absmax.reshape(-1),
+                up_code.reshape(-1),
+                down_packed.reshape(-1),
+                down_absmax.reshape(-1),
+                down_code.reshape(-1),
+                out.reshape(-1),
+                out_accum.reshape(-1),
+                tile_state.reshape(-1),
+                tile_done.reshape(-1),
+                epoch_i32,
+                hidden_size,
+                int(block_size),
+                quant_block_size,
+                top_k,
+                int(bytes_per_row_gate),
+                int(absmax_per_row_gate),
+                int(bytes_per_cblk_down),
+                BLOCK_IN=64,
+                BLOCK_OUT=int(block_out),
+                num_warps=4,
+                num_stages=1,
+            )
+            return out.view_as(x_flat)
+        except Exception as exc:
+            launch_error = exc
+            continue
+
+    if launch_error is not None:
+        raise launch_error
+    raise RuntimeError("single-kernel sparse MLP decode did not launch")
 
 
 def triton_fused_sparse_mlp_decode_4bit(
