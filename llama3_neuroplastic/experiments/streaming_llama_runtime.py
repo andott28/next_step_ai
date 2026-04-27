@@ -570,7 +570,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
 
         self._prefetch_executor = (
-            concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="layer_prefetch")
+            concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="layer_prefetch")
             if self._enable_background_prefetch
             else None
         )
@@ -1931,12 +1931,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             )
 
     def pre_warm_vram_hot_cache(self) -> None:
-        """Load top-importance MLP blocks for all layers into VRAM hot-cache before inference.
-
-        Paid once at startup; persists across all subsequent queries.  After this call,
-        decode token 1 is served from VRAM (no cold-start SSD read), and when
-        --sparse-mlp-prefill-mode hot_cache is active the prefill MLP pass also reads
-        from VRAM rather than SSD, reducing per-query prefill I/O to attention weights only.
+        """Load top-importance MLP blocks, sparse K/V hot-blocks, and sparse Q/O head slices
+        into VRAM before inference.  Paid once at startup; all three tiers use the same budget.
         """
         if not self._vram_hot_cache_enabled:
             print("[pre-warm] VRAM hot-cache is disabled; skipping.", flush=True)
@@ -1949,6 +1945,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._traffic_current_phase = "decode"
         cached_layers = 0
         try:
+            # --- Tier 1: MLP gate / up / down hot blocks ---
             for layer_idx in range(self.num_layers):
                 prefix = f"model.layers.{layer_idx}.mlp."
                 new_this_layer = False
@@ -1967,10 +1964,64 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     flush=True,
                 )
             print(
-                f"\n[pre-warm] complete — {cached_layers} layers cached, "
+                f"\n[pre-warm] complete — {cached_layers} MLP layers cached, "
                 f"VRAM hot-cache: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB",
                 flush=True,
             )
+
+            # --- Tier 2: sparse K/V projection hot column-blocks ---
+            if self._kv_hot_blocks_by_layer and self._vram_hot_cache_enabled:
+                kv_cached = 0
+                for layer_idx in range(self.num_layers):
+                    attn_prefix = f"model.layers.{layer_idx}.self_attn."
+                    for proj in ("k_proj.weight", "v_proj.weight"):
+                        full_name = f"{attn_prefix}{proj}"
+                        if full_name not in self._vram_nf4_cache:
+                            with contextlib.suppress(Exception):
+                                self._get_sparse_4bit_kv_param(full_name)
+                                if full_name in self._vram_nf4_cache:
+                                    kv_cached += 1
+                if kv_cached > 0:
+                    print(
+                        f"[pre-warm] cached hot K/V blocks for {kv_cached} projections "
+                        f"| VRAM used: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB",
+                        flush=True,
+                    )
+
+            # --- Tier 3: sparse Q/O head slices ---
+            if self._attn_active_head_indices and self._vram_hot_cache_enabled:
+                head_dim = int(
+                    getattr(self.config, "head_dim", None)
+                    or (
+                        int(getattr(self.config, "hidden_size", 4096))
+                        // int(getattr(self.config, "num_attention_heads", 32))
+                    )
+                )
+                qo_cached = 0
+                for layer_idx in range(self.num_layers):
+                    if int(layer_idx) in self._attn_hot_head_cache:
+                        continue
+                    attn_prefix = f"model.layers.{layer_idx}.self_attn."
+                    q_name = f"{attn_prefix}q_proj.weight"
+                    o_name = f"{attn_prefix}o_proj.weight"
+                    with contextlib.suppress(Exception):
+                        meta_q = self._get_sparse_4bit_attn_meta(q_name, head_dim=head_dim)
+                        meta_o = self._get_sparse_4bit_attn_meta(o_name, head_dim=head_dim)
+                        result = self._maybe_cache_sparse_attn_hot_heads(
+                            layer_idx=layer_idx,
+                            q_name=q_name,
+                            o_name=o_name,
+                            meta_q=meta_q,
+                            meta_o=meta_o,
+                        )
+                        if result is not None:
+                            qo_cached += 1
+                if qo_cached > 0:
+                    print(
+                        f"[pre-warm] cached sparse Q/O heads for {qo_cached} layers "
+                        f"| VRAM used: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB",
+                        flush=True,
+                    )
         finally:
             self._traffic_current_phase = prev_phase
 
@@ -2191,6 +2242,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 logits_calib = self._forward_prefill(calibration_ids.to(self.device), compute_logits=(n_decode > 0))
             if n_decode > 0 and logits_calib is not None:
                 self._set_traffic_phase("decode")
+                self._decode_mlp_hot_blocks_hit = getattr(self, "_decode_mlp_hot_blocks_hit", 0)
+                self._decode_mlp_cold_blocks_streamed = getattr(self, "_decode_mlp_cold_blocks_streamed", 0)
+                self._decode_down_hot_blocks_hit = getattr(self, "_decode_down_hot_blocks_hit", 0)
+                self._decode_down_cold_blocks_streamed = getattr(self, "_decode_down_cold_blocks_streamed", 0)
                 seq_gpu = calibration_ids.to(self.device)
                 with torch.no_grad():
                     for _d in range(n_decode):
@@ -5144,252 +5199,46 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         prefix = f"model.layers.{int(layer_idx)}.mlp."
         if self.device.type != "cuda":
-            flat_hidden = hidden.view(-1, hidden.shape[-1]).to(device=self.device, dtype=self.dtype)
-            gate_weight = self.loader.load_parameter(f"{prefix}gate_proj.weight").to(device=self.device, dtype=flat_hidden.dtype)
-            up_weight = self.loader.load_parameter(f"{prefix}up_proj.weight").to(device=self.device, dtype=flat_hidden.dtype)
-            down_weight = self.loader.load_parameter(f"{prefix}down_proj.weight").to(device=self.device, dtype=flat_hidden.dtype)
-            gate_bias = self._load_optional_bias(
-                f"{prefix}gate_proj.weight",
-                getattr(gate_proj, "bias", None),
-                device=self.device,
-                dtype=flat_hidden.dtype,
-                layer_idx=layer_idx,
-                tag="mlp_guard_gate_bias",
-            )
-            up_bias = self._load_optional_bias(
-                f"{prefix}up_proj.weight",
-                getattr(up_proj, "bias", None),
-                device=self.device,
-                dtype=flat_hidden.dtype,
-                layer_idx=layer_idx,
-                tag="mlp_guard_up_bias",
-            )
-            down_bias = self._load_optional_bias(
-                f"{prefix}down_proj.weight",
-                getattr(down_proj, "bias", None),
-                device=self.device,
-                dtype=flat_hidden.dtype,
-                layer_idx=layer_idx,
-                tag="mlp_guard_down_bias",
-            )
-            gate = F.linear(flat_hidden, gate_weight, gate_bias)
-            up = F.linear(flat_hidden, up_weight, up_bias)
-            out = F.linear(F.silu(gate) * up, down_weight, down_bias)
-            return out.view_as(hidden)
+            return self._dense_mlp_forward_streaming(mlp, hidden)
 
-        block_size = int(self._sparse_block_size)
         flat_hidden = hidden.view(-1, hidden.shape[-1]).to(device=self.device, dtype=self.dtype)
-        rows = int(flat_hidden.shape[0])
-        if rows <= 0:
-            return torch.zeros_like(hidden)
-
-        gate_param = self._get_sparse_4bit_param(f"{prefix}gate_proj.weight")
-        up_param = self._get_sparse_4bit_param(f"{prefix}up_proj.weight")
-        down_param = self._get_sparse_4bit_param(f"{prefix}down_proj.weight")
-
-        if int(gate_param["in_features"]) != int(hidden.shape[-1]) or int(up_param["in_features"]) != int(hidden.shape[-1]):
-            raise RuntimeError(
-                f"Layer {int(layer_idx)} dense guard input shapes do not match hidden size {int(hidden.shape[-1])}."
+        
+        def _load_and_linear(param_name: str, proj: nn.Module, x: torch.Tensor, is_gate: bool = False) -> torch.Tensor:
+            out_feat = getattr(proj, "out_features", None)
+            in_feat = getattr(proj, "in_features", None)
+            if out_feat is None or in_feat is None:
+                raise RuntimeError("Dense guard requires shape-configured MLP projections")
+                
+            weight = torch.empty((out_feat, in_feat), device=self.device, dtype=self.dtype)
+            
+            self.loader.load_parameter_into(
+                name=param_name,
+                out=weight,
+                dtype=self.dtype,
+                staging=self._nf4_staging,
+                absmax_staging=self._absmax_staging,
+                nested_absmax_staging=self._nested_absmax_staging,
+                state2_absmax_staging=self._state2_absmax_staging,
+                code_staging=self._code_staging,
             )
-        total_blocks = int(gate_param["blocks_per_col"])
-        if int(down_param["out_features"]) != int(hidden.shape[-1]):
-            raise RuntimeError(
-                f"Layer {int(layer_idx)} dense guard down_proj out_features "
-                f"{int(down_param['out_features'])} do not match hidden size {int(hidden.shape[-1])}."
+            
+            bias_gpu = self._load_optional_bias(
+                param_name, getattr(proj, "bias", None), device=self.device, dtype=self.dtype, layer_idx=layer_idx, tag="mlp_guard_bias"
             )
-        if int(down_param["in_features"]) % max(block_size, 1) != 0:
-            raise RuntimeError(
-                f"Layer {int(layer_idx)} dense guard down_proj in_features "
-                f"{int(down_param['in_features'])} are not divisible by block_size {block_size}."
-            )
-        expected_intermediate_blocks = int(down_param["in_features"]) // max(block_size, 1)
-        if (
-            total_blocks <= 0
-            or total_blocks != int(up_param["blocks_per_col"])
-            or total_blocks != expected_intermediate_blocks
-        ):
-            raise RuntimeError(
-                f"Layer {int(layer_idx)} dense guard block layout is inconsistent: "
-                f"gate={int(gate_param['blocks_per_col'])}, up={int(up_param['blocks_per_col'])}, "
-                f"down={expected_intermediate_blocks}, block_size={block_size}."
-            )
-
-        chunk_blocks = int(chunk_blocks if chunk_blocks is not None else self._guard_mlp_chunk_blocks)
-        chunk_blocks = max(1, min(chunk_blocks, total_blocks))
-
-        gate_bias_full = self._load_optional_bias(
-            f"{prefix}gate_proj.weight",
-            getattr(gate_proj, "bias", None),
-            device=self.device,
-            dtype=flat_hidden.dtype,
-            layer_idx=layer_idx,
-            tag="mlp_guard_gate_bias",
-        )
-        up_bias_full = self._load_optional_bias(
-            f"{prefix}up_proj.weight",
-            getattr(up_proj, "bias", None),
-            device=self.device,
-            dtype=flat_hidden.dtype,
-            layer_idx=layer_idx,
-            tag="mlp_guard_up_bias",
-        )
-        down_bias = self._load_optional_bias(
-            f"{prefix}down_proj.weight",
-            getattr(down_proj, "bias", None),
-            device=self.device,
-            dtype=flat_hidden.dtype,
-            layer_idx=layer_idx,
-            tag="mlp_guard_down_bias",
-        )
-
-        try:
-            out_flat = torch.zeros((rows, int(down_param["out_features"])), device=self.device, dtype=flat_hidden.dtype)
-            neuron_offsets_gpu = torch.arange(block_size, device=self.device, dtype=torch.long)
-            bytes_per_cblk = block_size // 2
-            col_b_range = torch.arange(bytes_per_cblk, dtype=torch.long)
-            down_quant_block_size = int(down_param["quant_block_size"])
-            down_absmax_per_row = int(down_param["in_features"]) // max(down_quant_block_size, 1)
-            down_raw_2d = down_param["packed_weight"].view(int(down_param["out_features"]), int(down_param["bytes_per_row"]))
-            down_absmax_2d = down_param["absmax"].view(int(down_param["out_features"]), down_absmax_per_row)
-
-
-
-
-            for block_start in range(0, total_blocks, chunk_blocks):
-                block_stop = min(total_blocks, block_start + chunk_blocks)
-                ordered_blocks = torch.arange(block_start, block_stop, dtype=torch.long)
-                active_dim = int(ordered_blocks.numel()) * block_size
-                active_neurons = (
-                    ordered_blocks.to(device=self.device, dtype=torch.long).unsqueeze(-1) * block_size
-                    + neuron_offsets_gpu.unsqueeze(0)
-                ).reshape(-1)
-
-                gate_packed_gpu, gate_absmax_gpu = self._prepare_sparse_blocks_for_param(
-                    gate_param,
-                    ordered_blocks=ordered_blocks,
-                )
-                up_packed_gpu, up_absmax_gpu = self._prepare_sparse_blocks_for_param(
-                    up_param,
-                    ordered_blocks=ordered_blocks,
-                )
-                self._wait_for_h2d_stream()
-
-                gate_weight = torch.empty(
-                    (active_dim, int(gate_param["in_features"])),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                _bnb_dequant_impl(
-                    gate_packed_gpu.reshape(-1),
-                    gate_absmax_gpu.reshape(-1),
-                    int(gate_param["quant_block_size"]),
-                    gate_param["quant_type"],
-                    gate_weight.dtype,
-                    out=gate_weight,
-                )
-                gate_bias = (
-                    None
-                    if gate_bias_full is None
-                    else gate_bias_full.index_select(0, active_neurons).to(dtype=flat_hidden.dtype)
-                )
-                gate = F.linear(flat_hidden, gate_weight.to(dtype=flat_hidden.dtype), gate_bias)
-                del gate_weight, gate_packed_gpu, gate_absmax_gpu, gate_bias
-
-                up_weight = torch.empty(
-                    (active_dim, int(up_param["in_features"])),
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                _bnb_dequant_impl(
-                    up_packed_gpu.reshape(-1),
-                    up_absmax_gpu.reshape(-1),
-                    int(up_param["quant_block_size"]),
-                    up_param["quant_type"],
-                    up_weight.dtype,
-                    out=up_weight,
-                )
-                up_bias = (
-                    None
-                    if up_bias_full is None
-                    else up_bias_full.index_select(0, active_neurons).to(dtype=flat_hidden.dtype)
-                )
-                up = F.linear(flat_hidden, up_weight.to(dtype=flat_hidden.dtype), up_bias)
-                del up_weight, up_packed_gpu, up_absmax_gpu, up_bias
-
-                activated = F.silu(gate) * up
-                del gate, up
-
-                down_col_starts = ordered_blocks * bytes_per_cblk
-                down_col_idx = (down_col_starts.unsqueeze(-1) + col_b_range.unsqueeze(0)).reshape(-1)
-                gathered_down_packed_cpu = (
-                    down_raw_2d[:, down_col_idx]
-                    .reshape(int(down_param["out_features"]), int(ordered_blocks.numel()), bytes_per_cblk)
-                    .contiguous()
-                )
-
-
-
-
-
-                down_abs_idx_raw = (ordered_blocks * block_size) // down_quant_block_size
-                down_abs_idx = torch.unique_consecutive(down_abs_idx_raw)
-                gathered_down_absmax_cpu = down_absmax_2d[:, down_abs_idx].contiguous()
-                down_packed_gpu = self._copy_cpu_to_gpu(
-                    gathered_down_packed_cpu,
-                    dtype=torch.uint8,
-                    layer_idx=layer_idx,
-                    tag="mlp_guard_down_packed",
-                )
-                down_absmax_gpu = self._copy_cpu_to_gpu(
-                    gathered_down_absmax_cpu,
-                    dtype=torch.float32,
-                    layer_idx=layer_idx,
-                    tag="mlp_guard_down_absmax",
-                )
-                self._wait_for_h2d_stream()
-                down_weight_chunk = torch.empty(
-                    int(down_param["out_features"]),
-                    active_dim,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                _bnb_dequant_impl(
-                    down_packed_gpu.reshape(-1),
-                    down_absmax_gpu.reshape(-1),
-                    int(down_param["quant_block_size"]),
-                    down_param["quant_type"],
-                    down_weight_chunk.dtype,
-                    out=down_weight_chunk,
-                )
-                out_flat += F.linear(activated, down_weight_chunk.to(dtype=flat_hidden.dtype), None)
-                del activated, down_packed_gpu, down_absmax_gpu, down_weight_chunk
-
-            if down_bias is not None:
-                out_flat = out_flat + down_bias.unsqueeze(0)
-            return out_flat.view_as(hidden).to(device=hidden.device, dtype=hidden.dtype)
-        except Exception as exc:
-            if not _is_cuda_oom_error(exc):
-                raise
-            self._disable_vram_hot_cache("cuda_oom_dense_guard_mlp")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            if chunk_blocks <= 1:
-                raise RuntimeError(
-                    f"Dense guard MLP exact chunked 4-bit path OOM at minimum chunk size for layer {int(layer_idx)}."
-                ) from exc
-            next_chunk_blocks = max(1, chunk_blocks // 2)
-            print(
-                f"[dense_guard] CUDA OOM in layer {int(layer_idx)} with chunk_blocks={chunk_blocks}; "
-                f"retrying with chunk_blocks={next_chunk_blocks}.",
-                flush=True,
-            )
-            return self._dense_guard_mlp_forward_exact_chunked_4bit(
-                layer_idx,
-                mlp,
-                hidden,
-                chunk_blocks=next_chunk_blocks,
-                _oom_retry_depth=int(_oom_retry_depth) + 1,
-            )
+            
+            y = F.linear(x, weight, bias_gpu)
+            del weight, bias_gpu
+            if is_gate:
+                y = F.silu(y)
+            return y
+            
+        gate = _load_and_linear(f"{prefix}gate_proj.weight", gate_proj, flat_hidden, is_gate=True)
+        up = _load_and_linear(f"{prefix}up_proj.weight", up_proj, flat_hidden, is_gate=False)
+        act = gate * up
+        del gate, up
+        
+        out = _load_and_linear(f"{prefix}down_proj.weight", down_proj, act, is_gate=False)
+        return out.view_as(hidden)
 
     def _mlp_forward_dispatch(
         self,
@@ -6873,6 +6722,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         next_idx = layer_idx + 1
         if next_idx < self.num_layers:
             self._schedule_prefetch_layer(next_idx)
+        next2_idx = layer_idx + 2
+        if next2_idx < self.num_layers:
+            self._schedule_prefetch_layer(next2_idx)
 
         return self._layer_skeleton
 
@@ -6881,6 +6733,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         pass
 
     def _embed_tokens_cpu(self, token_ids: torch.LongTensor) -> torch.Tensor:
+        if getattr(self, "_show_progress", False) or getattr(self, "_debug_steps", False):
+            print(f"[profile] CPU Warning: embed_tokens_cpu invoked for {token_ids.shape[1] if token_ids.ndim > 1 else 1} tokens!", flush=True)
         token_ids_cpu = token_ids.to(device=torch.device("cpu"), dtype=torch.long)
         if self._embed_weight_cpu is not None:
             return F.embedding(token_ids_cpu, self._embed_weight_cpu)
@@ -6905,6 +6759,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         return torch.stack(row_tensors, dim=0).view(int(token_ids_cpu.shape[0]), int(token_ids_cpu.shape[1]), -1)
 
     def _lm_head_forward_cpu(self, hidden: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_show_progress", False) or getattr(self, "_debug_steps", False):
+            print(f"[profile] CPU Bottleneck: LM Head processing on CPU! (GPU underutilized)", flush=True)
         lm_head_weight_cpu = self._ensure_lm_head_weight_cpu()
         if lm_head_weight_cpu is None:
             raise RuntimeError("StreamingLlamaRuntime.generate requires materialize_lm_head=True")
@@ -7222,7 +7078,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         else:
             _causal_mask = None
 
+        import time
         for layer_idx in range(self.num_layers):
+            t_start = time.perf_counter()
+            ev_start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            ev_load = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            ev_attn = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            ev_mlp = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+            if ev_start: ev_start.record()
             if self._show_progress and torch.cuda.is_available():
                 alloc_gb = torch.cuda.memory_allocated() / 1e9
                 reserv_gb = torch.cuda.memory_reserved() / 1e9
@@ -7231,6 +7094,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     end="\r", flush=True,
                 )
             layer = self._load_layer(layer_idx)
+            if ev_load: ev_load.record()
 
 
             use_taylor = layer_idx in self.taylor_layer_set
@@ -7261,6 +7125,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     cache_position=position_ids_all.view(-1),
                 )
             all_hidden = all_hidden + attn_out
+            if ev_attn: ev_attn.record()
 
 
 
@@ -7291,6 +7156,22 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             all_hidden = residual + mlp_out
 
             self._release_modules(layer)
+            if ev_mlp: 
+                ev_mlp.record()
+                torch.cuda.synchronize()
+                load_ms = ev_start.elapsed_time(ev_load) if ev_load else 0.0
+                attn_ms = ev_load.elapsed_time(ev_attn) if ev_attn else 0.0
+                mlp_ms = ev_attn.elapsed_time(ev_mlp) if ev_mlp else 0.0
+                total_gpu_ms = ev_start.elapsed_time(ev_mlp) if ev_mlp else 0.0
+                total_cpu_ms = (time.perf_counter() - t_start) * 1000.0
+                
+                if total_cpu_ms > total_gpu_ms + 10.0 and self._show_progress:
+                    print(f"\n[profile] layer {layer_idx} CPU bottleneck detected! CPU: {total_cpu_ms:.1f}ms, GPU: {total_gpu_ms:.1f}ms (load={load_ms:.1f}ms, attn={attn_ms:.1f}ms, mlp={mlp_ms:.1f}ms)", flush=True)
+                elif self._debug_steps:
+                    print(f"\n[profile] layer {layer_idx} CPU: {total_cpu_ms:.1f}ms, GPU: {total_gpu_ms:.1f}ms", flush=True)
+                
+                if hasattr(self, "_record_runtime_event"):
+                    self._record_runtime_event("prefill_layer_profile", layer_idx=layer_idx, cpu_ms=total_cpu_ms, gpu_ms=total_gpu_ms, load_ms=load_ms, attn_ms=attn_ms, mlp_ms=mlp_ms)
 
         if self._show_progress:
             print("", flush=True)

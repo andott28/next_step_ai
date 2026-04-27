@@ -211,10 +211,10 @@ def _resolve_ram_cache_limit_bytes() -> int | None:
         import psutil
         raw_frac = os.getenv("STREAMING_RAM_CACHE_AUTO_FRACTION", "").strip()
         try:
-            auto_frac = float(raw_frac) if raw_frac else 0.25
+            auto_frac = float(raw_frac) if raw_frac else 0.50
         except ValueError:
-            auto_frac = 0.25
-        auto_frac = max(0.20, min(auto_frac, 0.80))
+            auto_frac = 0.50
+        auto_frac = max(0.20, min(auto_frac, 0.90))
         available_bytes = psutil.virtual_memory().available
         min_headroom = int(6 * (1024 ** 3))
         target_headroom = int(18 * (1024 ** 3))
@@ -253,7 +253,7 @@ def _resolve_background_prefetch_default() -> bool:
         return True
     if raw in {"0", "false", "no", "off"}:
         return False
-    return os.name != "nt"
+    return True
 
 
 def _resolve_windows_batch_preload_default() -> bool:
@@ -262,7 +262,7 @@ def _resolve_windows_batch_preload_default() -> bool:
         return True
     if raw in {"0", "false", "no", "off"}:
         return False
-    return False
+    return os.name == "nt"
 
 
 def _resolve_show_progress_default() -> bool:

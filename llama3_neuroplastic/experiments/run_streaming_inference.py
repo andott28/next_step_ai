@@ -481,10 +481,33 @@ def main() -> None:
     if bool(args.pre_warm):
         args.sparse_mlp_prefill_mode = "hot_cache"
         if args.vram_hot_cache_gb is None:
-            args.vram_hot_cache_gb = 6.4
+            # Try to size to available VRAM; fall back to a safe 7.2 GB default for 8 GB cards.
+            try:
+                _pw_free, _pw_total = torch.cuda.mem_get_info()
+                _pw_margin = max(int(_pw_total * 0.05), 512 * 1024 * 1024)
+                args.vram_hot_cache_gb = round(max(1.0, (_pw_total - _pw_margin) / (1024 ** 3)), 2)
+            except Exception:
+                args.vram_hot_cache_gb = 7.2
     prompts = list(args.prompt) if args.prompt else []
     taylor_layers = _parse_layer_selection(args.taylor_layers)
     runtime_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Auto-fill VRAM hot cache when not explicitly disabled (0.0) and CUDA is available.
+    # Reserves 5% + 512 MB as a hard margin so activations and staging buffers never OOM.
+    if runtime_device.type == "cuda" and args.vram_hot_cache_gb is None:
+        try:
+            _vram_free, _vram_total = torch.cuda.mem_get_info(runtime_device)
+            _margin = max(int(_vram_total * 0.05), 512 * 1024 * 1024)
+            _auto_hot_gb = max(0.0, (_vram_total - _margin) / (1024 ** 3))
+            if _auto_hot_gb >= 1.0:
+                args.vram_hot_cache_gb = round(_auto_hot_gb, 2)
+                print(
+                    f"[vram] auto hot-cache: {args.vram_hot_cache_gb:.2f} GB "
+                    f"(total {_vram_total / (1024**3):.1f} GB, margin {_margin / (1024**3):.2f} GB). "
+                    "Set --vram-hot-cache-gb 0 to disable.",
+                    flush=True,
+                )
+        except Exception:
+            pass
     runtime_dtype = torch.bfloat16
     if runtime_device.type == "cuda":
         major, _minor = torch.cuda.get_device_capability(runtime_device)
@@ -571,6 +594,7 @@ def main() -> None:
                 calibration_encoded["input_ids"],
                 max_tokens=int(args.hot_cache_calibration_tokens),
                 rebuild_cache=True,
+                generate_decode_tokens=2,
             )
             if str(args.throughput_contract) in {"probe", "strict"}:
                 _validate_runtime_for_throughput_probe(runtime)
