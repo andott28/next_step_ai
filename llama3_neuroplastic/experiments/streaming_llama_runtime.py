@@ -431,6 +431,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._h2d_stage_slots: dict[str, int] = defaultdict(int)
         self._sparse_block_transfer_cache: dict[tuple[str, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
         self._downproj_transfer_cache: dict[tuple[str, tuple[int, ...]], tuple[torch.Tensor, torch.Tensor]] = {}
+        # CPU-side column cache for down_proj cold blocks.  Keyed by (full_name, block_id).
+        # Stores (packed_cols_cpu, absmax_cols_cpu) extracted from the weight, so SSD-miss layers
+        # only pay the full-weight SSD read ONCE; subsequent tokens hit this cheap CPU buffer.
+        self._down_proj_col_cache: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         # Phase 4: pre-routed MLP block indices (keyed by layer_idx) for H2D prefetch overlap
         self._mlp_prefetch_active_blocks: dict[int, torch.Tensor] = {}
         _target_layer_mb_raw = os.getenv("STREAMING_TARGET_LAYER_MB", "").strip()
@@ -2082,24 +2086,31 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             )
 
     def _estimate_mlp_hot_cache_bytes_per_block(self, layer_idx: int) -> int:
+        # Read shape metadata from already-loaded cache entries ONLY — never call
+        # _get_sparse_4bit_param here, which would trigger _maybe_cache_sparse_param_hot_blocks
+        # on a param that is currently mid-load, causing infinite recursion and massive VRAM
+        # over-allocation (each stack frame allocates a new ~16 MB GPU buffer).
         prefix = f"model.layers.{int(layer_idx)}.mlp."
         block_size = int(max(1, self._sparse_block_size))
         total = 0
         try:
             for proj in ("gate_proj.weight", "up_proj.weight"):
-                param = self._get_sparse_4bit_param(f"{prefix}{proj}", store_raw_in_ram_cache=True)
-                packed = param.get("packed_blocks")
-                absmax = param.get("absmax_blocks")
-                if torch.is_tensor(packed) and int(packed.ndim) >= 2 and int(packed.shape[0]) > 0:
-                    total += int(packed[0].numel() * packed.element_size())
-                if torch.is_tensor(absmax) and int(absmax.ndim) >= 2 and int(absmax.shape[0]) > 0:
-                    total += int(absmax[0].numel() * absmax.element_size())
+                meta = self._sparse_param_cache.get(f"{prefix}{proj}")
+                if meta is not None:
+                    total += int(meta.get("bytes_per_block", 0))
+                    total += int(meta.get("absmax_per_block", 0)) * 4  # float32 absmax
+                else:
+                    hidden = int(getattr(self.config, "hidden_size", 4096))
+                    total += (hidden // 2) * block_size
+                    total += (hidden // 64) * block_size * 4
 
-            down_param = self._get_sparse_4bit_param(f"{prefix}down_proj.weight", store_raw_in_ram_cache=True)
-            out_features = int(down_param.get("out_features", 0))
+            down_meta = self._sparse_param_cache.get(f"{prefix}down_proj.weight")
+            if down_meta is not None:
+                out_features = int(down_meta.get("out_features", 0))
+            else:
+                out_features = int(getattr(self.config, "hidden_size", 4096))
             bytes_per_cblk = max(1, block_size // 2)
-            total += int(out_features * bytes_per_cblk)
-            total += int(out_features * 4)
+            total += out_features * bytes_per_cblk + out_features * 4
         except Exception:
             total = 0
         return int(total if total > 0 else 1_048_576)
@@ -2236,12 +2247,25 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._hot_cache_calibration_active = True
         try:
             self.reset_caches()
-            self._set_traffic_phase("prefill")
-            self._sparse_mlp_prefill_mode = "sparse"
+            # Build KV cache token-by-token using the decode path (seq_len=1 per call).
+            # _forward_prefill with _hot_cache_calibration_active=True falls through to
+            # _sparse_mlp_forward_fast with seq_len=42 which crashes the Triton kernel
+            # (only supports seq_len=1). Dense mode also fails — buffer allocated for sparse
+            # blocks, not full weights. Token-by-token decode is safe and produces identical
+            # KV cache state via causal attention. Hits from this phase are discarded below.
+            self._set_traffic_phase("decode")
+            calib_ids_gpu = calibration_ids.to(self.device)
+            logits_calib = None
             with torch.no_grad():
-                logits_calib = self._forward_prefill(calibration_ids.to(self.device), compute_logits=(n_decode > 0))
+                for _tok_pos in range(int(calib_ids_gpu.shape[1])):
+                    _tok = calib_ids_gpu[:, _tok_pos : _tok_pos + 1]
+                    logits_calib, _ = self.forward_token(_tok, position_index=_tok_pos)
             if n_decode > 0 and logits_calib is not None:
                 self._set_traffic_phase("decode")
+                # Discard prefill activations so the rebuild is based purely on decode routing.
+                # Prefill uses a batched context (different block patterns from decode) and
+                # previously dominated the hit counts (74% prefill vs 26% decode).
+                self._hot_cache_calibration_hits = {}
                 self._decode_mlp_hot_blocks_hit = getattr(self, "_decode_mlp_hot_blocks_hit", 0)
                 self._decode_mlp_cold_blocks_streamed = getattr(self, "_decode_mlp_cold_blocks_streamed", 0)
                 self._decode_down_hot_blocks_hit = getattr(self, "_decode_down_hot_blocks_hit", 0)
@@ -3650,9 +3674,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             if int(cold_blocks.numel()) > 0:
                 if str(self._traffic_current_phase or "idle") == "decode":
                     self._decode_mlp_cold_blocks_streamed += int(cold_blocks.numel())
-                raw_param = self._materialize_sparse_4bit_param_raw_views(param)
-                cold_packed_cpu = raw_param["packed_blocks"][cold_blocks].contiguous()
-                cold_absmax_cpu = raw_param["absmax_blocks"][cold_blocks].contiguous().to(dtype=torch.float32)
+                cold_packed_cpu, cold_absmax_cpu = self._load_cold_blocks_direct(param, cold_blocks)
                 cold_packed = self._copy_cpu_to_gpu(
                     cold_packed_cpu,
                     dtype=torch.uint8,
@@ -3812,10 +3834,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         if has_cold_a and has_cold_b:
 
-            raw_param_a = self._materialize_sparse_4bit_param_raw_views(param_a)
-            raw_param_b = self._materialize_sparse_4bit_param_raw_views(param_b)
-            cold_a_packed_cpu = raw_param_a["packed_blocks"][cold_a].contiguous()
-            cold_b_packed_cpu = raw_param_b["packed_blocks"][cold_b].contiguous()
+            cold_a_packed_cpu, cold_a_absmax_cpu = self._load_cold_blocks_direct(param_a, cold_a)
+            cold_b_packed_cpu, cold_b_absmax_cpu = self._load_cold_blocks_direct(param_b, cold_b)
             combined_packed_cpu = torch.cat([cold_a_packed_cpu, cold_b_packed_cpu], dim=0)
             combined_packed_gpu = self._copy_cpu_to_gpu(
                 combined_packed_cpu,
@@ -3827,8 +3847,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             cold_a_packed_gpu = combined_packed_gpu[:na]
             cold_b_packed_gpu = combined_packed_gpu[na:]
 
-            cold_a_absmax_cpu = raw_param_a["absmax_blocks"][cold_a].contiguous().to(dtype=torch.float32)
-            cold_b_absmax_cpu = raw_param_b["absmax_blocks"][cold_b].contiguous().to(dtype=torch.float32)
             combined_absmax_cpu = torch.cat([cold_a_absmax_cpu, cold_b_absmax_cpu], dim=0)
             combined_absmax_gpu = self._copy_cpu_to_gpu(
                 combined_absmax_cpu,
@@ -3854,15 +3872,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 layer_idx=layer_idx,
             )
         elif has_cold_a:
-            raw_param_a = self._materialize_sparse_4bit_param_raw_views(param_a)
+            cold_a_packed_cpu, cold_a_absmax_cpu = self._load_cold_blocks_direct(param_a, cold_a)
             cold_a_packed_gpu = self._copy_cpu_to_gpu(
-                raw_param_a["packed_blocks"][cold_a].contiguous(),
+                cold_a_packed_cpu,
                 dtype=torch.uint8,
                 layer_idx=layer_idx,
                 tag=f"{tag_prefix}_a_packed",
             )
             cold_a_absmax_gpu = self._copy_cpu_to_gpu(
-                raw_param_a["absmax_blocks"][cold_a].contiguous().to(dtype=torch.float32),
+                cold_a_absmax_cpu,
                 dtype=torch.float32,
                 layer_idx=layer_idx,
                 tag=f"{tag_prefix}_a_absmax",
@@ -3875,15 +3893,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 layer_idx=layer_idx,
             )
         elif has_cold_b:
-            raw_param_b = self._materialize_sparse_4bit_param_raw_views(param_b)
+            cold_b_packed_cpu, cold_b_absmax_cpu = self._load_cold_blocks_direct(param_b, cold_b)
             cold_b_packed_gpu = self._copy_cpu_to_gpu(
-                raw_param_b["packed_blocks"][cold_b].contiguous(),
+                cold_b_packed_cpu,
                 dtype=torch.uint8,
                 layer_idx=layer_idx,
                 tag=f"{tag_prefix}_b_packed",
             )
             cold_b_absmax_gpu = self._copy_cpu_to_gpu(
-                raw_param_b["absmax_blocks"][cold_b].contiguous().to(dtype=torch.float32),
+                cold_b_absmax_cpu,
                 dtype=torch.float32,
                 layer_idx=layer_idx,
                 tag=f"{tag_prefix}_b_absmax",
@@ -4175,6 +4193,117 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         param["absmax"] = absmax_cpu
         param["absmax_blocks"] = absmax_cpu.view(blocks_per_col, absmax_per_block)
         return param
+
+    def _load_down_proj_cold_cols(
+        self,
+        down_param: dict,
+        cold_blocks: torch.Tensor,
+        *,
+        H_out: int,
+        bytes_per_row: int,
+        bytes_per_cblk: int,
+        absmax_per_row: int,
+        block_size: int,
+        qbs: int,
+        down_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (cold_packed_cpu, cold_absmax_cpu) for down_proj cold column blocks.
+
+        Checks _down_proj_col_cache first so that layers whose column blocks were
+        already extracted (during a previous token or pre_warm) never trigger a
+        full 436 MB weight reload from SSD.  Only blocks absent from the cache go
+        through _materialize_sparse_4bit_param_raw_views; their slices are then
+        stored in the cache for all future tokens (~320 KB per block entry).
+
+        After the first decode token the cache covers all commonly-active blocks,
+        eliminating the 17×436 MB/token SSD reads that caused 208 s/token.
+        """
+        cold_list = cold_blocks.tolist()
+        layer_cache = self._down_proj_col_cache.get(down_name)
+
+        # Fast path: every cold block already in CPU cache
+        if layer_cache is not None and all(b in layer_cache for b in cold_list):
+            packed_parts = [layer_cache[b][0] for b in cold_list]
+            absmax_parts = [layer_cache[b][1] for b in cold_list]
+            cold_packed_cpu = torch.stack(packed_parts, dim=1).contiguous()
+            cold_absmax_cpu = torch.stack(absmax_parts, dim=1).contiguous()
+            return cold_packed_cpu, cold_absmax_cpu
+
+        # Need to load the raw weight for the cache-miss blocks
+        miss_blocks = [b for b in cold_list if layer_cache is None or b not in layer_cache]
+
+        down_param_raw = self._materialize_sparse_4bit_param_raw_views(down_param)
+        raw_2d = down_param_raw["packed_weight"].view(H_out, bytes_per_row)
+        absmax_2d = down_param_raw["absmax"].view(H_out, absmax_per_row)
+
+        if layer_cache is None:
+            layer_cache = {}
+            self._down_proj_col_cache[down_name] = layer_cache
+
+        # Extract and cache each missing block individually (~256 KB + 64 KB each)
+        for b in miss_blocks:
+            b_start = int(b) * bytes_per_cblk
+            col_slice = raw_2d[:, b_start : b_start + bytes_per_cblk].contiguous()
+            abs_idx = (int(b) * block_size) // qbs
+            abs_slice = absmax_2d[:, abs_idx : abs_idx + 1].contiguous()
+            layer_cache[b] = (col_slice, abs_slice)
+
+        # Assemble result for ALL cold blocks (hits + newly loaded)
+        packed_parts = [layer_cache[b][0] for b in cold_list]
+        absmax_parts = [layer_cache[b][1] for b in cold_list]
+        cold_packed_cpu = torch.stack(packed_parts, dim=1).contiguous()
+        cold_absmax_cpu = torch.stack(absmax_parts, dim=1).contiguous()
+        return cold_packed_cpu, cold_absmax_cpu
+
+    def _load_cold_blocks_direct(
+        self,
+        param: dict[str, Any],
+        cold_blocks: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load only the requested cold blocks for an NF4 sparse param.
+
+        Uses load_nf4_packed_blocks to read just the needed byte ranges from disk
+        (~13 MB per projection) instead of materializing the full 436 MB weight tensor.
+        absmax is already in _sparse_param_cache (loaded during pre_warm), so no absmax I/O.
+
+        Returns (packed_blocks_cpu, absmax_blocks_cpu_f32).
+        """
+        bytes_per_block = int(param["bytes_per_block"])
+        absmax_per_block = int(param["absmax_per_block"])
+        full_name = str(param.get("full_name", "")).strip()
+        cold_idx = cold_blocks.to(dtype=torch.long)
+
+        absmax_cpu = param.get("absmax_cpu")
+        if absmax_cpu is not None:
+            absmax_blocks = absmax_cpu.reshape(-1, absmax_per_block)
+            cold_absmax_cpu = absmax_blocks[cold_idx].contiguous().to(dtype=torch.float32)
+        else:
+            raw_param = self._materialize_sparse_4bit_param_raw_views(param)
+            return (
+                raw_param["packed_blocks"][cold_idx].contiguous(),
+                raw_param["absmax_blocks"][cold_idx].contiguous().to(dtype=torch.float32),
+            )
+
+        if not full_name:
+            raw_param = self._materialize_sparse_4bit_param_raw_views(param)
+            return (
+                raw_param["packed_blocks"][cold_idx].contiguous(),
+                cold_absmax_cpu,
+            )
+
+        try:
+            cold_packed_cpu = self.loader.load_nf4_packed_blocks(
+                full_name,
+                cold_idx,
+                bytes_per_block=bytes_per_block,
+            )
+            return cold_packed_cpu, cold_absmax_cpu
+        except Exception:
+            raw_param = self._materialize_sparse_4bit_param_raw_views(param)
+            return (
+                raw_param["packed_blocks"][cold_idx].contiguous(),
+                cold_absmax_cpu,
+            )
 
     def _get_sparse_4bit_param(
         self,
@@ -4646,7 +4775,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         qbs = int(down_param["quant_block_size"])
         bytes_per_row = I_in // 2
         bytes_per_cblk = block_size // 2
-        col_b_range = torch.arange(bytes_per_cblk, dtype=torch.long)
         absmax_per_row = I_in // qbs
 
         _down_prefill_mode = str(getattr(self, "_sparse_mlp_prefill_mode", "dense"))
@@ -4707,14 +4835,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 if int(cold_blocks.numel()) > 0 and not _use_down_vram_only:
                     if str(self._traffic_current_phase or "idle") == "decode":
                         self._decode_down_cold_blocks_streamed += int(cold_blocks.numel())
-                    down_param_raw = self._materialize_sparse_4bit_param_raw_views(down_param)
-                    raw_2d_cold = down_param_raw["packed_weight"].view(H_out, bytes_per_row)
-                    absmax_2d_cold = down_param_raw["absmax"].view(H_out, absmax_per_row)
-                    cold_starts = cold_blocks * bytes_per_cblk
-                    cold_idx = (cold_starts.unsqueeze(-1) + col_b_range.unsqueeze(0)).reshape(-1)
-                    cold_packed_cpu = raw_2d_cold[:, cold_idx].reshape(H_out, int(cold_blocks.numel()), bytes_per_cblk).contiguous()
-                    cold_abs_idx = (cold_blocks * block_size) // qbs
-                    cold_absmax_cpu = absmax_2d_cold[:, cold_abs_idx].contiguous()
+                    down_name = str(down_param.get("full_name", "")).strip()
+                    cold_packed_cpu, cold_absmax_cpu = self._load_down_proj_cold_cols(
+                        down_param, cold_blocks,
+                        H_out=H_out, bytes_per_row=bytes_per_row,
+                        bytes_per_cblk=bytes_per_cblk, absmax_per_row=absmax_per_row,
+                        block_size=block_size, qbs=qbs,
+                        down_name=down_name,
+                    )
                     cold_cols_packed = self._copy_cpu_to_gpu(
                         cold_packed_cpu,
                         dtype=torch.uint8,
@@ -4757,14 +4885,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             if str(self._traffic_current_phase or "idle") == "decode":
                 self._decode_down_cold_blocks_streamed += int(ordered_blocks.numel())
 
-            down_param_raw = self._materialize_sparse_4bit_param_raw_views(down_param)
-            raw_2d = down_param_raw["packed_weight"].view(H_out, bytes_per_row)
-            col_b_idx = (ordered_blocks * bytes_per_cblk).unsqueeze(-1) + col_b_range.unsqueeze(0)
-            col_b_idx = col_b_idx.reshape(-1)
-            gathered_down_packed_cpu = raw_2d[:, col_b_idx].reshape(H_out, num_active_blocks, bytes_per_cblk).contiguous()
-            absmax_2d = down_param_raw["absmax"].view(H_out, absmax_per_row)
-            down_abs_idx = (ordered_blocks * block_size) // qbs
-            gathered_down_absmax_cpu = absmax_2d[:, down_abs_idx].contiguous()
+            down_name = str(down_param.get("full_name", "")).strip()
+            gathered_down_packed_cpu, gathered_down_absmax_cpu = self._load_down_proj_cold_cols(
+                down_param, ordered_blocks,
+                H_out=H_out, bytes_per_row=bytes_per_row,
+                bytes_per_cblk=bytes_per_cblk, absmax_per_row=absmax_per_row,
+                block_size=block_size, qbs=qbs,
+                down_name=down_name,
+            )
             try:
                 gathered_down_packed_gpu = self._copy_cpu_to_gpu(
                     gathered_down_packed_cpu,
@@ -5290,8 +5418,18 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
 
                 rows = int(mlp_input.view(-1, mlp_input.shape[-1]).shape[0])
-                hot_blocks_expanded = hot_blocks.unsqueeze(0).expand(rows, -1)
-                return self._sparse_mlp_forward_fast(layer_idx, layer.mlp, mlp_input, hot_blocks_expanded)
+                hot_blocks_1row = hot_blocks.unsqueeze(0)  # [1, K]
+                if rows == 1:
+                    return self._sparse_mlp_forward_fast(layer_idx, layer.mlp, mlp_input, hot_blocks_1row)
+                # Multi-token prefill: Triton kernel only supports seq_len=1.
+                # Process each row independently — attention is already computed for all
+                # tokens together; only MLP needs the per-row workaround.
+                flat_in = mlp_input.view(rows, -1)
+                row_outs = []
+                for _r in range(rows):
+                    _row = flat_in[_r : _r + 1].unsqueeze(0)
+                    row_outs.append(self._sparse_mlp_forward_fast(layer_idx, layer.mlp, _row, hot_blocks_1row))
+                return torch.cat(row_outs, dim=1).view_as(mlp_input)
 
             return self._dense_guard_mlp_forward_exact_chunked_4bit(layer_idx, layer.mlp, mlp_input)
         if layer_idx in self._sparse_routing:
@@ -7360,17 +7498,23 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
             if reuse_prefix_len <= 0:
                 self.reset_caches()
+                _skip_calib = os.getenv("STREAMING_SKIP_LIVE_CALIBRATION", "").strip().lower() in {"1", "true", "yes"}
                 if (
                     getattr(self, "_vram_hot_cache_enabled", False)
                     and prompt_len > 0
                     and not bool(getattr(self, "_vram_hot_cache_live_calibrated", False))
+                    and not _skip_calib
                 ):
                     self.calibrate_vram_hot_cache(
                         prompt_ids_cpu,
-                        max_tokens=16,
+                        max_tokens=256,
                         rebuild_cache=True,
-                        generate_decode_tokens=50,
+                        generate_decode_tokens=2,
                     )
+                if _skip_calib and not bool(getattr(self, "_vram_hot_cache_live_calibrated", False)):
+                    print("[hot-cache] skipping live calibration; pre-warming VRAM from static hot-block map", flush=True)
+                    self.pre_warm_vram_hot_cache()
+                    self._vram_hot_cache_live_calibrated = True
                 self._set_traffic_phase("prefill")
                 if prompt_len > 1:
                     print(f"[prompt] batched prefill: {prompt_len} tokens × 1 layer pass", flush=True)

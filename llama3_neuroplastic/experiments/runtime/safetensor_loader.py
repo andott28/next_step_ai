@@ -288,6 +288,67 @@ class ShardedSafetensorLoader:
 
         return out_unique.index_select(0, inverse)
 
+    def load_nf4_packed_blocks(
+        self,
+        name: str,
+        block_indices: torch.Tensor,
+        *,
+        bytes_per_block: int,
+    ) -> torch.Tensor:
+        """Load specific NF4 packed blocks directly from disk without loading the full weight.
+
+        NF4 weights are stored as flat uint8 in safetensors (e.g. shape [N, 1]).
+        Each logical block of `block_size` output rows occupies `bytes_per_block` contiguous
+        bytes.  This method reads only those byte ranges, reducing SSD I/O from ~436 MB to
+        ~13 MB per projection for 51 active blocks out of 1664.
+
+        Falls back to full-weight load when the weight is already in the RAM cache (free).
+        Returns (n_blocks, bytes_per_block) uint8 tensor on CPU.
+        """
+        full_name = str(name)
+        bpb = int(bytes_per_block)
+        idx = block_indices.to(dtype=torch.long).reshape(-1)
+
+        # RAM cache hit: extract blocks from the already-loaded weight (free, no I/O)
+        if self._ram_cache_enabled:
+            with self._ram_cache_lock:
+                cached = self._ram_cache.get(full_name)
+            if cached is not None:
+                weight, _ = cached
+                raw_flat = weight.reshape(-1)
+                packed_blocks = raw_flat.view(-1, bpb)
+                return packed_blocks[idx].contiguous()
+
+        if os.name != "nt":
+            # Non-Windows: load full tensor and extract (no direct seek path needed)
+            weight, _ = self._load_raw_for_param(full_name, store_in_ram_cache=False)
+            raw_flat = weight.reshape(-1)
+            return raw_flat.view(-1, bpb)[idx].contiguous()
+
+        # Windows: direct seek-and-read for only the needed blocks
+        shard_path, data_base, meta = self._get_tensor_direct_meta(full_name)
+        start_offset, _ = meta["data_offsets"]
+
+        idx_sorted, inverse = idx.sort()
+        n_blocks = int(idx_sorted.numel())
+        if n_blocks == 0:
+            return torch.empty((0, bpb), dtype=torch.uint8)
+
+        out_sorted = torch.empty((n_blocks, bpb), dtype=torch.uint8)
+        file_base = int(data_base) + int(start_offset)
+        with open(str(shard_path), "rb") as f:
+            cursor = 0
+            while cursor < n_blocks:
+                run_start = cursor
+                first_block = int(idx_sorted[cursor].item())
+                cursor += 1
+                while cursor < n_blocks and int(idx_sorted[cursor].item()) == first_block + (cursor - run_start):
+                    cursor += 1
+                f.seek(file_base + first_block * bpb)
+                _readinto_cpu_tensor(f, out_sorted[run_start:cursor])
+
+        return out_sorted.index_select(0, inverse)
+
     def _load_exact_tensors(self, names: Sequence[str]) -> dict[str, torch.Tensor]:
         requested = [str(name) for name in names if str(name) in self._available_names]
         by_shard: dict[str, list[str]] = defaultdict(list)

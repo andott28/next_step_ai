@@ -19,7 +19,8 @@
       "Bash(ls *.pt)",
       "Bash(python3 -)",
       "Bash(verification_env/Scripts/python.exe -m llama3_neuroplastic.experiments.benchmark --model-name \"unsloth/Meta-Llama-3.1-405B-Instruct-bnb-4bit\" --sparse-basis-path results/mlp_basis_intermediate_full126.pt --attn-head-importance-path results/attn_head_importance_405b.pt --taylor-layers none --max-new-tokens 5 --warmup-tokens 2 --output-json results/benchmark.json)",
-      "Bash(python -m llama3_neuroplastic.experiments.verify_sparse_mlp_generation_pair --help)"
+      "Bash(python -m llama3_neuroplastic.experiments.verify_sparse_mlp_generation_pair --help)",
+      "Bash(taskkill /F /IM python.exe)"
     ],
     "additionalDirectories": [
       "c:\\Users\\andre\\.claude\\plans"
