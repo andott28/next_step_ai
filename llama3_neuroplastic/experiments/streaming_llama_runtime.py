@@ -444,14 +444,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._vram_hot_cache_pressure_warned: bool = False
         self._vram_hot_cache_oom_warned: bool = False
         self._vram_hot_cache_disable_reason: str | None = None
-        self._vram_hot_cache_margin_bytes: int = int(1.0 * (1024 ** 3))
+        _margin_gb = float(os.getenv("STREAMING_VRAM_MARGIN_GB", "0.35"))
+        self._vram_hot_cache_margin_bytes: int = int(_margin_gb * (1024 ** 3))
         if self.device.type == "cuda":
             try:
                 _, _vram_total = torch.cuda.mem_get_info(self.device)
 
                 self._vram_hot_cache_margin_bytes = max(
                     self._vram_hot_cache_margin_bytes,
-                    int(float(_vram_total) * 0.05),
+                    int(float(_vram_total) * 0.04),
                 )
             except Exception:
                 pass
@@ -495,6 +496,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._down_proj_col_cache: dict[str, OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         # Phase 4: pre-routed MLP block indices (keyed by layer_idx) for H2D prefetch overlap
         self._mlp_prefetch_active_blocks: dict[int, torch.Tensor] = {}
+        self._decode_prefetch_route_cache: dict[int, torch.Tensor] = {}
         _target_layer_mb_raw = os.getenv("STREAMING_TARGET_LAYER_MB", "").strip()
         try:
             self._target_layer_traffic_mb = float(_target_layer_mb_raw) if _target_layer_mb_raw else 30.0
@@ -5901,10 +5903,12 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             # Always route from mlp_input (post-attention) for correctness.
             # Pre-routed blocks (from hidden_norm pre-attention) are in
             # _sparse_block_transfer_cache as H2D cache hits when routing matches.
-            self._mlp_prefetch_active_blocks.pop(int(layer_idx), None)
-            active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
-            if active_blocks is None:
-                raise RuntimeError(f"Sparse basis routing disappeared for layer {int(layer_idx)}")
+        self._mlp_prefetch_active_blocks.pop(int(layer_idx), None)
+        active_blocks = self._route_sparse_mlp(mlp_input, layer_idx)
+        if active_blocks is None:
+            raise RuntimeError(f"Sparse basis routing disappeared for layer {int(layer_idx)}")
+        if str(self._traffic_current_phase or "idle") == "decode":
+            self._decode_prefetch_route_cache[int(layer_idx)] = active_blocks
             self._record_hot_cache_calibration_blocks(layer_idx, active_blocks)
             _mlp_out = self._sparse_mlp_forward_fast(layer_idx, layer.mlp, mlp_input, active_blocks)
         else:
@@ -7780,7 +7784,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 ):
                     _next_layer_idx = int(layer_idx) + 1
                     if _next_layer_idx < int(self.num_layers) and _next_layer_idx in self._sparse_routing:
-                        _next_prefetch_blocks = self._mlp_hot_blocks_by_layer.get(_next_layer_idx)
+                        _next_prefetch_blocks = self._decode_prefetch_route_cache.get(_next_layer_idx)
+                        if _next_prefetch_blocks is None or int(_next_prefetch_blocks.numel()) <= 0:
+                            _next_prefetch_blocks = self._mlp_hot_blocks_by_layer.get(_next_layer_idx)
                         if _next_prefetch_blocks is None or int(_next_prefetch_blocks.numel()) <= 0:
                             _next_prefetch_blocks = self._route_sparse_mlp(hidden, _next_layer_idx)
                         if _next_prefetch_blocks is not None:

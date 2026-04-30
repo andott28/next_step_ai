@@ -171,6 +171,8 @@ class RuntimeSessionMixin:
     def reset_caches(self) -> None:
         self._taylor_caches = [None for _ in range(self.num_layers)]
         self._dense_cache = DynamicCache(config=self.config) if DynamicCache is not None else None
+        if hasattr(self, "_decode_prefetch_route_cache"):
+            self._decode_prefetch_route_cache.clear()
         if hasattr(self, "_compact_attn_cache"):
             self._compact_attn_cache.clear()
         if self._token_archive is not None:
@@ -298,7 +300,12 @@ class RuntimeSessionMixin:
         self.reset_decode_profiler()
 
     def _set_traffic_phase(self, phase: str) -> None:
-        self._traffic_current_phase = str(phase or "other")
+        prev_phase = str(self._traffic_current_phase or "other")
+        next_phase = str(phase or "other")
+        self._traffic_current_phase = next_phase
+        if prev_phase == "decode" and next_phase != "decode":
+            if hasattr(self, "_decode_prefetch_route_cache"):
+                self._decode_prefetch_route_cache.clear()
 
     def _record_layer_visit(self, layer_idx: int) -> None:
         phase = str(self._traffic_current_phase or "other")

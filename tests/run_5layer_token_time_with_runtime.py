@@ -25,9 +25,11 @@ def build_runtime() -> StreamingLlamaRuntime:
 
 def prewarm_and_seed(rt: StreamingLlamaRuntime) -> None:
     rt.reset_caches()
+    if rt.device.type == "cuda":
+        torch.cuda.empty_cache()
     orig_num_layers = rt.num_layers
     rt.num_layers = 5
-    rt._traffic_current_phase = "decode"
+    rt._set_traffic_phase("decode")
     try:
         rt.pre_warm_vram_hot_cache()
 
