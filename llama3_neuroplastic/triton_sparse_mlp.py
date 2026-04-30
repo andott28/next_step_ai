@@ -205,6 +205,8 @@ def materialize_linear_4bit_params(
     in_features = int(quant_state.shape[1])
     quant_block_size = int(quant_state.blocksize)
     quant_type = str(quant_state.quant_type)
+    if str(quant_type).lower() != "nf4":
+        raise RuntimeError(f"Only NF4 quant_type is supported on this Triton sparse path, got {quant_type!r}")
     return packed, absmax, code, out_features, in_features, quant_block_size, quant_type
 
 
@@ -257,13 +259,17 @@ if _TRITON_AVAILABLE:
     ]
     # SM75: num_stages=1 only — no async copy benefit, double-buffering wastes registers
     _OUTPUT_4BIT_TILE_CONFIGS_SM75 = [
-        triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_OUT": 32, "BLOCK_K": 32}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_OUT": 64, "BLOCK_K": 32}, num_warps=2, num_stages=1),
     ]
 
-    @triton.autotune(configs=_INPUT_TILE_CONFIGS, key=["out_features", "block_size", "top_k"])
+    @triton.autotune(
+        configs=_INPUT_TILE_CONFIGS,
+        key=["out_features", "block_size", "top_k"],
+        reset_to_zero=["out_ptr"],
+    )
     @triton.jit
     def _sparse_input_linear_tiled_kernel(
         x_ptr,
@@ -367,7 +373,11 @@ if _TRITON_AVAILABLE:
         tl.atomic_add(out_ptrs, acc, mask=offs_out < out_features)
 
 
-    @triton.autotune(configs=_OUTPUT_TILE_CONFIGS, key=["input_dim", "block_size"])
+    @triton.autotune(
+        configs=_OUTPUT_TILE_CONFIGS,
+        key=["input_dim", "block_size"],
+        reset_to_zero=["out_ptr"],
+    )
     @triton.jit
     def _sparse_output_linear_kernel(
         x_ptr,
@@ -424,7 +434,11 @@ if _TRITON_AVAILABLE:
         tl.store(out_ptrs, acc, mask=valid_out)
 
 
-    @triton.autotune(configs=_INPUT_4BIT_TILE_CONFIGS, key=["out_features", "block_size", "top_k"])
+    @triton.autotune(
+        configs=_INPUT_4BIT_TILE_CONFIGS,
+        key=["out_features", "block_size", "top_k"],
+        reset_to_zero=["out_ptr"],
+    )
     @triton.jit
     def _sparse_input_linear_4bit_tiled_kernel(
         x_ptr,
@@ -478,7 +492,8 @@ if _TRITON_AVAILABLE:
                 x_ptrs = x_ptr + row * stride_x_row + in_idx
                 x = tl.load(x_ptrs, mask=in_valid, other=0.0).to(tl.float32)
 
-                elem_idx = out_idx * in_features + in_idx[None, :]
+                # NF4 payload is produced from weight.t() -> logical layout [in_features, out_features].
+                elem_idx = in_idx[None, :] * out_features + out_idx
                 pair_idx = elem_idx >> 1
                 valid = out_mask[:, None] & in_valid[None, :]
 
@@ -541,7 +556,8 @@ if _TRITON_AVAILABLE:
 
         out_idx = offs_out[:, None]
         in_idx_2d = in_idx[None, :]
-        elem_idx = out_idx * in_features + in_idx_2d
+        # NF4 payload is produced from weight.t() -> logical layout [in_features, out_features].
+        elem_idx = in_idx_2d * out_features + out_idx
         pair_idx = elem_idx >> 1
         valid = (offs_out[:, None] < out_features) & in_valid[None, :]
 
@@ -559,7 +575,11 @@ if _TRITON_AVAILABLE:
         tl.atomic_add(out_ptrs, acc, mask=offs_out < out_features)
 
 
-    @triton.autotune(configs=_OUTPUT_4BIT_TILE_CONFIGS, key=["input_dim", "block_size", "quant_block_size"])
+    @triton.autotune(
+        configs=_OUTPUT_4BIT_TILE_CONFIGS,
+        key=["input_dim", "block_size", "quant_block_size"],
+        reset_to_zero=["out_ptr"],
+    )
     @triton.jit
     def _sparse_output_linear_4bit_kernel(
         x_ptr,
@@ -611,7 +631,8 @@ if _TRITON_AVAILABLE:
             x_ptrs = x_ptr + row * stride_x_row + offs_k
             x = tl.load(x_ptrs, mask=valid_k, other=0.0).to(tl.float32)
 
-            elem_idx = out_idx * input_dim + offs_k[None, :]
+            # NF4 payload is produced from weight.t() -> logical layout [input_dim, block_size].
+            elem_idx = offs_k[None, :] * block_size + out_idx
             pair_idx = elem_idx >> 1
             valid = valid_out[:, None] & valid_k[None, :]
 
@@ -631,7 +652,11 @@ if _TRITON_AVAILABLE:
 
 
     # SM75 (Turing) variant: num_stages=1 in inner loop — no async copy, saves register budget
-    @triton.autotune(configs=_OUTPUT_4BIT_TILE_CONFIGS_SM75, key=["input_dim", "block_size", "quant_block_size"])
+    @triton.autotune(
+        configs=_OUTPUT_4BIT_TILE_CONFIGS_SM75,
+        key=["input_dim", "block_size", "quant_block_size"],
+        reset_to_zero=["out_ptr"],
+    )
     @triton.jit
     def _sparse_output_linear_4bit_kernel_sm75(
         x_ptr,
@@ -684,7 +709,8 @@ if _TRITON_AVAILABLE:
             x_ptrs = x_ptr + row * stride_x_row + offs_k
             x = tl.load(x_ptrs, mask=valid_k, other=0.0).to(tl.float32)
 
-            elem_idx = out_idx * input_dim + offs_k[None, :]
+            # NF4 payload is produced from weight.t() -> logical layout [input_dim, block_size].
+            elem_idx = offs_k[None, :] * block_size + out_idx
             pair_idx = elem_idx >> 1
             valid = valid_out[:, None] & valid_k[None, :]
 
@@ -758,7 +784,8 @@ if _TRITON_AVAILABLE:
                 x_ptrs = x_ptr + row * stride_x_row + in_idx
                 x = tl.load(x_ptrs, mask=in_valid, other=0.0).to(tl.float32)
 
-                elem_idx = out_idx * in_features + in_idx[None, :]
+                # NF4 payload is produced from weight.t() -> logical layout [in_features, out_features].
+                elem_idx = in_idx[None, :] * out_features + out_idx
                 pair_idx = elem_idx >> 1
                 valid = out_mask[:, None] & in_valid[None, :]
 
@@ -1049,24 +1076,10 @@ def triton_sparse_input_linear(
     *,
     block_size: int,
 ) -> torch.Tensor:
-    x_flat = _prepare_activation_tensor(x_flat)
-    active_idx = _prepare_active_idx(active_idx, device=x_flat.device)
-
-    if weight is None:
-        if linear is None:
-            raise ValueError("Either linear or weight must be provided to triton_sparse_input_linear")
-        weight = materialize_linear_weight(
-            linear,
-            device=x_flat.device,
-            dtype=_resolve_weight_dtype(x_flat),
-        )
-    else:
-        weight = weight.to(device=x_flat.device, dtype=_resolve_weight_dtype(x_flat)).contiguous()
-    if bias is None and linear is not None:
-        bias = materialize_linear_bias(linear, device=x_flat.device, dtype=x_flat.dtype)
-    elif bias is not None:
-        bias = bias.to(device=x_flat.device, dtype=x_flat.dtype).contiguous()
-    return _SparseInputLinearFn.apply(x_flat, active_idx, weight, bias, int(block_size))
+    raise RuntimeError(
+        "Dense triton_sparse_input_linear path is disabled. "
+        "Only explicit NF4 route triton_sparse_input_linear_4bit is supported."
+    )
 
 
 def triton_sparse_output_linear(
@@ -1079,25 +1092,10 @@ def triton_sparse_output_linear(
     *,
     block_size: int,
 ) -> torch.Tensor:
-    x_flat = _prepare_activation_tensor(x_flat)
-    active_idx = _prepare_active_idx(active_idx, device=x_flat.device)
-    flat_mask = _prepare_mask(flat_mask, device=x_flat.device)
-
-    if weight is None:
-        if linear is None:
-            raise ValueError("Either linear or weight must be provided to triton_sparse_output_linear")
-        weight = materialize_linear_weight(
-            linear,
-            device=x_flat.device,
-            dtype=_resolve_weight_dtype(x_flat),
-        )
-    else:
-        weight = weight.to(device=x_flat.device, dtype=_resolve_weight_dtype(x_flat)).contiguous()
-    if bias is None and linear is not None:
-        bias = materialize_linear_bias(linear, device=x_flat.device, dtype=x_flat.dtype)
-    elif bias is not None:
-        bias = bias.to(device=x_flat.device, dtype=x_flat.dtype).contiguous()
-    return _SparseOutputLinearFn.apply(x_flat, active_idx, weight, bias, flat_mask, int(block_size))
+    raise RuntimeError(
+        "Dense triton_sparse_output_linear path is disabled. "
+        "Only explicit NF4 route triton_sparse_output_linear_4bit is supported."
+    )
 
 
 class _SparseInputLinear4bitFn(torch.autograd.Function):
@@ -1121,6 +1119,12 @@ class _SparseInputLinear4bitFn(torch.autograd.Function):
 
         rows = int(x_flat.shape[0])
         top_k = int(active_idx.shape[1])
+        if int(block_size) <= 0:
+            raise RuntimeError("block_size must be > 0 for triton_sparse_input_linear_4bit")
+        if int(in_features) % int(block_size) != 0:
+            raise RuntimeError(
+                f"in_features ({int(in_features)}) must be divisible by block_size ({int(block_size)})"
+            )
         out = torch.empty((rows, int(out_features)), device=x_flat.device, dtype=x_flat.dtype)
 
         if rows == 0 or int(out_features) == 0:
@@ -1243,6 +1247,12 @@ class _SparseOutputLinear4bitFn(torch.autograd.Function):
         rows = int(x_flat.shape[0])
         hidden_size = int(flat_mask.shape[1])
         top_k = int(active_idx.shape[1])
+        if int(block_size) <= 0:
+            raise RuntimeError("block_size must be > 0 for triton_sparse_output_linear_4bit")
+        if int(input_dim) % int(block_size) != 0:
+            raise RuntimeError(
+                f"input_dim ({int(input_dim)}) must be divisible by block_size ({int(block_size)})"
+            )
         out = torch.zeros((rows, hidden_size), device=x_flat.device, dtype=x_flat.dtype)
 
         if rows > 0 and top_k > 0:

@@ -180,16 +180,17 @@ def _tensor_byte_view_cpu(tensor: torch.Tensor) -> torch.Tensor:
 def _readinto_cpu_tensor(file_obj: Any, tensor: torch.Tensor) -> None:
     byte_view = _tensor_byte_view_cpu(tensor)
     target_np = byte_view.numpy()
+    target_mv = memoryview(target_np).cast("B")
     offset = 0
     total = int(byte_view.numel())
     chunk_bytes = 8 * 1024 * 1024
     while offset < total:
         want = min(chunk_bytes, total - offset)
-        chunk_np = np.fromfile(file_obj, dtype=np.uint8, count=int(want))
-        got = int(chunk_np.size)
+        chunk = file_obj.read(int(want))
+        got = len(chunk)
         if got <= 0:
             raise EOFError(f"Unexpected EOF while reading {total} bytes from safetensors shard")
-        target_np[offset : offset + got] = chunk_np
+        target_mv[offset : offset + got] = chunk
         offset += got
 
 

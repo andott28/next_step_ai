@@ -6,10 +6,13 @@ import os
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
+
+if os.getenv("STREAMING_TORCHINDUCTOR_MAX_AUTOTUNE", "").strip().lower() in {"1", "true", "yes", "on"}:
+    os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "1")
 
 import bitsandbytes.functional as bnb_functional
 import torch
@@ -216,6 +219,27 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             "yes",
             "on",
         }
+        self._debug_sparse_mlp_phase_timing = (
+            os.getenv("STREAMING_DEBUG_SPARSE_MLP_PHASE_TIMING", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._debug_compact_attn_phase_timing = (
+            os.getenv("STREAMING_DEBUG_COMPACT_ATTN_PHASE_TIMING", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._debug_decode_token_overhead = (
+            os.getenv("STREAMING_DEBUG_DECODE_TOKEN_OVERHEAD", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._profile_decode_overhead = (
+            os.getenv("STREAMING_PROFILE_DECODE_OVERHEAD", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._enable_decode_lookahead_prefetch = (
+            os.getenv("STREAMING_ENABLE_DECODE_LOOKAHEAD_PREFETCH", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._triton_sparse_mlp_path_logged = False
         self._sparse_basis_bias_mode = os.getenv("STREAMING_SPARSE_BIAS_MODE", "selected").strip().lower() or "selected"
         if self._sparse_basis_bias_mode not in {"selected", "none"}:
             raise RuntimeError(
@@ -312,12 +336,39 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._h2d_stream: torch.cuda.Stream | None = (
             torch.cuda.Stream(device=self.device) if self._enable_cuda_h2d_overlap else None
         )
+        self._h2d_stream_down: torch.cuda.Stream | None = (
+            torch.cuda.Stream(device=self.device) if self._enable_cuda_h2d_overlap else None
+        )
+        self._h2d_pinned_bytes = 0
+        self._h2d_unpinned_bytes = 0
+        self._enable_kv_route_overlap = (
+            os.getenv("STREAMING_ENABLE_KV_ROUTE_OVERLAP", "1").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._kv_route_stream: torch.cuda.Stream | None = (
+            torch.cuda.Stream(device=self.device)
+            if (self.device.type == "cuda" and self._enable_kv_route_overlap)
+            else None
+        )
         self._lm_head_gpu_attempted = False
         self._lm_head_nf4_meta_gpu: dict[str, Any] | None = None
         self._prefer_gpu_quant_lm_head = self.device.type == "cuda"
-        self._compact_sparse_attn_decode = self.device.type == "cuda"
+        _compact_attn_env = os.getenv("STREAMING_COMPACT_SPARSE_ATTN_DECODE", "").strip().lower()
+        if _compact_attn_env in {"0", "false", "no", "off"}:
+            self._compact_sparse_attn_decode = False
+        elif _compact_attn_env in {"1", "true", "yes", "on"}:
+            self._compact_sparse_attn_decode = self.device.type == "cuda"
+        else:
+            self._compact_sparse_attn_decode = self.device.type == "cuda"
         self._compact_attn_cache: dict[int, dict[str, torch.Tensor | None]] = {}
+        self._compact_attn_weight_cache: dict[int, dict[str, Any]] = {}
         self._compact_attn_decode_steps = 0
+        self._compact_attn_kv_window = max(
+            0, int(os.getenv("STREAMING_COMPACT_ATTN_KV_WINDOW", "128").strip() or "128")
+        )
+        self._compact_attn_path_logged = False
+        self._compact_attn_flash_checked = False
+        self._dense_attn_fallback_logged = False
         self.num_layers = int(getattr(self.config, "num_hidden_layers", 0))
         if self.num_layers <= 0:
             raise RuntimeError("Invalid llama config: num_hidden_layers must be > 0")
@@ -434,7 +485,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         # CPU-side column cache for down_proj cold blocks.  Keyed by (full_name, block_id).
         # Stores (packed_cols_cpu, absmax_cols_cpu) extracted from the weight, so SSD-miss layers
         # only pay the full-weight SSD read ONCE; subsequent tokens hit this cheap CPU buffer.
-        self._down_proj_col_cache: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        self._down_proj_col_cache_max_blocks_per_layer = 64
+        _down_proj_col_cache_cap_env = os.getenv("STREAMING_DOWN_PROJ_COL_CACHE_MAX_BLOCKS", "").strip()
+        if _down_proj_col_cache_cap_env:
+            try:
+                self._down_proj_col_cache_max_blocks_per_layer = max(1, int(_down_proj_col_cache_cap_env))
+            except ValueError:
+                self._down_proj_col_cache_max_blocks_per_layer = 64
+        self._down_proj_col_cache: dict[str, OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         # Phase 4: pre-routed MLP block indices (keyed by layer_idx) for H2D prefetch overlap
         self._mlp_prefetch_active_blocks: dict[int, torch.Tensor] = {}
         _target_layer_mb_raw = os.getenv("STREAMING_TARGET_LAYER_MB", "").strip()
@@ -1133,6 +1191,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._attn_zero_only_layers: set[int] = set()
         self._attn_sparse_disabled_reason: str | None = None
 
+        self._decode_mlp_hot_blocks_hit: int = 0
+        self._decode_mlp_cold_blocks_streamed: int = 0
+        self._decode_down_hot_blocks_hit: int = 0
+        self._decode_down_cold_blocks_streamed: int = 0
 
         self._attn_sparse_param_meta: dict[str, dict[str, Any]] = {}
         self._attn_hot_head_cache: dict[int, dict[str, Any]] = {}
@@ -1708,6 +1770,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 if decode_profile_report is not None
                 else {}
             ),
+            "h2d_pinned_bytes": int(getattr(self, "_h2d_pinned_bytes", 0)),
+            "h2d_unpinned_bytes": int(getattr(self, "_h2d_unpinned_bytes", 0)),
+            "h2d_unpinned_mb": float(getattr(self, "_h2d_unpinned_bytes", 0)) / float(1024 ** 2),
             "runtime_events": self.get_runtime_events(),
         }
 
@@ -1950,17 +2015,74 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         cached_layers = 0
         try:
             # --- Tier 1: MLP gate / up / down hot blocks ---
+            col_cache_warmed = 0
+            preexisting_col_layers = len(self._down_proj_col_cache)
+            should_build_col_cache = preexisting_col_layers == 0
             for layer_idx in range(self.num_layers):
                 prefix = f"model.layers.{layer_idx}.mlp."
                 new_this_layer = False
                 for proj in ("gate_proj.weight", "up_proj.weight", "down_proj.weight"):
                     full_name = f"{prefix}{proj}"
                     if full_name not in self._vram_nf4_cache:
-                        self._get_sparse_4bit_param(full_name, store_raw_in_ram_cache=True)
+                        keep_raw_in_ram = proj == "down_proj.weight"
+                        self._get_sparse_4bit_param(
+                            full_name,
+                            store_raw_in_ram_cache=keep_raw_in_ram,
+                        )
                         if full_name in self._vram_nf4_cache:
                             new_this_layer = True
                 if new_this_layer:
                     cached_layers += 1
+
+                # Tier 1b: CPU column-cache pre-warm for down_proj cold blocks.
+                # The full down_proj weight is guaranteed to be in the RAM LRU cache
+                # right after _get_sparse_4bit_param above — extract cold column
+                # slices now so decode token 1 doesn't hit the SSD at all.
+                down_name = f"{prefix}down_proj.weight"
+                down_param = self._sparse_param_cache.get(down_name)
+                routing_blocks = self._mlp_hot_blocks_by_layer.get(layer_idx)
+                if (
+                    should_build_col_cache
+                    and down_param is not None
+                    and routing_blocks is not None
+                    and int(routing_blocks.numel()) > 0
+                    and down_name not in self._down_proj_col_cache
+                ):
+                    vram_hot_down = down_param.get("vram_hot_down")
+                    if vram_hot_down is not None:
+                        lookup = vram_hot_down["lookup_cpu"]
+                        cold_mask = lookup.index_select(
+                            0, routing_blocks.to(dtype=torch.long)
+                        ) < 0
+                        cold_blocks = routing_blocks[cold_mask].contiguous()
+                    else:
+                        cold_blocks = routing_blocks.contiguous()
+                    H_out = int(down_param.get("out_features", 0))
+                    I_in = int(down_param.get("in_features", 0))
+                    qbs = int(down_param.get("quant_block_size", 64))
+                    bprow = int(down_param.get("bytes_per_row", I_in // 2))
+                    bpcblk = int(self._sparse_block_size) // 2
+                    absmaxpr = int(down_param.get("absmax_per_row", I_in // max(qbs, 1)))
+                    if H_out > 0 and I_in > 0 and int(cold_blocks.numel()) > 0:
+                        with contextlib.suppress(Exception):
+                            self._load_down_proj_cold_cols(
+                                down_param, cold_blocks,
+                                H_out=H_out,
+                                bytes_per_row=bprow,
+                                bytes_per_cblk=bpcblk,
+                                absmax_per_row=absmaxpr,
+                                block_size=int(self._sparse_block_size),
+                                qbs=qbs,
+                                down_name=down_name,
+                            )
+                            col_cache_warmed += 1
+                            # _load_down_proj_cold_cols called _materialize_sparse_4bit_param_raw_views
+                            # which stored the full 436 MB packed_weight into down_param. With 126
+                            # layers that is ~55 GB of live references that prevent GC. Drop them now
+                            # that the col-cache has all the slices we need.
+                            down_param.pop("packed_weight", None)
+                            down_param.pop("packed_blocks", None)
+
                 print(
                     f"\r[pre-warm] {layer_idx + 1}/{self.num_layers} layers "
                     f"| VRAM used: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB",
@@ -1969,7 +2091,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 )
             print(
                 f"\n[pre-warm] complete — {cached_layers} MLP layers cached, "
-                f"VRAM hot-cache: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB",
+                f"VRAM hot-cache: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB"
+                f" | CPU col-cache: {col_cache_warmed if should_build_col_cache else preexisting_col_layers} down_proj layers",
                 flush=True,
             )
 
@@ -1992,8 +2115,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                         flush=True,
                     )
 
-            # --- Tier 3: sparse Q/O head slices ---
-            if self._attn_active_head_indices and self._vram_hot_cache_enabled:
+            # --- Tier 2b: sparse Q/O CPU row-cache pre-warm ---
+            # Build the per-layer active-head CPU slice cache once at startup so
+            # decode token 1 never re-opens safetensors from SSD for q/o slices.
+            if self._attn_active_head_indices:
                 head_dim = int(
                     getattr(self.config, "head_dim", None)
                     or (
@@ -2001,29 +2126,59 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                         // int(getattr(self.config, "num_attention_heads", 32))
                     )
                 )
-                qo_cached = 0
+                hidden_size = int(getattr(self.config, "hidden_size", 16384))
+                qo_cpu_warmed = 0
                 for layer_idx in range(self.num_layers):
-                    if int(layer_idx) in self._attn_hot_head_cache:
+                    if self._should_use_attn_share_for_layer(layer_idx):
                         continue
-                    attn_prefix = f"model.layers.{layer_idx}.self_attn."
-                    q_name = f"{attn_prefix}q_proj.weight"
-                    o_name = f"{attn_prefix}o_proj.weight"
+                    active_heads = self._get_attn_active_heads(layer_idx)
+                    if active_heads is None or int(active_heads.numel()) <= 0:
+                        continue
                     with contextlib.suppress(Exception):
-                        meta_q = self._get_sparse_4bit_attn_meta(q_name, head_dim=head_dim)
-                        meta_o = self._get_sparse_4bit_attn_meta(o_name, head_dim=head_dim)
-                        result = self._maybe_cache_sparse_attn_hot_heads(
+                        self._load_sparse_attn_heads(
                             layer_idx=layer_idx,
-                            q_name=q_name,
-                            o_name=o_name,
-                            meta_q=meta_q,
-                            meta_o=meta_o,
+                            active_heads=active_heads,
+                            head_dim=head_dim,
+                            hidden_size=hidden_size,
+                            prewarm_only=True,
                         )
-                        if result is not None:
-                            qo_cached += 1
-                if qo_cached > 0:
+                        qo_cpu_warmed += 1
+                if qo_cpu_warmed > 0:
                     print(
-                        f"[pre-warm] cached sparse Q/O heads for {qo_cached} layers "
-                        f"| VRAM used: {self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB",
+                        f"[pre-warm] cached sparse Q/O CPU slices for {qo_cpu_warmed} layers "
+                        f"| CPU row-cache entries: {len(self._sparse_attn_cpu_row_cache)}",
+                        flush=True,
+                    )
+            prewarm_compact_attn_proj = bool(
+                os.getenv("STREAMING_PREWARM_COMPACT_ATTN_PROJ", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if (
+                prewarm_compact_attn_proj
+                and self._attn_active_head_indices
+                and self._compact_sparse_attn_decode
+            ):
+                compact_proj_warmed = 0
+                for layer_idx in range(self.num_layers):
+                    if self._should_use_attn_share_for_layer(layer_idx):
+                        continue
+                    active_heads = self._get_attn_active_heads(layer_idx)
+                    if active_heads is None or int(active_heads.numel()) <= 0:
+                        continue
+                    with contextlib.suppress(Exception):
+                        self._load_layer(layer_idx)
+                        self._prime_compact_attn_projection_cache(
+                            layer_idx=layer_idx,
+                            layer=self._layer_skeleton,
+                            active_heads=active_heads,
+                            head_dim=head_dim,
+                        )
+                        _ = self._layer_skeleton.self_attn.k_proj.weight.view(-1)[:1]
+                        _ = self._layer_skeleton.self_attn.v_proj.weight.view(-1)[:1]
+                        compact_proj_warmed += 1
+                if compact_proj_warmed > 0:
+                    print(
+                        f"[pre-warm] primed compact-attn QKV/O projection cache for {compact_proj_warmed} layers",
                         flush=True,
                     )
         finally:
@@ -2245,6 +2400,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         prev_active = self._hot_cache_calibration_active
         self._hot_cache_calibration_hits = {}
         self._hot_cache_calibration_active = True
+        # Ensure decode counters exist before any forward pass in decode phase.
+        if not hasattr(self, "_decode_mlp_hot_blocks_hit"):
+            self._decode_mlp_hot_blocks_hit = 0
+        if not hasattr(self, "_decode_mlp_cold_blocks_streamed"):
+            self._decode_mlp_cold_blocks_streamed = 0
+        if not hasattr(self, "_decode_down_hot_blocks_hit"):
+            self._decode_down_hot_blocks_hit = 0
+        if not hasattr(self, "_decode_down_cold_blocks_streamed"):
+            self._decode_down_cold_blocks_streamed = 0
         try:
             self.reset_caches()
             # Build KV cache token-by-token using the decode path (seq_len=1 per call).
@@ -2368,6 +2532,22 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             free_bytes = max(int(sys_free_bytes), int(allocator_free_bytes))
         except Exception:
             return True
+
+        # If the driver itself reports effectively no headroom, stop growing the
+        # hot cache even when PyTorch's allocator bookkeeping still looks healthy.
+        # This avoids WDDM-era native allocation failures during pre-warm.
+        if int(sys_free_bytes) <= int(self._vram_hot_cache_margin_bytes):
+            if not self._vram_hot_cache_pressure_warned:
+                self._vram_hot_cache_pressure_warned = True
+                print(
+                    "[sparse] VRAM hot-cache auto-clamp engaged: "
+                    f"used={self._vram_hot_cache_used_bytes / (1024 ** 3):.2f} GB, "
+                    f"sys_free={int(sys_free_bytes) / (1024 ** 3):.2f} GB, "
+                    f"allocator_free={int(allocator_free_bytes) / (1024 ** 3):.2f} GB, "
+                    f"margin={self._vram_hot_cache_margin_bytes / (1024 ** 3):.2f} GB.",
+                    flush=True,
+                )
+            return False
 
         dynamic_limit = self._vram_hot_cache_used_bytes + max(
             int(free_bytes) - int(self._vram_hot_cache_margin_bytes), 0
@@ -3015,7 +3195,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             if banked_mask.any():
                 scores[:, banked_mask.to(device=scores.device)] = float("-inf")
         top_k = max(1, min(top_k, int(scores.shape[-1])))
-        return scores.topk(top_k, dim=-1).indices
+        return scores.topk(top_k, dim=-1).indices.to(device="cpu", dtype=torch.long)
 
     def _load_sparse_kv(
         self,
@@ -3177,11 +3357,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         k_weight = layer.self_attn.k_proj.weight
         v_weight = layer.self_attn.v_proj.weight
 
-
-        if active_col_blocks.shape[0] == 1:
-            blocks_cpu = active_col_blocks[0].cpu()
+        active_col_blocks_cpu = (
+            active_col_blocks
+            if active_col_blocks.device.type == "cpu"
+            else active_col_blocks.to(device="cpu", dtype=torch.long)
+        )
+        if active_col_blocks_cpu.shape[0] == 1:
+            blocks_cpu = active_col_blocks_cpu[0]
         else:
-            blocks_cpu = active_col_blocks.reshape(-1).cpu().unique(sorted=True)
+            blocks_cpu = active_col_blocks_cpu.reshape(-1).unique(sorted=True)
         blocks_cpu = blocks_cpu.sort().values
 
         kv_hidden = int(k_weight.shape[0])
@@ -3218,7 +3402,11 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             return
         decay = 0.95
         num_blocks = int(ema.numel())
-        used = active_col_blocks.reshape(-1).cpu()
+        used = (
+            active_col_blocks.reshape(-1)
+            if active_col_blocks.device.type == "cpu"
+            else active_col_blocks.reshape(-1).to(device="cpu", dtype=torch.long)
+        )
         used = used[(used >= 0) & (used < num_blocks)]
         current_usage = torch.zeros(num_blocks, dtype=torch.float32)
         if int(used.numel()) > 0:
@@ -3257,6 +3445,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         dtype: torch.dtype,
         layer_idx: int | None = None,
         tag: str = "h2d",
+        h2d_stream: torch.cuda.Stream | None = None,
     ) -> torch.Tensor:
         scratch_key = self._next_h2d_scratch_key(tag, dtype)
         prepared = self.loader._stage_h2d_source_via_scratch(
@@ -3269,12 +3458,17 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             layer_idx=layer_idx,
             tag=tag,
         )
+        if bool(prepared.is_pinned()):
+            self._h2d_pinned_bytes += int(prepared.numel() * prepared.element_size())
+        else:
+            self._h2d_unpinned_bytes += int(prepared.numel() * prepared.element_size())
         if self.device.type != "cuda":
             return prepared.to(device=self.device, dtype=dtype)
+        target_stream = h2d_stream if h2d_stream is not None else self._h2d_stream
         try:
             out = torch.empty(tuple(prepared.shape), dtype=dtype, device=self.device)
-            if self._h2d_stream is not None:
-                with torch.cuda.stream(self._h2d_stream):
+            if target_stream is not None:
+                with torch.cuda.stream(target_stream):
                     out.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
                     self.loader._record_h2d_scratch_use(scratch_key, device=out.device)
             else:
@@ -3287,16 +3481,13 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
 
             self._disable_vram_hot_cache("cuda_oom_during_h2d_copy")
+            self._disable_h2d_overlap("cuda_oom_during_h2d_copy")
             if self.device.type == "cuda":
+                self._wait_for_h2d_stream()
                 torch.cuda.empty_cache()
             out = torch.empty(tuple(prepared.shape), dtype=dtype, device=self.device)
-            if self._h2d_stream is not None:
-                with torch.cuda.stream(self._h2d_stream):
-                    out.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
-                    self.loader._record_h2d_scratch_use(scratch_key, device=out.device)
-            else:
-                out.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
-                self.loader._record_h2d_scratch_use(scratch_key, device=out.device)
+            out.copy_(prepared, non_blocking=False)
+            self.loader._record_h2d_scratch_use(scratch_key, device=out.device)
             return out
 
     def _copy_cpu_to_existing_gpu(
@@ -3313,14 +3504,37 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         if self.device.type != "cuda":
             dest.copy_(prepared)
             return prepared
-        if self._h2d_stream is not None:
-            with torch.cuda.stream(self._h2d_stream):
+        try:
+            if self._h2d_stream is not None:
+                with torch.cuda.stream(self._h2d_stream):
+                    dest.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
+                    self.loader._record_h2d_scratch_use(scratch_key, device=dest.device)
+            else:
                 dest.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
                 self.loader._record_h2d_scratch_use(scratch_key, device=dest.device)
-        else:
-            dest.copy_(prepared, non_blocking=bool(prepared.is_pinned()))
+        except Exception as _e:
+            if not _is_cuda_oom_error(_e):
+                raise
+            self._disable_vram_hot_cache("cuda_oom_during_h2d_copy_existing")
+            self._disable_h2d_overlap("cuda_oom_during_h2d_copy_existing")
+            self._wait_for_h2d_stream()
+            torch.cuda.empty_cache()
+            dest.copy_(prepared, non_blocking=False)
             self.loader._record_h2d_scratch_use(scratch_key, device=dest.device)
         return prepared
+
+    def _disable_h2d_overlap(self, reason: str) -> None:
+        if not bool(self._enable_cuda_h2d_overlap):
+            return
+        self._enable_cuda_h2d_overlap = False
+        self._h2d_stream = None
+        self._h2d_stream_down = None
+        if not bool(getattr(self, "_h2d_overlap_disabled_warned", False)):
+            self._h2d_overlap_disabled_warned = True
+            print(
+                f"[sparse] CUDA H2D overlap disabled ({str(reason)}); falling back to synchronous H2D copies.",
+                flush=True,
+            )
 
     def _ensure_cpu_scratch(
         self,
@@ -3341,6 +3555,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             return
         if self._h2d_stream is not None:
             torch.cuda.current_stream(self.device).wait_stream(self._h2d_stream)
+        if self._h2d_stream_down is not None:
+            torch.cuda.current_stream(self.device).wait_stream(self._h2d_stream_down)
 
     @staticmethod
     def _blocks_cache_key(blocks: torch.Tensor) -> tuple[int, ...]:
@@ -3383,6 +3599,44 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             hot_slots_gpu = None
         cold_mask_cpu = ~hot_mask_cpu
         cold_blocks = ordered_blocks[cold_mask_cpu]
+        return hot_positions_cpu, hot_slots_gpu, cold_blocks, cold_mask_cpu
+
+    def _partition_down_hot_blocks_cached(
+        self,
+        *,
+        down_hot_cache: dict[str, Any],
+        ordered_blocks: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        partition_cache = down_hot_cache.get("partition_cache")
+        if not isinstance(partition_cache, OrderedDict):
+            partition_cache = OrderedDict()
+            down_hot_cache["partition_cache"] = partition_cache
+        key = self._blocks_cache_key(ordered_blocks)
+        cached = partition_cache.get(key)
+        if cached is not None:
+            hot_positions_cpu, hot_slots_cpu, cold_blocks_cpu, cold_mask_cpu = cached
+            partition_cache.move_to_end(key)
+            hot_slots_gpu = None
+            if hot_slots_cpu is not None:
+                hot_slots_gpu = hot_slots_cpu.to(device=self.device, dtype=torch.long)
+            return hot_positions_cpu, hot_slots_gpu, cold_blocks_cpu, cold_mask_cpu
+        lookup = down_hot_cache["lookup_cpu"].index_select(0, ordered_blocks.to(dtype=torch.long))
+        hot_positions_cpu, hot_slots_gpu, cold_blocks, cold_mask_cpu = self._partition_cached_block_lookup(
+            lookup,
+            ordered_blocks=ordered_blocks,
+            device=self.device,
+        )
+        hot_slots_cpu = None
+        if hot_slots_gpu is not None:
+            hot_slots_cpu = hot_slots_gpu.detach().to(device=torch.device("cpu"), dtype=torch.long).contiguous()
+        partition_cache[key] = (
+            hot_positions_cpu,
+            hot_slots_cpu,
+            cold_blocks.detach().to(device=torch.device("cpu"), dtype=torch.long).contiguous(),
+            cold_mask_cpu,
+        )
+        while len(partition_cache) > 128:
+            partition_cache.popitem(last=False)
         return hot_positions_cpu, hot_slots_gpu, cold_blocks, cold_mask_cpu
 
     @staticmethod
@@ -3469,6 +3723,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             return
         if self._h2d_stream is not None:
             self._h2d_stream.wait_stream(torch.cuda.current_stream(self.device))
+        if self._h2d_stream_down is not None:
+            self._h2d_stream_down.wait_stream(torch.cuda.current_stream(self.device))
 
     def _clear_sparse_attn_qo_buffers(
         self,
@@ -4223,8 +4479,13 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         # Fast path: every cold block already in CPU cache
         if layer_cache is not None and all(b in layer_cache for b in cold_list):
-            packed_parts = [layer_cache[b][0] for b in cold_list]
-            absmax_parts = [layer_cache[b][1] for b in cold_list]
+            packed_parts: list[torch.Tensor] = []
+            absmax_parts: list[torch.Tensor] = []
+            for b in cold_list:
+                entry = layer_cache[b]
+                layer_cache.move_to_end(b)
+                packed_parts.append(entry[0])
+                absmax_parts.append(entry[1])
             cold_packed_cpu = torch.stack(packed_parts, dim=1).contiguous()
             cold_absmax_cpu = torch.stack(absmax_parts, dim=1).contiguous()
             return cold_packed_cpu, cold_absmax_cpu
@@ -4237,7 +4498,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         absmax_2d = down_param_raw["absmax"].view(H_out, absmax_per_row)
 
         if layer_cache is None:
-            layer_cache = {}
+            layer_cache = OrderedDict()
             self._down_proj_col_cache[down_name] = layer_cache
 
         # Extract and cache each missing block individually (~256 KB + 64 KB each)
@@ -4245,14 +4506,23 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             b_start = int(b) * bytes_per_cblk
             col_slice = raw_2d[:, b_start : b_start + bytes_per_cblk].contiguous()
             abs_idx = (int(b) * block_size) // qbs
-            abs_slice = absmax_2d[:, abs_idx : abs_idx + 1].contiguous()
+            abs_slice = absmax_2d[:, abs_idx].contiguous()
             layer_cache[b] = (col_slice, abs_slice)
+            layer_cache.move_to_end(b)
 
         # Assemble result for ALL cold blocks (hits + newly loaded)
-        packed_parts = [layer_cache[b][0] for b in cold_list]
-        absmax_parts = [layer_cache[b][1] for b in cold_list]
+        packed_parts = []
+        absmax_parts = []
+        for b in cold_list:
+            entry = layer_cache[b]
+            layer_cache.move_to_end(b)
+            packed_parts.append(entry[0])
+            absmax_parts.append(entry[1])
         cold_packed_cpu = torch.stack(packed_parts, dim=1).contiguous()
         cold_absmax_cpu = torch.stack(absmax_parts, dim=1).contiguous()
+        max_entries = int(getattr(self, "_down_proj_col_cache_max_blocks_per_layer", 64) or 64)
+        while len(layer_cache) > max_entries:
+            layer_cache.popitem(last=False)
         return cold_packed_cpu, cold_absmax_cpu
 
     def _load_cold_blocks_direct(
@@ -4599,7 +4869,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, union_blocks)
         ordered_blocks = ordered_blocks[(ordered_blocks >= 0) & (ordered_blocks < int(max_valid_blocks))]
         ordered_blocks = ordered_blocks.unique(sorted=False).to(dtype=torch.long, device=torch.device("cpu")).contiguous()
-        ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, ordered_blocks).contiguous()
         num_active_blocks = int(ordered_blocks.numel())
         if num_active_blocks <= 0:
             return (
@@ -4620,27 +4889,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         active_dim = num_active_blocks * int(block_size)
         flat_mask = torch.zeros((rows, active_dim), device=self.device, dtype=dtype)
 
-
-
-        neuron_offsets = torch.arange(int(block_size), device=self.device, dtype=torch.long)
-
         al_long = active_local.long()
         valid_mask = al_long >= 0
         if bool(valid_mask.any()):
-            row_ids = torch.arange(rows, device=self.device, dtype=torch.long).unsqueeze(1).expand_as(al_long)
-
             slot_safe = al_long.clamp(min=0)
-
-            col_starts = slot_safe.unsqueeze(-1) * int(block_size)
-            col_idx = (col_starts + neuron_offsets.view(1, 1, -1))
-            row_idx_exp = row_ids.unsqueeze(-1).expand_as(col_idx)
-            valid_exp = valid_mask.unsqueeze(-1).expand_as(col_idx)
-            flat_mask.scatter_(
-                1,
-                col_idx.reshape(rows, -1),
-                valid_exp.to(dtype=flat_mask.dtype).reshape(rows, -1),
-            )
-            del row_idx_exp, col_idx, col_starts, slot_safe, row_ids, valid_exp
+            slot_mask = torch.zeros((rows, num_active_blocks), device=self.device, dtype=dtype)
+            slot_mask.scatter_(1, slot_safe, valid_mask.to(dtype=dtype))
+            flat_mask = slot_mask.repeat_interleave(int(block_size), dim=1).contiguous()
+            del slot_safe, slot_mask
         del al_long, valid_mask
 
         active_neurons = (
@@ -4682,7 +4938,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, active_blocks_cpu)
         ordered_blocks = ordered_blocks[(ordered_blocks >= 0) & (ordered_blocks < int(max_valid_blocks))]
         ordered_blocks = ordered_blocks.unique(sorted=False).to(dtype=torch.long, device=torch.device("cpu")).contiguous()
-        ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, ordered_blocks).contiguous()
         if int(ordered_blocks.numel()) == 0:
             return
 
@@ -4697,6 +4952,153 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         except Exception:
             pass  # Non-fatal: actual call in _sparse_mlp_forward_fast will re-try
 
+    def _prefetch_down_blocks_for_layer(
+        self,
+        layer_idx: int,
+        active_blocks: torch.Tensor,
+    ) -> None:
+        """Start H2D transfer for sparse down-proj column blocks before MLP compute.
+
+        This mirrors gate/up prefetch and fills _downproj_transfer_cache so the
+        critical path inside _sparse_mlp_forward_fast can hit prepared GPU buffers.
+        """
+        if self._h2d_stream is None:
+            return
+        prefix = f"model.layers.{int(layer_idx)}.mlp."
+        try:
+            down_param = self._get_sparse_4bit_param(f"{prefix}down_proj.weight", require_raw=False)
+        except Exception:
+            return
+        if down_param is None:
+            return
+
+        block_size = int(self._sparse_block_size)
+        max_valid_blocks = int(down_param.get("in_features", 0)) // max(1, block_size)
+        if max_valid_blocks <= 0:
+            return
+
+        active_blocks_cpu = active_blocks.detach().to(device=torch.device("cpu"), dtype=torch.long).reshape(-1)
+        ordered_blocks = self._order_blocks_for_layer_hot_cache(layer_idx, active_blocks_cpu)
+        ordered_blocks = ordered_blocks[(ordered_blocks >= 0) & (ordered_blocks < int(max_valid_blocks))]
+        ordered_blocks = ordered_blocks.unique(sorted=False).to(dtype=torch.long, device=torch.device("cpu")).contiguous()
+        if int(ordered_blocks.numel()) == 0:
+            return
+
+        down_name = str(down_param.get("full_name", "")).strip()
+        if self._get_sparse_transfer_cache(
+            self._downproj_transfer_cache,
+            full_name=down_name,
+            ordered_blocks=ordered_blocks,
+        ) is not None:
+            return
+
+        H_out = int(down_param.get("out_features", 0))
+        I_in = int(down_param.get("in_features", 0))
+        qbs = int(down_param.get("quant_block_size", 64))
+        if H_out <= 0 or I_in <= 0:
+            return
+        bytes_per_row = I_in // 2
+        bytes_per_cblk = block_size // 2
+        absmax_per_row = I_in // max(1, qbs)
+
+        gathered_down_packed_gpu = None
+        gathered_down_absmax_gpu = None
+        try:
+            down_hot_cache = down_param.get("vram_hot_down")
+            if down_hot_cache is not None:
+                if not bool(down_hot_cache.get("h2d_ready", True)):
+                    self._wait_for_h2d_stream()
+                    down_hot_cache["h2d_ready"] = True
+                hot_positions_cpu, hot_slots, cold_blocks, cold_mask_cpu = self._partition_down_hot_blocks_cached(
+                    down_hot_cache=down_hot_cache,
+                    ordered_blocks=ordered_blocks,
+                )
+                hot_cols_packed = None
+                hot_cols_absmax = None
+                if hot_slots is not None:
+                    hot_cols_packed = down_hot_cache["packed_cols_gpu"].index_select(1, hot_slots)
+                    hot_cols_absmax = down_hot_cache["absmax_cols_gpu"].index_select(1, hot_slots)
+
+                cold_cols_packed = None
+                cold_cols_absmax = None
+                if int(cold_blocks.numel()) > 0:
+                    cold_packed_cpu, cold_absmax_cpu = self._load_down_proj_cold_cols(
+                        down_param,
+                        cold_blocks,
+                        H_out=H_out,
+                        bytes_per_row=bytes_per_row,
+                        bytes_per_cblk=bytes_per_cblk,
+                        absmax_per_row=absmax_per_row,
+                        block_size=block_size,
+                        qbs=qbs,
+                        down_name=down_name,
+                    )
+                    cold_cols_packed = self._copy_cpu_to_gpu(
+                        cold_packed_cpu,
+                        dtype=torch.uint8,
+                        layer_idx=int(layer_idx),
+                        tag="mlp_sparse_down_prefetch_packed",
+                        h2d_stream=self._h2d_stream_down,
+                    )
+                    cold_cols_absmax = self._copy_cpu_to_gpu(
+                        cold_absmax_cpu,
+                        dtype=torch.float32,
+                        layer_idx=int(layer_idx),
+                        tag="mlp_sparse_down_prefetch_absmax",
+                        h2d_stream=self._h2d_stream_down,
+                    )
+                if (hot_cols_packed is not None and hot_cols_absmax is not None) or (
+                    cold_cols_packed is not None and cold_cols_absmax is not None
+                ):
+                    gathered_down_packed_gpu, gathered_down_absmax_gpu = self._merge_columnwise_parts(
+                        total_blocks=int(ordered_blocks.numel()),
+                        hot_positions_cpu=hot_positions_cpu,
+                        hot_packed=hot_cols_packed,
+                        cold_mask_cpu=cold_mask_cpu,
+                        cold_packed=cold_cols_packed,
+                        hot_absmax=hot_cols_absmax,
+                        cold_absmax=cold_cols_absmax,
+                    )
+
+            if gathered_down_packed_gpu is None or gathered_down_absmax_gpu is None:
+                gathered_down_packed_cpu, gathered_down_absmax_cpu = self._load_down_proj_cold_cols(
+                    down_param,
+                    ordered_blocks,
+                    H_out=H_out,
+                    bytes_per_row=bytes_per_row,
+                    bytes_per_cblk=bytes_per_cblk,
+                    absmax_per_row=absmax_per_row,
+                    block_size=block_size,
+                    qbs=qbs,
+                    down_name=down_name,
+                )
+                gathered_down_packed_gpu = self._copy_cpu_to_gpu(
+                    gathered_down_packed_cpu,
+                    dtype=torch.uint8,
+                    layer_idx=int(layer_idx),
+                    tag="mlp_sparse_down_prefetch_packed",
+                    h2d_stream=self._h2d_stream_down,
+                )
+                gathered_down_absmax_gpu = self._copy_cpu_to_gpu(
+                    gathered_down_absmax_cpu,
+                    dtype=torch.float32,
+                    layer_idx=int(layer_idx),
+                    tag="mlp_sparse_down_prefetch_absmax",
+                    h2d_stream=self._h2d_stream_down,
+                )
+
+            if gathered_down_packed_gpu is not None and gathered_down_absmax_gpu is not None:
+                self._put_sparse_transfer_cache(
+                    self._downproj_transfer_cache,
+                    full_name=down_name,
+                    ordered_blocks=ordered_blocks,
+                    packed_gpu=gathered_down_packed_gpu,
+                    absmax_gpu=gathered_down_absmax_gpu,
+                )
+        except Exception:
+            # Non-fatal: _sparse_mlp_forward_fast will still do synchronous path.
+            return
+
     def _sparse_mlp_forward_fast(
         self,
         layer_idx: int,
@@ -4705,6 +5107,41 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         active_blocks: torch.Tensor,
         _oom_retry_depth: int = 0,
     ) -> torch.Tensor:
+        _timing_enabled = bool(self._debug_sparse_mlp_phase_timing and self.device.type == "cuda")
+        _ev0_wait_start: torch.cuda.Event | None = None
+        _ev1_after_wait: torch.cuda.Event | None = None
+        _ev2_after_down_h2d: torch.cuda.Event | None = None
+        _ev3_after_compute: torch.cuda.Event | None = None
+        if _timing_enabled:
+            _ev0_wait_start = torch.cuda.Event(enable_timing=True)
+            _ev1_after_wait = torch.cuda.Event(enable_timing=True)
+            _ev2_after_down_h2d = torch.cuda.Event(enable_timing=True)
+            _ev3_after_compute = torch.cuda.Event(enable_timing=True)
+
+        def _log_sparse_mlp_timing(result_tag: str) -> None:
+            if not _timing_enabled:
+                return
+            if _ev0_wait_start is None or _ev1_after_wait is None or _ev2_after_down_h2d is None or _ev3_after_compute is None:
+                return
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize(self.device)
+                t_wait = float(_ev0_wait_start.elapsed_time(_ev1_after_wait))
+                t_down = float(_ev1_after_wait.elapsed_time(_ev2_after_down_h2d))
+                t_compute = float(_ev2_after_down_h2d.elapsed_time(_ev3_after_compute))
+                self._record_runtime_event(
+                    "sparse_mlp_phase",
+                    layer_idx=int(layer_idx),
+                    wait_gate_up_ms=t_wait,
+                    down_h2d_ms=t_down,
+                    compute_ms=t_compute,
+                    path=result_tag,
+                )
+                print(
+                    f"[sparse-mlp-phase] layer={int(layer_idx)} wait_gate_up_ms={t_wait:.3f} "
+                    f"down_h2d_ms={t_down:.3f} compute_ms={t_compute:.3f} path={result_tag}",
+                    flush=True,
+                )
+
         if (
             layer_idx in self._sparse_routing
             and str(self._sparse_routing[int(layer_idx)].get("block_domain", "intermediate")) != "intermediate"
@@ -4768,7 +5205,11 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         )
 
 
+        if _ev0_wait_start is not None:
+            _ev0_wait_start.record()
         self._wait_for_h2d_stream()
+        if _ev1_after_wait is not None:
+            _ev1_after_wait.record()
 
         H_out = int(down_param["out_features"])
         I_in = int(down_param["in_features"])
@@ -4805,13 +5246,12 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         if gathered_down_packed_gpu is None and gathered_down_absmax_gpu is None and down_hot_cache is not None:
             try:
                 if not bool(down_hot_cache.get("h2d_ready", True)):
-                    self._wait_for_h2d_stream()
+                    if self._h2d_stream_down is not None:
+                        torch.cuda.current_stream(self.device).wait_stream(self._h2d_stream_down)
                     down_hot_cache["h2d_ready"] = True
-                lookup = down_hot_cache["lookup_cpu"].index_select(0, ordered_blocks.to(dtype=torch.long))
-                hot_positions_cpu, hot_slots, cold_blocks, cold_mask_cpu = self._partition_cached_block_lookup(
-                    lookup,
+                hot_positions_cpu, hot_slots, cold_blocks, cold_mask_cpu = self._partition_down_hot_blocks_cached(
+                    down_hot_cache=down_hot_cache,
                     ordered_blocks=ordered_blocks,
-                    device=self.device,
                 )
 
                 hot_cols_packed = None
@@ -4937,6 +5377,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 packed_gpu=gathered_down_packed_gpu,
                 absmax_gpu=gathered_down_absmax_gpu,
             )
+        if _ev2_after_down_h2d is not None:
+            _ev2_after_down_h2d.record()
         _triton_was_enabled = bool(self._triton_fused_sparse_mlp)
         triton_out = self._sparse_mlp_forward_fast_triton(
             hidden=hidden,
@@ -4959,6 +5401,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             down_absmax_gpu=gathered_down_absmax_gpu,
         )
         if triton_out is not None:
+            if _ev3_after_compute is not None:
+                _ev3_after_compute.record()
+            _log_sparse_mlp_timing("triton")
             return triton_out
         if _triton_was_enabled and (not self._triton_fused_sparse_mlp) and int(_oom_retry_depth) < 1:
             if self._h2d_stream is not None:
@@ -5039,6 +5484,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             bias_gpu = None if down_bias is None else down_bias.to(device=self.device, dtype=self.dtype)
 
             out = F.linear(activated, down_weight_active, bias_gpu)
+            if _ev3_after_compute is not None:
+                _ev3_after_compute.record()
+            _log_sparse_mlp_timing("dequant_fallback")
             return out.view_as(hidden)
         except Exception as _e:
             if not _is_cuda_oom_error(_e):
@@ -5097,10 +5545,19 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
     ) -> torch.Tensor | None:
         self._decode_backend_name = "dequant_sparse_fallback"
         if not self._triton_fused_sparse_mlp:
+            if not self._triton_sparse_mlp_path_logged:
+                print("[sparse] Triton sparse MLP disabled by runtime flag; using fallback path.", flush=True)
+                self._triton_sparse_mlp_path_logged = True
             return None
         if triton_fused_sparse_mlp_decode_4bit is None:
+            if not self._triton_sparse_mlp_path_logged:
+                print("[sparse] Triton sparse MLP kernel unavailable; using fallback path.", flush=True)
+                self._triton_sparse_mlp_path_logged = True
             return None
         if down_packed_gpu is None or down_absmax_gpu is None:
+            if not self._triton_sparse_mlp_path_logged:
+                print("[sparse] Triton sparse MLP missing down buffers; using fallback path.", flush=True)
+                self._triton_sparse_mlp_path_logged = True
             return None
 
         block_size = int(self._sparse_block_size)
@@ -5136,7 +5593,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 self._ensure_single_kernel_mlp_scratch(hidden_size=hidden_size, block_out=block_out)
                 if self._single_kernel_mlp_out_accum is None:
                     raise RuntimeError("single-kernel sparse MLP scratch allocation failed")
-                self._wait_for_h2d_stream()
                 out_buf = torch.empty((1, hidden_size), device=self.device, dtype=torch.float16)
                 down_single = triton_sparse_mlp_decode_4bit_single_kernel_sm75(
                     flat_hidden,
@@ -5161,6 +5617,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                     down_bias_gpu = down_bias.to(device=self.device, dtype=down_single.dtype)
                     down_single = down_single + down_bias_gpu.view(1, -1)
                 self._decode_backend_name = "single_kernel_sparse_decode_sm75"
+                if not self._triton_sparse_mlp_path_logged:
+                    print("[sparse] Triton sparse MLP path active: single-kernel sm75.", flush=True)
+                    self._triton_sparse_mlp_path_logged = True
                 return down_single.view_as(hidden).to(dtype=hidden.dtype)
             except Exception as exc:
                 if not hasattr(self, "_single_kernel_fail_count"):
@@ -5187,8 +5646,6 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             down_bias_gpu = None
             if down_bias is not None:
                 down_bias_gpu = down_bias.to(device=self.device, dtype=flat_hidden.dtype)
-
-            self._wait_for_h2d_stream()
             down = triton_fused_sparse_mlp_decode_4bit(
                 flat_hidden,
                 active_local,
@@ -5215,6 +5672,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 block_size=block_size,
             )
             self._decode_backend_name = "fused_sparse_decode_v1"
+            if not self._triton_sparse_mlp_path_logged:
+                print("[sparse] Triton sparse MLP path active: fused_sparse_decode_v1.", flush=True)
+                self._triton_sparse_mlp_path_logged = True
             return down.view_as(hidden).to(dtype=hidden.dtype)
         except Exception as exc:
             print(f"[sparse] Triton fused 4-bit path failed; falling back to dequant path: {exc}", flush=True)
@@ -5879,13 +6339,22 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         context - groups that have not fired much are down-weighted.
         """
         if self._attn_sparse_disabled_reason is not None:
-            return None
+            raise RuntimeError(
+                f"[attn] sparse attention disabled: {self._attn_sparse_disabled_reason}. "
+                "Loading full Q/O is not acceptable on this hardware — fix the root cause."
+            )
         if int(layer_idx) in getattr(self, "_attn_force_dense_layers", set()):
-            return None
+            raise RuntimeError(
+                f"[attn] layer {layer_idx} is in _attn_force_dense_layers, which would load full Q/O. "
+                "Remove the layer from _attn_force_dense_layers instead of falling back to dense."
+            )
 
         static_indices = self._attn_active_head_indices.get(layer_idx)
         if static_indices is None:
-            return None
+            raise RuntimeError(
+                f"[attn] layer {layer_idx} has no active head indices — compact sparse attention cannot run "
+                "and loading full Q/O is not acceptable. Ensure attn_head_importance_path covers all layers."
+            )
 
         static_imp = self._attn_head_importance.get(layer_idx)
         if static_imp is None:
@@ -6142,6 +6611,7 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         *,
         head_dim: int,
         hidden_size: int,
+        prewarm_only: bool = False,
     ) -> None:
         """Load only the active K heads' NF4 bytes for q_proj and o_proj.
 
@@ -6177,81 +6647,82 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
         q_skel = self._layer_skeleton.self_attn.q_proj.weight
         o_skel = self._layer_skeleton.self_attn.o_proj.weight
-        # Always do a full zero-fill on entry so no stale rows from a previous
-        # token's hot-head cache short-circuit can corrupt the current token.
-        self._clear_sparse_attn_qo_buffers(q_skel=q_skel, o_skel=o_skel, force_full=True)
         loaded_q_rows: list[torch.Tensor] = []
         loaded_o_cols: list[torch.Tensor] = []
+        if not prewarm_only:
+            # Always do a full zero-fill on entry so no stale rows from a previous
+            # token's hot-head cache short-circuit can corrupt the current token.
+            self._clear_sparse_attn_qo_buffers(q_skel=q_skel, o_skel=o_skel, force_full=True)
 
-        hot_cache = self._maybe_cache_sparse_attn_hot_heads(
-            layer_idx=layer_idx,
-            q_name=q_name,
-            o_name=o_name,
-            meta_q=meta_q,
-            meta_o=meta_o,
-        )
-        if hot_cache is not None:
-            if not bool(hot_cache.get("h2d_ready", True)):
-                self._wait_for_h2d_stream()
-                hot_cache["h2d_ready"] = True
-            lookup = hot_cache["lookup_cpu"].index_select(0, active_cpu)
-            hot_mask = lookup >= 0
-            if bool(hot_mask.any().item()):
-                hot_active_cpu = active_cpu[hot_mask].contiguous()
-                hot_slots = lookup[hot_mask].to(device=self.device, dtype=torch.long)
-                hot_active_gpu = hot_active_cpu.to(device=self.device, dtype=torch.long)
-                K_hot = int(hot_active_cpu.shape[0])
+            hot_cache = self._maybe_cache_sparse_attn_hot_heads(
+                layer_idx=layer_idx,
+                q_name=q_name,
+                o_name=o_name,
+                meta_q=meta_q,
+                meta_o=meta_o,
+            )
+            if hot_cache is not None:
+                if not bool(hot_cache.get("h2d_ready", True)):
+                    self._wait_for_h2d_stream()
+                    hot_cache["h2d_ready"] = True
+                lookup = hot_cache["lookup_cpu"].index_select(0, active_cpu)
+                hot_mask = lookup >= 0
+                if bool(hot_mask.any().item()):
+                    hot_active_cpu = active_cpu[hot_mask].contiguous()
+                    hot_slots = lookup[hot_mask].to(device=self.device, dtype=torch.long)
+                    hot_active_gpu = hot_active_cpu.to(device=self.device, dtype=torch.long)
+                    K_hot = int(hot_active_cpu.shape[0])
 
-                q_packed_gpu = hot_cache["q_packed_gpu"].index_select(0, hot_slots).reshape(-1)
-                q_absmax_gpu = hot_cache["q_absmax_gpu"].index_select(0, hot_slots).reshape(-1)
-                q_partial = self._attn_q_head_staging[: K_hot * head_dim * hidden_size].view(K_hot * head_dim, hidden_size)
-                _bnb_dequant_impl(
-                    q_packed_gpu,
-                    q_absmax_gpu,
-                    meta_q["quant_block_size"],
-                    meta_q["quant_type"],
-                    self.dtype,
-                    out=q_partial,
-                )
-                row_idx = (
-                    hot_active_gpu.unsqueeze(-1) * head_dim
-                    + torch.arange(head_dim, device=self.device)
-                ).reshape(-1)
-                q_skel.index_copy_(0, row_idx, q_partial)
-                loaded_q_rows.append(row_idx.detach().clone())
+                    q_packed_gpu = hot_cache["q_packed_gpu"].index_select(0, hot_slots).reshape(-1)
+                    q_absmax_gpu = hot_cache["q_absmax_gpu"].index_select(0, hot_slots).reshape(-1)
+                    q_partial = self._attn_q_head_staging[: K_hot * head_dim * hidden_size].view(K_hot * head_dim, hidden_size)
+                    _bnb_dequant_impl(
+                        q_packed_gpu,
+                        q_absmax_gpu,
+                        meta_q["quant_block_size"],
+                        meta_q["quant_type"],
+                        self.dtype,
+                        out=q_partial,
+                    )
+                    row_idx = (
+                        hot_active_gpu.unsqueeze(-1) * head_dim
+                        + torch.arange(head_dim, device=self.device)
+                    ).reshape(-1)
+                    q_skel.index_copy_(0, row_idx, q_partial)
+                    loaded_q_rows.append(row_idx.detach().clone())
 
-                o_packed_gpu = hot_cache["o_packed_gpu"].index_select(1, hot_slots).reshape(-1)
-                o_absmax_gpu = hot_cache["o_absmax_gpu"].index_select(1, hot_slots).reshape(-1)
-                o_partial = self._attn_q_head_staging[: hidden_size * K_hot * head_dim].view(hidden_size, K_hot * head_dim)
-                _bnb_dequant_impl(
-                    o_packed_gpu,
-                    o_absmax_gpu,
-                    meta_o["quant_block_size"],
-                    meta_o["quant_type"],
-                    self.dtype,
-                    out=o_partial,
-                )
-                col_idx_gpu = (
-                    hot_active_gpu.unsqueeze(-1) * head_dim
-                    + torch.arange(head_dim, device=self.device)
-                ).reshape(-1)
-                o_skel.index_copy_(1, col_idx_gpu, o_partial)
-                loaded_o_cols.append(col_idx_gpu.detach().clone())
-            if bool(torch.all(lookup >= 0).item()):
-                self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
-                self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
-                self._attn_qo_state = "sparse"
-                self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
-                return
-            active_cpu = active_cpu[lookup < 0].contiguous()
-            active_heads = active_cpu.to(device=active_heads.device, dtype=torch.long)
-            K = int(active_cpu.shape[0])
-            if K <= 0:
-                self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
-                self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
-                self._attn_qo_state = "sparse"
-                self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
-                return
+                    o_packed_gpu = hot_cache["o_packed_gpu"].index_select(1, hot_slots).reshape(-1)
+                    o_absmax_gpu = hot_cache["o_absmax_gpu"].index_select(1, hot_slots).reshape(-1)
+                    o_partial = self._attn_q_head_staging[: hidden_size * K_hot * head_dim].view(hidden_size, K_hot * head_dim)
+                    _bnb_dequant_impl(
+                        o_packed_gpu,
+                        o_absmax_gpu,
+                        meta_o["quant_block_size"],
+                        meta_o["quant_type"],
+                        self.dtype,
+                        out=o_partial,
+                    )
+                    col_idx_gpu = (
+                        hot_active_gpu.unsqueeze(-1) * head_dim
+                        + torch.arange(head_dim, device=self.device)
+                    ).reshape(-1)
+                    o_skel.index_copy_(1, col_idx_gpu, o_partial)
+                    loaded_o_cols.append(col_idx_gpu.detach().clone())
+                if bool(torch.all(lookup >= 0).item()):
+                    self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
+                    self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
+                    self._attn_qo_state = "sparse"
+                    self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
+                    return
+                active_cpu = active_cpu[lookup < 0].contiguous()
+                active_heads = active_cpu.to(device=active_heads.device, dtype=torch.long)
+                K = int(active_cpu.shape[0])
+                if K <= 0:
+                    self._attn_loaded_q_rows = torch.cat(loaded_q_rows, dim=0).contiguous() if loaded_q_rows else None
+                    self._attn_loaded_o_cols = torch.cat(loaded_o_cols, dim=0).contiguous() if loaded_o_cols else None
+                    self._attn_qo_state = "sparse"
+                    self._debug_assert_sparse_attn_qo_zero_inactive(q_skel=q_skel, o_skel=o_skel)
+                    return
 
 
         H_out = int(meta_o["out_features"])
@@ -6278,7 +6749,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             ):
                 _phase_dbg = str(self._traffic_current_phase or "?")
                 print(f"[attn_row_cache] MISS layer={layer_idx} phase={_phase_dbg} hits={self._cpu_row_cache_hits} misses={self._cpu_row_cache_misses}", flush=True)
-            q_raw, _ = self.loader._load_raw_for_param(q_name)
+            q_raw = None
+            o_raw = None
+            with contextlib.suppress(Exception):
+                exact = self.loader._load_exact_tensors([q_name, o_name])
+                q_raw = exact.get(q_name)
+                o_raw = exact.get(o_name)
+            if q_raw is None:
+                q_raw, _ = self.loader._load_raw_for_param(q_name)
             bytes_per_head_q = meta_q["in_features"] // 2 * head_dim
             packed_2d_q = q_raw.view(meta_q["num_heads_total"], bytes_per_head_q)
             q_rows_cpu = packed_2d_q.index_select(0, active_cpu).contiguous()
@@ -6287,7 +6765,8 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             absmax_2d_q = meta_q["absmax_flat"].view(meta_q["num_heads_total"], absmax_per_head_q)
             q_abs_cpu = absmax_2d_q.index_select(0, active_cpu).contiguous()
 
-            o_raw, _ = self.loader._load_raw_for_param(o_name)
+            if o_raw is None:
+                o_raw, _ = self.loader._load_raw_for_param(o_name)
             bytes_per_row_o    = H_in // 2
             bytes_per_head_col = head_dim // 2
             raw_2d_o = o_raw.view(H_out, bytes_per_row_o)
@@ -6316,6 +6795,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 "o_cols": _pin(o_cols_cpu.contiguous()),
                 "o_abs":  _pin(o_abs_cpu.contiguous()),
             }
+
+        if prewarm_only:
+            return
 
         gathered_q = self._copy_cpu_to_existing_gpu(self._nf4_staging[: q_rows_cpu.numel()], q_rows_cpu.reshape(-1))
         n_q = gathered_q.numel()
@@ -6407,6 +6889,72 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         cache[int(layer_idx)] = entry
         return entry
 
+    def _bootstrap_compact_attn_weight_cache(self, layer_idx: int) -> dict[str, Any]:
+        cache = getattr(self, "_compact_attn_weight_cache", None)
+        if not isinstance(cache, dict):
+            self._compact_attn_weight_cache = {}
+            cache = self._compact_attn_weight_cache
+        entry = cache.get(int(layer_idx))
+        if isinstance(entry, dict):
+            return entry
+        entry = {
+            "head_key": None,
+            "head_offsets": None,
+            "q_weight": None,
+            "q_bias": None,
+            "o_weight": None,
+            "o_bias": None,
+        }
+        cache[int(layer_idx)] = entry
+        return entry
+
+    def _prime_compact_attn_projection_cache(
+        self,
+        *,
+        layer_idx: int,
+        layer: LlamaDecoderLayer,
+        active_heads: torch.Tensor,
+        head_dim: int,
+    ) -> None:
+        active_heads_gpu = (
+            active_heads.to(device=self.device, dtype=torch.long).reshape(-1).unique(sorted=True).contiguous()
+        )
+        if int(active_heads_gpu.numel()) <= 0:
+            return
+        head_offsets = (
+            active_heads_gpu.unsqueeze(-1) * int(head_dim)
+            + torch.arange(int(head_dim), device=self.device, dtype=torch.long)
+        ).reshape(-1)
+        head_key = tuple(int(v) for v in active_heads_gpu.detach().to(device=torch.device("cpu")).tolist())
+        weight_cache = self._bootstrap_compact_attn_weight_cache(int(layer_idx))
+        if weight_cache.get("head_key") == head_key:
+            return
+
+        q_weight = layer.self_attn.q_proj.weight.index_select(0, head_offsets).contiguous()
+        q_bias_full = getattr(layer.self_attn.q_proj, "bias", None)
+        q_bias = None
+        if q_bias_full is not None:
+            q_bias = q_bias_full.index_select(0, head_offsets).to(device=self.device, dtype=self.dtype).contiguous()
+        o_weight = layer.self_attn.o_proj.weight.index_select(1, head_offsets).contiguous()
+        o_bias_full = getattr(layer.self_attn.o_proj, "bias", None)
+        o_bias = None
+        if o_bias_full is not None:
+            o_bias = o_bias_full.to(device=self.device, dtype=self.dtype).contiguous()
+
+        # Cache full K/V weights as independent fp16 VRAM tensors so _load_layer never H2D them.
+        # Must clone — the skeleton tensor is shared and overwritten on every _load_layer call.
+        k_weight = layer.self_attn.k_proj.weight.detach().to(device=self.device, dtype=self.dtype).clone().contiguous()
+        v_weight = layer.self_attn.v_proj.weight.detach().to(device=self.device, dtype=self.dtype).clone().contiguous()
+
+        weight_cache["head_key"] = head_key
+        weight_cache["head_offsets"] = head_offsets.detach().clone()
+        weight_cache["q_weight"] = q_weight
+        weight_cache["q_bias"] = q_bias
+        weight_cache["o_weight"] = o_weight
+        weight_cache["o_bias"] = o_bias
+        weight_cache["k_weight"] = k_weight
+        weight_cache["v_weight"] = v_weight
+
     def _should_use_compact_sparse_attention(
         self,
         *,
@@ -6441,6 +6989,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         active_heads: torch.Tensor,
         use_attention_cache: bool,
     ) -> torch.Tensor:
+        _timing_enabled = bool(self._debug_compact_attn_phase_timing and self.device.type == "cuda")
+        _ev_qkv: torch.cuda.Event | None = None
+        _ev_sdpa: torch.cuda.Event | None = None
+        _ev_o: torch.cuda.Event | None = None
+        if _timing_enabled:
+            _ev_qkv = torch.cuda.Event(enable_timing=True)
+            _ev_sdpa = torch.cuda.Event(enable_timing=True)
+            _ev_o = torch.cuda.Event(enable_timing=True)
+
         cfg = self.config
         num_heads = int(getattr(cfg, "num_attention_heads", 0) or getattr(cfg, "num_heads", 0) or 0)
         num_kv_heads = int(getattr(cfg, "num_key_value_heads", 0) or num_heads)
@@ -6465,18 +7022,40 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         ).reshape(-1)
         if int(head_offsets.numel()) != int(active_heads_gpu.numel()) * int(head_dim):
             raise RuntimeError("Sparse-attention head offsets are inconsistent with active head count")
-        q_weight = layer.self_attn.q_proj.weight.index_select(0, head_offsets)
-        q_bias_full = getattr(layer.self_attn.q_proj, "bias", None)
-        q_bias = None
-        if q_bias_full is not None:
-            q_bias = q_bias_full.index_select(0, head_offsets).to(device=self.device, dtype=flat_hidden.dtype)
-        q_raw = F.linear(flat_hidden, q_weight.to(dtype=flat_hidden.dtype), q_bias)
+        head_key = tuple(int(v) for v in active_heads_gpu.detach().to(device=torch.device("cpu")).tolist())
+        weight_cache = self._bootstrap_compact_attn_weight_cache(int(layer_idx))
+        if weight_cache.get("head_key") != head_key:
+            self._prime_compact_attn_projection_cache(
+                layer_idx=int(layer_idx),
+                layer=layer,
+                active_heads=active_heads_gpu,
+                head_dim=int(head_dim),
+            )
+            weight_cache = self._bootstrap_compact_attn_weight_cache(int(layer_idx))
+        q_weight = weight_cache.get("q_weight")
+        if not torch.is_tensor(q_weight):
+            raise RuntimeError(f"Layer {int(layer_idx)} compact-attn q_weight cache missing after priming.")
+        q_bias = weight_cache.get("q_bias")
+        q_bias_linear = None
+        if torch.is_tensor(q_bias):
+            q_bias_linear = q_bias.to(device=self.device, dtype=flat_hidden.dtype)
+        q_raw = F.linear(flat_hidden, q_weight.to(dtype=flat_hidden.dtype), q_bias_linear)
         q = q_raw.view(int(flat_hidden.shape[0]), int(active_heads_gpu.numel()), 1, int(head_dim))
 
-        k_raw = layer.self_attn.k_proj(flat_hidden).view(int(flat_hidden.shape[0]), 1, int(num_kv_heads), int(head_dim)).transpose(1, 2)
-        v_raw = layer.self_attn.v_proj(flat_hidden).view(int(flat_hidden.shape[0]), 1, int(num_kv_heads), int(head_dim)).transpose(1, 2)
+        k_weight_cached = weight_cache.get("k_weight")
+        v_weight_cached = weight_cache.get("v_weight")
+        if torch.is_tensor(k_weight_cached) and torch.is_tensor(v_weight_cached):
+            k_raw = F.linear(flat_hidden, k_weight_cached.to(dtype=flat_hidden.dtype)).view(
+                int(flat_hidden.shape[0]), 1, int(num_kv_heads), int(head_dim)).transpose(1, 2)
+            v_raw = F.linear(flat_hidden, v_weight_cached.to(dtype=flat_hidden.dtype)).view(
+                int(flat_hidden.shape[0]), 1, int(num_kv_heads), int(head_dim)).transpose(1, 2)
+        else:
+            k_raw = layer.self_attn.k_proj(flat_hidden).view(int(flat_hidden.shape[0]), 1, int(num_kv_heads), int(head_dim)).transpose(1, 2)
+            v_raw = layer.self_attn.v_proj(flat_hidden).view(int(flat_hidden.shape[0]), 1, int(num_kv_heads), int(head_dim)).transpose(1, 2)
         cos, sin = rope
         q, k_new = apply_rotary_pos_emb(q, k_raw, cos, sin)
+        if _ev_qkv is not None:
+            _ev_qkv.record()
 
         cache_entry = self._bootstrap_compact_attn_cache(int(layer_idx))
         past_k = cache_entry.get("k")
@@ -6487,40 +7066,73 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         else:
             k_all = k_new
             v_all = v_raw
+        if int(self._compact_attn_kv_window) > 0:
+            k_all = k_all[:, :, -int(self._compact_attn_kv_window):, :]
+            v_all = v_all[:, :, -int(self._compact_attn_kv_window):, :]
         if use_attention_cache:
-            cache_entry["k"] = k_all.detach().contiguous()
-            cache_entry["v"] = v_all.detach().contiguous()
+            cache_entry["k"] = k_all.detach()
+            cache_entry["v"] = v_all.detach()
 
         queries_per_group = max(1, int(num_heads) // max(1, int(num_kv_heads)))
         kv_group_idx = torch.div(active_heads_gpu, queries_per_group, rounding_mode="floor").clamp_(0, max(0, int(num_kv_heads) - 1))
-        attn_out = torch.empty_like(q)
         if int(kv_group_idx.numel()) != int(active_heads_gpu.numel()):
             raise RuntimeError("Sparse-attention KV group mapping is inconsistent with active heads")
-        for group_idx in kv_group_idx.unique(sorted=True).tolist():
-            group_mask = kv_group_idx == int(group_idx)
-            q_group = q[:, group_mask, :, :]
-            k_group = k_all[:, int(group_idx): int(group_idx) + 1, :, :]
-            v_group = v_all[:, int(group_idx): int(group_idx) + 1, :, :]
-            out_group = F.scaled_dot_product_attention(
-                q_group,
-                k_group,
-                v_group,
-                scale=float(head_dim) ** -0.5,
-            )
-            attn_out[:, group_mask, :, :] = out_group
+        k_for_heads = k_all.index_select(1, kv_group_idx)
+        v_for_heads = v_all.index_select(1, kv_group_idx)
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k_for_heads,
+            v_for_heads,
+            scale=float(head_dim) ** -0.5,
+        )
+        if _ev_sdpa is not None:
+            _ev_sdpa.record()
 
         compact_hidden = attn_out.transpose(1, 2).reshape(int(hidden_norm.shape[0]), int(hidden_norm.shape[1]), -1)
-        o_weight = layer.self_attn.o_proj.weight.index_select(1, head_offsets)
+        o_weight = weight_cache.get("o_weight")
+        if not torch.is_tensor(o_weight):
+            raise RuntimeError(f"Layer {int(layer_idx)} compact-attn o_weight cache missing after priming.")
         if int(o_weight.shape[1]) != int(head_offsets.numel()):
             raise RuntimeError("Sparse-attention o_proj gather shape does not match active-head ordering")
-        o_bias = getattr(layer.self_attn.o_proj, "bias", None)
-        if o_bias is not None:
-            o_bias = o_bias.to(device=self.device, dtype=compact_hidden.dtype)
+        o_bias = weight_cache.get("o_bias")
+        o_bias_linear = None
+        if torch.is_tensor(o_bias):
+            o_bias_linear = o_bias.to(device=self.device, dtype=compact_hidden.dtype)
         out = F.linear(
             compact_hidden.view(-1, compact_hidden.shape[-1]).to(dtype=self.dtype),
             o_weight.to(dtype=self.dtype),
-            o_bias,
+            o_bias_linear,
         )
+        if not self._compact_attn_flash_checked and self.device.type == "cuda":
+            self._compact_attn_flash_checked = True
+            if not bool(torch.backends.cuda.flash_sdp_enabled()):
+                print(
+                    "[compact-attn] flash_sdp backend is disabled; SDPA may fall back to slower kernels.",
+                    flush=True,
+                )
+        if _timing_enabled:
+            if _ev_o is not None:
+                _ev_o.record()
+            _ev_end = torch.cuda.Event(enable_timing=True)
+            _ev_end.record()
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize(self.device)
+                qkv_ms = float(_ev_qkv.elapsed_time(_ev_sdpa)) if _ev_qkv is not None and _ev_sdpa is not None else 0.0
+                sdpa_ms = float(_ev_sdpa.elapsed_time(_ev_o)) if _ev_sdpa is not None and _ev_o is not None else 0.0
+                o_ms = float(_ev_o.elapsed_time(_ev_end)) if _ev_o is not None else 0.0
+                self._record_runtime_event(
+                    "compact_attn_phase",
+                    layer_idx=int(layer_idx),
+                    qkv_ms=qkv_ms,
+                    sdpa_ms=sdpa_ms,
+                    o_ms=o_ms,
+                    kv_window=int(self._compact_attn_kv_window),
+                )
+                print(
+                    f"[compact-attn-phase] layer={int(layer_idx)} qkv_ms={qkv_ms:.3f} "
+                    f"sdpa_ms={sdpa_ms:.3f} o_ms={o_ms:.3f} kv_window={int(self._compact_attn_kv_window)}",
+                    flush=True,
+                )
         self._compact_attn_decode_steps = int(getattr(self, "_compact_attn_decode_steps", 0)) + 1
         return out.view_as(hidden_norm).to(dtype=hidden_norm.dtype)
 
@@ -6672,12 +7284,16 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
             and self._sparse_kv_prefill_mode == "dense"
         )
         _gqa_kv_groups: torch.Tensor | None = None
+        _compact_kv_ready = torch.is_tensor(
+            self._compact_attn_weight_cache.get(int(layer_idx), {}).get("k_weight")
+        )
         if (
             _active_attn_heads is not None
             and _allow_sparse_kv
             and not _use_shared_attn
             and layer_idx not in self._retrieval_layers
             and layer_idx not in self._kv_routing
+            and not _compact_kv_ready
         ):
             _gqa_kv_groups = self._derive_gqa_kv_groups_from_q_heads(_active_attn_heads)
 
@@ -6685,6 +7301,10 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         _skip_attn: set = set()
         if _active_attn_heads is not None:
             _skip_attn = _skip_attn | {"self_attn.q_proj.weight", "self_attn.o_proj.weight"}
+            # Also skip K/V if they are already cached in compact-attn weight cache for this layer.
+            _kv_cache = self._compact_attn_weight_cache.get(int(layer_idx), {})
+            if torch.is_tensor(_kv_cache.get("k_weight")) and torch.is_tensor(_kv_cache.get("v_weight")):
+                _skip_attn = _skip_attn | {"self_attn.k_proj.weight", "self_attn.v_proj.weight"}
         if _use_shared_attn:
             _skip_attn = _skip_attn | {
                 "self_attn.q_proj.weight",
@@ -6827,7 +7447,15 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
 
 
-        if _active_attn_heads is not None and not _use_shared_attn:
+        # Skip skeleton Q/O population entirely when compact-attn weight cache is ready —
+        # _forward_compact_sparse_attn never reads the skeleton Q/O/K/V tensors.
+        # Avoiding _load_sparse_attn_heads also skips the 1 GB zero-fill of Q+O per layer.
+        _compact_cache_ready = (
+            _active_attn_heads is not None
+            and not _use_shared_attn
+            and torch.is_tensor(self._compact_attn_weight_cache.get(int(layer_idx), {}).get("q_weight"))
+        )
+        if _active_attn_heads is not None and not _use_shared_attn and not _compact_cache_ready:
             if int(layer_idx) in self._attn_zero_only_layers:
                 self._clear_sparse_attn_qo_buffers(
                     q_skel=self._layer_skeleton.self_attn.q_proj.weight,
@@ -6949,6 +7577,21 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         if token_ids.ndim != 2 or int(token_ids.shape[0]) != 1 or int(token_ids.shape[1]) != 1:
             raise RuntimeError("StreamingLlamaRuntime.forward_token currently supports batch_size=1 and seq_len=1 only")
 
+        _token_cpu_start = time.perf_counter()
+        _track_token_overhead = bool(self.device.type == "cuda" and self._profile_decode_overhead)
+        _ev_token_start: torch.cuda.Event | None = None
+        _ev_embed_end: torch.cuda.Event | None = None
+        _ev_layers_end: torch.cuda.Event | None = None
+        _ev_norm_end: torch.cuda.Event | None = None
+        _ev_lm_head_end: torch.cuda.Event | None = None
+        if _track_token_overhead:
+            _ev_token_start = torch.cuda.Event(enable_timing=True)
+            _ev_embed_end = torch.cuda.Event(enable_timing=True)
+            _ev_layers_end = torch.cuda.Event(enable_timing=True)
+            _ev_norm_end = torch.cuda.Event(enable_timing=True)
+            _ev_lm_head_end = torch.cuda.Event(enable_timing=True)
+            _ev_token_start.record()
+
         capture_set = {int(idx) for idx in capture_layers or []}
         captures: dict[int, dict[str, torch.Tensor]] = {}
         printed_progress = False
@@ -6956,7 +7599,11 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         hidden = self._embed_tokens_cpu(token_ids).to(device=self.device, dtype=self.dtype)
         position_ids = torch.tensor([[int(position_index)]], device=self.device, dtype=torch.long)
         rope = self.rotary_emb(hidden, position_ids)
+        if _ev_embed_end is not None:
+            _ev_embed_end.record()
         profile_step = self._begin_decode_profile_step(position_index=int(position_index))
+        if str(self._traffic_current_phase or "idle") == "decode":
+            self.clear_sparse_transfer_caches()
 
         for layer_idx in range(self.num_layers):
             layer_cpu_start = time.perf_counter() if profile_step is not None else 0.0
@@ -6994,25 +7641,22 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
 
 
             _active_kv_blocks = None
+            _kv_route_async = False
             if layer_idx not in self._retrieval_layers:
-                _active_kv_blocks = self._route_kv_blocks(hidden_norm, layer_idx)
+                if (
+                    self._kv_route_stream is not None
+                    and str(self._traffic_current_phase or "idle") == "decode"
+                ):
+                    self._kv_route_stream.wait_stream(torch.cuda.current_stream(self.device))
+                    with torch.cuda.stream(self._kv_route_stream):
+                        _active_kv_blocks = self._route_kv_blocks(hidden_norm, layer_idx)
+                    _kv_route_async = True
+                else:
+                    _active_kv_blocks = self._route_kv_blocks(hidden_norm, layer_idx)
+            if _kv_route_async and self._kv_route_stream is not None:
+                torch.cuda.current_stream(self.device).wait_stream(self._kv_route_stream)
             if _active_kv_blocks is not None:
                 self._populate_sparse_kv_skeleton(layer_idx, _active_kv_blocks, layer)
-
-            # Phase 4: pre-transfer cold MLP blocks to GPU while attention runs.
-            # Route from hidden_norm (pre-attention) as a proxy to predict which blocks
-            # will be needed; blocks go into _sparse_block_transfer_cache as H2D cache
-            # hits.  Actual routing in _mlp_forward_dispatch always uses mlp_input
-            # (post-attention) for correctness — the dict is discarded there.
-            if (
-                layer_idx in self._sparse_routing
-                and str(self._traffic_current_phase or "idle") == "decode"
-                and self._h2d_stream is not None
-            ):
-                _prefetch_blocks = self._route_sparse_mlp(hidden_norm, layer_idx)
-                if _prefetch_blocks is not None:
-                    self._mlp_prefetch_active_blocks[layer_idx] = _prefetch_blocks
-                    self._prefetch_mlp_blocks_for_layer(layer_idx, _prefetch_blocks)
 
             # Phase 5.2: SMC for attention — skip dense attention if hidden state unchanged
             _lidx = int(layer_idx)
@@ -7072,6 +7716,9 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                         active_heads=_active_attn_heads,
                     )
                 elif not _is_dense_attn_path:
+                    if not self._compact_attn_path_logged:
+                        print("[attn] compact sparse decode path active.", flush=True)
+                        self._compact_attn_path_logged = True
                     if self._debug_steps:
                         print(f"[debug] layer {layer_idx}: attn_forward_compact_sparse", flush=True)
                     attn_out = self._forward_compact_sparse_attn(
@@ -7083,14 +7730,14 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                         use_attention_cache=bool(use_attention_cache),
                     )
                 else:
-                    if self._debug_steps:
-                        print(f"[debug] layer {layer_idx}: attn_forward_dense", flush=True)
-                    attn_out, _attn_weights = layer.self_attn(
-                        hidden_states=hidden_norm,
-                        position_embeddings=rope,
-                        attention_mask=None,
-                        past_key_values=self._dense_cache if use_attention_cache else None,
-                        cache_position=position_ids.view(-1),
+                    raise RuntimeError(
+                        f"[attn] layer {layer_idx}: reached dense attention fallback, which would load full Q/O "
+                        f"(~68 MB H2D per layer). This is not acceptable on this hardware. "
+                        f"_is_dense_attn_path={_is_dense_attn_path}, "
+                        f"use_shared_attn={_use_shared_attn}, "
+                        f"active_heads={'None' if _active_attn_heads is None else int(_active_attn_heads.numel())}, "
+                        f"phase={self._traffic_current_phase!r}. "
+                        "Fix the root cause: ensure _traffic_current_phase='decode' and all layers have head indices."
                     )
                 # Update SMC attn state for non-protected dense layers
                 if (
@@ -7127,7 +7774,19 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
                 self._update_kv_block_banking(layer_idx, _active_kv_blocks)
             self._release_modules(layer, *( [taylor_attn] if taylor_attn is not None else [] ))
             if str(self._traffic_current_phase or "idle") == "decode":
-                self.clear_sparse_transfer_caches()
+                if (
+                    self._enable_decode_lookahead_prefetch
+                    and self._h2d_stream is not None
+                ):
+                    _next_layer_idx = int(layer_idx) + 1
+                    if _next_layer_idx < int(self.num_layers) and _next_layer_idx in self._sparse_routing:
+                        _next_prefetch_blocks = self._mlp_hot_blocks_by_layer.get(_next_layer_idx)
+                        if _next_prefetch_blocks is None or int(_next_prefetch_blocks.numel()) <= 0:
+                            _next_prefetch_blocks = self._route_sparse_mlp(hidden, _next_layer_idx)
+                        if _next_prefetch_blocks is not None:
+                            self._mlp_prefetch_active_blocks[_next_layer_idx] = _next_prefetch_blocks
+                            self._prefetch_mlp_blocks_for_layer(_next_layer_idx, _next_prefetch_blocks)
+                            self._prefetch_down_blocks_for_layer(_next_layer_idx, _next_prefetch_blocks)
             if ev_end is not None:
                 ev_end.record()
             if profile_step is not None:
@@ -7149,13 +7808,45 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         if self._kv_routing:
             self._kv_bank_step += 1
 
+        if _ev_layers_end is not None:
+            _ev_layers_end.record()
         if printed_progress:
             print("", flush=True)
         hidden = self.norm(hidden)
+        if _ev_norm_end is not None:
+            _ev_norm_end.record()
         if not self._materialize_lm_head:
             logits = torch.zeros((hidden.shape[0], hidden.shape[1], 1), dtype=torch.float32)
         else:
             logits = self._lm_head_forward(hidden).float()
+        if _ev_lm_head_end is not None:
+            _ev_lm_head_end.record()
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize(self.device)
+                embed_ms = float(_ev_token_start.elapsed_time(_ev_embed_end)) if _ev_token_start is not None and _ev_embed_end is not None else 0.0
+                layer_loop_ms = float(_ev_embed_end.elapsed_time(_ev_layers_end)) if _ev_embed_end is not None and _ev_layers_end is not None else 0.0
+                norm_ms = float(_ev_layers_end.elapsed_time(_ev_norm_end)) if _ev_layers_end is not None and _ev_norm_end is not None else 0.0
+                lm_head_ms = float(_ev_norm_end.elapsed_time(_ev_lm_head_end)) if _ev_norm_end is not None else 0.0
+                total_gpu_ms = float(_ev_token_start.elapsed_time(_ev_lm_head_end)) if _ev_token_start is not None else 0.0
+                total_cpu_ms = float((time.perf_counter() - _token_cpu_start) * 1000.0)
+                self._record_runtime_event(
+                    "decode_token_overhead",
+                    position_index=int(position_index),
+                    embed_ms=embed_ms,
+                    layer_loop_ms=layer_loop_ms,
+                    norm_ms=norm_ms,
+                    lm_head_ms=lm_head_ms,
+                    total_gpu_ms=total_gpu_ms,
+                    total_cpu_ms=total_cpu_ms,
+                    outside_layer_ms=max(0.0, total_gpu_ms - layer_loop_ms),
+                )
+                if self._debug_decode_token_overhead:
+                    print(
+                        f"[decode-overhead] pos={int(position_index)} embed_ms={embed_ms:.3f} "
+                        f"layer_loop_ms={layer_loop_ms:.3f} norm_ms={norm_ms:.3f} "
+                        f"lm_head_ms={lm_head_ms:.3f} total_gpu_ms={total_gpu_ms:.3f}",
+                        flush=True,
+                    )
         if profile_step is not None:
             self._finalize_decode_profile_step(profile_step)
         return logits, captures
@@ -7596,3 +8287,5 @@ class StreamingLlamaRuntime(RuntimeSessionMixin, RuntimeLmHeadMixin):
         self._set_traffic_phase("idle")
         self._finalize_traffic_report()
         return generated
+
+

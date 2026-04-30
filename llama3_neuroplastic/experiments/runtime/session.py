@@ -76,6 +76,7 @@ class RuntimeSessionMixin:
         total_other_ms = 0.0
         total_layer_ms = 0.0
         total_cpu_ms = 0.0
+        total_python_overhead_ms = 0.0
         for layer in step["layers"]:
             events = layer.pop("_events", None)
             if events is not None:
@@ -94,6 +95,8 @@ class RuntimeSessionMixin:
             total_other_ms += other_ms
             total_layer_ms += total_ms
             total_cpu_ms += float(layer["cpu_ms"])
+            python_overhead_ms = max(0.0, float(layer["cpu_ms"]) - float(total_ms))
+            total_python_overhead_ms += python_overhead_ms
             finalized_layers.append(
                 {
                     "layer_idx": int(layer["layer_idx"]),
@@ -102,6 +105,7 @@ class RuntimeSessionMixin:
                     "other_ms": float(other_ms),
                     "total_ms": float(total_ms),
                     "cpu_ms": float(layer["cpu_ms"]),
+                    "python_overhead_ms": float(python_overhead_ms),
                 }
             )
         finalized = {
@@ -114,7 +118,9 @@ class RuntimeSessionMixin:
                 "other_ms": float(total_other_ms),
                 "total_ms": float(total_layer_ms),
                 "cpu_ms": float(total_cpu_ms),
+                "python_overhead_ms": float(total_python_overhead_ms),
                 "mean_layer_total_ms": float(total_layer_ms) / float(max(len(finalized_layers), 1)),
+                "mean_layer_python_overhead_ms": float(total_python_overhead_ms) / float(max(len(finalized_layers), 1)),
             },
         }
         steps = getattr(self, "_decode_profile_steps", None)
@@ -134,6 +140,10 @@ class RuntimeSessionMixin:
         mean_attn_ms = sum(float(step["summary"]["load_attn_ms"]) for step in steps) / float(max(len(steps), 1))
         mean_mlp_ms = sum(float(step["summary"]["mlp_ms"]) for step in steps) / float(max(len(steps), 1))
         mean_other_ms = sum(float(step["summary"]["other_ms"]) for step in steps) / float(max(len(steps), 1))
+        mean_python_overhead_ms = (
+            sum(float(step["summary"].get("python_overhead_ms", 0.0)) for step in steps)
+            / float(max(len(steps), 1))
+        )
         return {
             "enabled": bool(getattr(self, "_decode_profile_enabled", False)),
             "steps_recorded": int(len(steps)),
@@ -142,6 +152,7 @@ class RuntimeSessionMixin:
                 "mean_load_attn_ms": float(mean_attn_ms),
                 "mean_mlp_ms": float(mean_mlp_ms),
                 "mean_other_ms": float(mean_other_ms),
+                "mean_python_overhead_ms": float(mean_python_overhead_ms),
             },
             "steps": steps,
         }
@@ -182,6 +193,8 @@ class RuntimeSessionMixin:
             self._sparse_basis_top_k_by_layer.pop(int(_layer_idx), None)
             self._mlp_hot_blocks_by_layer.pop(int(_layer_idx), None)
         self._session_sparse_route_layers.clear()
+        if hasattr(self, "_down_proj_col_cache"):
+            self._down_proj_col_cache.clear()
         self.clear_sparse_transfer_caches()
         gc.collect()
         if bool(getattr(self, "_hard_cuda_cache_flush", False)) and torch.cuda.is_available():
@@ -280,6 +293,8 @@ class RuntimeSessionMixin:
         self._decode_mlp_cold_blocks_streamed = 0
         self._decode_down_hot_blocks_hit = 0
         self._decode_down_cold_blocks_streamed = 0
+        self._h2d_pinned_bytes = 0
+        self._h2d_unpinned_bytes = 0
         self.reset_decode_profiler()
 
     def _set_traffic_phase(self, phase: str) -> None:
@@ -345,6 +360,16 @@ class RuntimeSessionMixin:
         phases = ["prefill", "decode"]
         total_bytes = sum(int(self._traffic_bytes_by_phase.get(phase, 0)) for phase in phases)
         total_layer_visits = sum(int(self._traffic_layer_visits_by_phase.get(phase, 0)) for phase in phases)
+        decode_report = self._build_phase_traffic_report(
+            "decode",
+            bytes_by_phase=self._traffic_bytes_by_phase,
+            layer_visits_by_phase=self._traffic_layer_visits_by_phase,
+            bytes_by_phase_layer=self._traffic_bytes_by_phase_layer,
+            layer_visits_by_phase_layer=self._traffic_layer_visits_by_phase_layer,
+            bytes_by_phase_tag=self._traffic_bytes_by_phase_tag,
+        )
+        decode_avg_mb = float(decode_report.get("avg_mb_per_layer", 0.0))
+        decode_budget_mb = 20.0
         self._last_traffic_report = {
             "prefill": self._build_phase_traffic_report(
                 "prefill",
@@ -354,20 +379,18 @@ class RuntimeSessionMixin:
                 layer_visits_by_phase_layer=self._traffic_layer_visits_by_phase_layer,
                 bytes_by_phase_tag=self._traffic_bytes_by_phase_tag,
             ),
-            "decode": self._build_phase_traffic_report(
-                "decode",
-                bytes_by_phase=self._traffic_bytes_by_phase,
-                layer_visits_by_phase=self._traffic_layer_visits_by_phase,
-                bytes_by_phase_layer=self._traffic_bytes_by_phase_layer,
-                layer_visits_by_phase_layer=self._traffic_layer_visits_by_phase_layer,
-                bytes_by_phase_tag=self._traffic_bytes_by_phase_tag,
-            ),
+            "decode": decode_report,
             "overall": {
                 "total_bytes": int(total_bytes),
                 "total_mb": float(total_bytes) / float(1024 ** 2),
                 "layer_visits": int(total_layer_visits),
                 "avg_bytes_per_layer": float(total_bytes) / float(max(total_layer_visits, 1)),
                 "avg_mb_per_layer": float(total_bytes) / float(max(total_layer_visits, 1)) / float(1024 ** 2),
+            },
+            "h2d_budget": {
+                "target_mb_per_layer": float(decode_budget_mb),
+                "decode_avg_mb_per_layer": float(decode_avg_mb),
+                "within_budget": bool(decode_avg_mb <= decode_budget_mb),
             },
         }
         if hasattr(self, "get_runtime_status"):

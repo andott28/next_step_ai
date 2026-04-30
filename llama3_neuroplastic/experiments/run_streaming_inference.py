@@ -576,6 +576,8 @@ def main() -> None:
         import time as _prewarm_time
         _t0 = _prewarm_time.perf_counter()
         runtime.pre_warm_vram_hot_cache()
+        # Startup pre-warm should satisfy generate()'s static hot-cache path.
+        runtime._vram_hot_cache_live_calibrated = True
         if bool(args.calibrate_hot_cache):
             calibration_prompt = str(args.hot_cache_calibration_prompt or (prompts[0] if prompts else "")).strip()
             if not calibration_prompt:
